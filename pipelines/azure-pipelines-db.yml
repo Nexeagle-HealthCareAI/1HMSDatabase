@@ -1,0 +1,90 @@
+# easyHMSDatabase – Azure SQL deploy via sqlcmd (no DB-create step)
+
+trigger:
+  branches: { include: [ main ] }
+  paths:    { include: [ db/**, pipelines/** ] }
+pr:
+  branches: { include: [ main ] }
+
+parameters:
+  - name: environment
+    displayName: Environment
+    type: string
+    default: dev
+    values: [dev, qa]
+  - name: action
+    displayName: Action
+    type: string
+    default: deploy
+    values: [deploy, rollback]   # deploy = schema + seed; rollback = run rollback scripts
+
+# Load per-env variables (no secrets in git; use variable group/Key Vault for sqlUser/sqlPassword)
+variables:
+  - ${{ if eq(parameters.environment, 'dev') }}:
+    - template: vars.dev.yml
+  - ${{ if eq(parameters.environment, 'qa') }}:
+    - template: vars.qa.yml
+
+stages:
+- stage: Deploy_${{ parameters.environment }}
+  displayName: "DB: ${{ parameters.environment }} (${{ parameters.action }})"
+  jobs:
+  - job: run_sql
+    displayName: "Run SQL (${{ parameters.action }})"
+    pool:
+      vmImage: windows-latest
+    steps:
+    - checkout: self
+      clean: true
+
+    # 1) Schema
+    - task: PowerShell@2
+      displayName: "Apply schema scripts: db/schema/*.sql"
+      env: { SQLPASSWORD: $(sqlPassword) }
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $server = "$(serverName)"; $db = "$(databaseName)"
+          $user   = "$(sqlUser)";   $pwd = $env:SQLPASSWORD
+
+          $schemaPath = "$(Build.SourcesDirectory)\db\schema"
+          if (-not (Test-Path $schemaPath)) { Write-Host "No schema folder, skipping."; exit 0 }
+          $files = Get-ChildItem $schemaPath -Filter *.sql -File | Sort-Object Name
+          if ($files.Count -eq 0) { Write-Host "No schema scripts, skipping."; exit 0 }
+
+          foreach ($f in $files) {
+            Write-Host "Executing schema: $($f.Name)"
+            & sqlcmd -S tcp:$server,1433 -d $db -U $user -P $pwd -b -I -l 60 -i $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "sqlcmd failed for $($f.Name) ($LASTEXITCODE)" }
+          }
+
+    # 2) Seed (or rollback)
+    - task: PowerShell@2
+      displayName: "Apply ${{ parameters.action }} scripts"
+      env: { SQLPASSWORD: $(sqlPassword) }
+      inputs:
+        targetType: inline
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $server = "$(serverName)"; $db = "$(databaseName)"
+          $user   = "$(sqlUser)";   $pwd = $env:SQLPASSWORD
+          $path   = if ("${{ parameters.action }}" -eq "deploy") { "$(Build.SourcesDirectory)\db\data\seed" } else { "$(Build.SourcesDirectory)\db\data\rollback" }
+
+          if (-not (Test-Path $path)) { Write-Host "Missing folder: $path, skipping."; exit 0 }
+          $files = Get-ChildItem $path -Filter *.sql -File | Sort-Object Name
+          if ($files.Count -eq 0) { Write-Host "No SQL files in $path, skipping."; exit 0 }
+
+          foreach ($f in $files) {
+            Write-Host "Executing $("${{ parameters.action }}"): $($f.Name)"
+            & sqlcmd -S tcp:$server,1433 -d $db -U $user -P $pwd -b -I -l 120 -i $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "sqlcmd failed for $($f.Name) ($LASTEXITCODE)" }
+          }
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish artifact: db-scripts"
+      inputs:
+        PathtoPublish: 'db'
+        ArtifactName: 'db'
+        publishLocation: 'Container'
+

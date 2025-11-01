@@ -4,12 +4,10 @@ variables:
   environmentName: 'dev'
 
   # Azure SQL connection
-  serverName: 'easyhmserver.database.windows.net'   # FQDN
-  databaseName: 'easyHMSDatabase'
-
-  # Auth (example: SQL auth). Prefer AAD-managed identity if you can.
-  sqlUser: '$(dev.sqlUser)'           # reference a Variable Group/secret variable
-  sqlPassword: '$(dev.sqlPassword)'   # secret
+  serverName: '$(serverName)'
+  databaseName: '$(databaseName)'
+  sqlUser: '$(sqlUser)'
+  sqlPassword: '$(sqlPassword)'
 
   # (Optional) naming/metadata
   owner: 'data-platform'

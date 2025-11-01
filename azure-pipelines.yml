@@ -57,10 +57,10 @@ stages:
   jobs:
   - job: run_sql
     displayName: "Execute SQL scripts with sqlcmd"
-    # Use container that already has sqlcmd
-    container: mcr.microsoft.com/mssql-tools
     pool:
       vmImage: 'ubuntu-latest'
+    # IMPORTANT: include a tag so Azure treats this as an image, not a resource alias.
+    container: mcr.microsoft.com/mssql-tools:latest
 
     steps:
     - checkout: self
@@ -85,13 +85,14 @@ stages:
         SEED_DIR="$ROOT/db/data/seed"
         ROLLBACK_DIR="$ROOT/db/rollback"
 
+        # sqlcmd 18+ defaults to Encrypt=Yes. If your gateway/proxy breaks TLS chain,
+        # you can add -C to trust the server cert (not recommended unless needed).
         SQLCMD="sqlcmd -S $(serverName) -d $(databaseName) -U $(sqlUser) -P '$(sqlPassword)' -b -l 60 -I"
 
         run_dir () {
           local dir="$1"
           if [ -d "$dir" ]; then
             echo "==> Running scripts in $dir"
-            # Use git ls-files to ensure stable, committed order; fallback to find if needed
             files=$(git -C "$ROOT" ls-files -- "$dir/*.sql" | sort || true)
             if [ -z "$files" ]; then
               files=$(find "$dir" -maxdepth 1 -type f -name "*.sql" | sort || true)

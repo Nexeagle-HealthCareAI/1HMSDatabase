@@ -1,0 +1,11 @@
+# Variables for QA
+variables:
+  environmentName: 'qa'
+
+  serverName: '$(serverName)'
+  databaseName: '$(databaseName)'
+  sqlUser: '$(sqlUser)'
+  sqlPassword: '$(sqlPassword)'
+
+  owner: 'data-platform'
+  appName: 'easyHMSDatabaseQA'

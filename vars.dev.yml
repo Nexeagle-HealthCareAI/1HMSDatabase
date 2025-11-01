@@ -1,0 +1,14 @@
+# Variables for DEV. Do not store secrets in git.
+# Put secrets (sqlUser, sqlPassword) in a Variable Group or pipeline variables (secret=true).
+variables:
+  environmentName: 'dev'
+
+  # Azure SQL connection
+  serverName: '$(serverName)'
+  databaseName: '$(databaseName)'
+  sqlUser: '$(sqlUser)'
+  sqlPassword: '$(sqlPassword)'
+
+  # (Optional) naming/metadata
+  owner: 'data-platform'
+  appName: 'easyHMSDatabase'

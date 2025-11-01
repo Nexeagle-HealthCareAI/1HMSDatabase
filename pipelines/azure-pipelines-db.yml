@@ -1,90 +1,131 @@
-# easyHMSDatabase – Azure SQL deploy via sqlcmd (no DB-create step)
+# easyHMSDatabase – SQL deploy via sqlcmd in container
+# Folder layout expected:
+#   db/schema/*.sql     -- schema build scripts (sorted by filename)
+#   db/data/seed/*.sql  -- seed data scripts (sorted by filename)
+#   db/rollback/*.sql   -- rollback scripts (sorted by filename)
+# Variable groups:
+#   dev -> 'swa-secrets-dev*'   (serverName, databaseName, sqlUser, sqlPassword)
 
 trigger:
-  branches: { include: [ main ] }
-  paths:    { include: [ db/**, pipelines/** ] }
+  branches:
+    include: [ main ]
+  paths:
+    include:
+      - db/*
+      - pipelines/*
+      - pipelines/azure-pipelines-db.yml
+      - pipelines/vars.*.yml
+
 pr:
-  branches: { include: [ main ] }
+  branches:
+    include: [ main ]
+  paths:
+    include:
+      - db/*
+      - pipelines/*
 
 parameters:
   - name: environment
-    displayName: Environment
+    displayName: Target environment
     type: string
     default: dev
-    values: [dev, qa]
+    values: [ dev, qa ]
+
   - name: action
-    displayName: Action
+    displayName: What to run
     type: string
     default: deploy
-    values: [deploy, rollback]   # deploy = schema + seed; rollback = run rollback scripts
+    values: [ deploy, seed-only, rollback ]
+    # deploy     -> schema + seed
+    # seed-only  -> seed only
+    # rollback   -> executes db/rollback/*.sql (sorted)
 
-# Load per-env variables (no secrets in git; use variable group/Key Vault for sqlUser/sqlPassword)
 variables:
+  # Bind variable groups & per-env var templates
   - ${{ if eq(parameters.environment, 'dev') }}:
+    - group: 'swa-secrets-dev'
     - template: vars.dev.yml
+
   - ${{ if eq(parameters.environment, 'qa') }}:
+    # Change this to your QA library group when you create it
+    - group: 'swa-secrets-qa'
     - template: vars.qa.yml
 
 stages:
 - stage: Deploy_${{ parameters.environment }}
-  displayName: "DB: ${{ parameters.environment }} (${{ parameters.action }})"
+  displayName: "DB ${{ parameters.environment }} – ${{ parameters.action }}"
   jobs:
   - job: run_sql
-    displayName: "Run SQL (${{ parameters.action }})"
+    displayName: "Execute SQL scripts with sqlcmd"
+    # Use container that already has sqlcmd
+    container: mcr.microsoft.com/mssql-tools
     pool:
-      vmImage: windows-latest
+      vmImage: 'ubuntu-latest'
+
     steps:
     - checkout: self
       clean: true
 
-    # 1) Schema
-    - task: PowerShell@2
-      displayName: "Apply schema scripts: db/schema/*.sql"
-      env: { SQLPASSWORD: $(sqlPassword) }
-      inputs:
-        targetType: inline
-        script: |
-          $ErrorActionPreference = 'Stop'
-          $server = "$(serverName)"; $db = "$(databaseName)"
-          $user   = "$(sqlUser)";   $pwd = $env:SQLPASSWORD
+    - script: |
+        echo "Validating inputs..."
+        echo "Server: $(serverName)"
+        echo "Database: $(databaseName)"
+        echo "Action: ${{ parameters.action }}"
+        test -n "$(serverName)" || { echo "serverName not set"; exit 1; }
+        test -n "$(databaseName)" || { echo "databaseName not set"; exit 1; }
+        test -n "$(sqlUser)" || { echo "sqlUser not set"; exit 1; }
+        test -n "$(sqlPassword)" || { echo "sqlPassword not set"; exit 1; }
+      displayName: "Sanity check variables (secrets masked)"
 
-          $schemaPath = "$(Build.SourcesDirectory)\db\schema"
-          if (-not (Test-Path $schemaPath)) { Write-Host "No schema folder, skipping."; exit 0 }
-          $files = Get-ChildItem $schemaPath -Filter *.sql -File | Sort-Object Name
-          if ($files.Count -eq 0) { Write-Host "No schema scripts, skipping."; exit 0 }
+    - script: |
+        set -euo pipefail
 
-          foreach ($f in $files) {
-            Write-Host "Executing schema: $($f.Name)"
-            & sqlcmd -S tcp:$server,1433 -d $db -U $user -P $pwd -b -I -l 60 -i $f.FullName
-            if ($LASTEXITCODE -ne 0) { throw "sqlcmd failed for $($f.Name) ($LASTEXITCODE)" }
-          }
+        ROOT="$(Build.SourcesDirectory)"
+        SCHEMA_DIR="$ROOT/db/schema"
+        SEED_DIR="$ROOT/db/data/seed"
+        ROLLBACK_DIR="$ROOT/db/rollback"
 
-    # 2) Seed (or rollback)
-    - task: PowerShell@2
-      displayName: "Apply ${{ parameters.action }} scripts"
-      env: { SQLPASSWORD: $(sqlPassword) }
-      inputs:
-        targetType: inline
-        script: |
-          $ErrorActionPreference = 'Stop'
-          $server = "$(serverName)"; $db = "$(databaseName)"
-          $user   = "$(sqlUser)";   $pwd = $env:SQLPASSWORD
-          $path   = if ("${{ parameters.action }}" -eq "deploy") { "$(Build.SourcesDirectory)\db\data\seed" } else { "$(Build.SourcesDirectory)\db\data\rollback" }
+        SQLCMD="sqlcmd -S $(serverName) -d $(databaseName) -U $(sqlUser) -P '$(sqlPassword)' -b -l 60 -I"
 
-          if (-not (Test-Path $path)) { Write-Host "Missing folder: $path, skipping."; exit 0 }
-          $files = Get-ChildItem $path -Filter *.sql -File | Sort-Object Name
-          if ($files.Count -eq 0) { Write-Host "No SQL files in $path, skipping."; exit 0 }
+        run_dir () {
+          local dir="$1"
+          if [ -d "$dir" ]; then
+            echo "==> Running scripts in $dir"
+            # Use git ls-files to ensure stable, committed order; fallback to find if needed
+            files=$(git -C "$ROOT" ls-files -- "$dir/*.sql" | sort || true)
+            if [ -z "$files" ]; then
+              files=$(find "$dir" -maxdepth 1 -type f -name "*.sql" | sort || true)
+            fi
 
-          foreach ($f in $files) {
-            Write-Host "Executing $("${{ parameters.action }}"): $($f.Name)"
-            & sqlcmd -S tcp:$server,1433 -d $db -U $user -P $pwd -b -I -l 120 -i $f.FullName
-            if ($LASTEXITCODE -ne 0) { throw "sqlcmd failed for $($f.Name) ($LASTEXITCODE)" }
-          }
+            if [ -z "$files" ]; then
+              echo "No .sql files found in $dir"
+              return 0
+            fi
 
-    - task: PublishBuildArtifacts@1
-      displayName: "Publish artifact: db-scripts"
-      inputs:
-        PathtoPublish: 'db'
-        ArtifactName: 'db'
-        publishLocation: 'Container'
+            for f in $files; do
+              echo "---- sqlcmd: $(basename "$f")"
+              $SQLCMD -i "$f"
+            done
+          else
+            echo "Directory $dir not found (skipping)"
+          fi
+        }
 
+        case "${{ parameters.action }}" in
+          deploy)
+            run_dir "$SCHEMA_DIR"
+            run_dir "$SEED_DIR"
+            ;;
+          seed-only)
+            run_dir "$SEED_DIR"
+            ;;
+          rollback)
+            run_dir "$ROLLBACK_DIR"
+            ;;
+          *)
+            echo "Unknown action"; exit 2
+            ;;
+        esac
+
+        echo "All done."
+      displayName: "Run sqlcmd over scripts"

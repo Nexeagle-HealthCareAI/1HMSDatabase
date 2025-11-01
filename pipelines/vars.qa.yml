@@ -2,11 +2,10 @@
 variables:
   environmentName: 'qa'
 
-  serverName: 'easyhmsdatabaseqa.database.windows.net'
-  databaseName: 'easyHMSDatabaseQA'
-
-  sqlUser: '$(qa.sqlUser)'           # secret in variable group
-  sqlPassword: '$(qa.sqlPassword)'   # secret
+  serverName: '$(serverName)'
+  databaseName: '$(databaseName)'
+  sqlUser: '$(sqlUser)'
+  sqlPassword: '$(sqlPassword)'
 
   owner: 'data-platform'
   appName: 'easyHMSDatabaseQA'

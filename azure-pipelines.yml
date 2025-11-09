@@ -1,19 +1,16 @@
 # azure-pipelines-db.yml
+
 trigger:
   branches:
-    include:
-      - main
+    include: [ main ]
   paths:
-    include:
-      - db/**
+    include: [ db/** ]
 
 pr:
   branches:
-    include:
-      - main
+    include: [ main ]
   paths:
-    include:
-      - db/**
+    include: [ db/** ]
 
 parameters:
 - name: action
@@ -31,23 +28,30 @@ parameters:
 pool:
   vmImage: ubuntu-latest
 
-# Re-usable job steps to avoid duplication
-# (YAML anchors are not supported; we just copy steps between stages)
+# ---------------------------------------------
+# Variables (selected once based on targetEnv)
+# ---------------------------------------------
+variables:
+# Use exactly one variable group based on target env
+- ${{ if eq(parameters.targetEnv, 'dev') }}:
+  - group: swa-secrets-dev
+- ${{ if eq(parameters.targetEnv, 'qa') }}:
+  - group: swa-secrets-qa
+
+# Expect these keys inside the selected group:
+#   SqlServer, DatabaseName, SqlUser, SqlPassword
 
 stages:
-# ========================= DEV =========================
-- stage: Dev
-  displayName: "DB: ${{ parameters.action }} → DEV"
-  condition: and(succeeded(), eq('${{ parameters.targetEnv }}','dev'))
-  variables:
-  - group: swa-secrets-dev
+- stage: DB
+  displayName: "DB: ${{ parameters.action }} → ${{ parameters.targetEnv | upper }}"
   jobs:
-  - job: ExecuteDev
-    displayName: "Execute SQL (${{ parameters.action }}) - DEV"
+  - job: Execute
+    displayName: "Execute SQL (${{ parameters.action }}) - ${{ parameters.targetEnv | upper }}"
     steps:
     - checkout: self
       clean: true
 
+    # Install sqlcmd (tools v18)
     - bash: |
         set -euo pipefail
         curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
@@ -55,126 +59,92 @@ stages:
         sudo apt-get update
         sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
         echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
+        which sqlcmd || true
+        sqlcmd -?      || true
       displayName: Install sqlcmd (mssql-tools18)
 
+    # Show what we’re about to run
     - bash: |
         set -euo pipefail
-        echo "Action: ${{ parameters.action }}"
-        echo "Server: $(SqlServer)"
-        echo "DB:     $(DatabaseName)"
-        echo "Listing files..."
+        echo "Env:       ${{ parameters.targetEnv }}"
+        echo "Action:    ${{ parameters.action }}"
+        echo "Server:    $SQLSERVER"
+        echo "Database:  $DATABASE"
+        echo "Listing files (if any):"
         ls -1v db/schema/tables/*.sql   2>/dev/null || true
         ls -1v db/schema/indexes/*.sql  2>/dev/null || true
         ls -1v db/dml/seed/*.sql        2>/dev/null || true
         ls -1v db/rollback/*.sql        2>/dev/null || true
       displayName: Inspect file lists
+      env:
+        SQLSERVER: $(SqlServer)
+        DATABASE: $(DatabaseName)
 
+    # Deploy path: Tables -> Indexes -> DML
     - bash: |
         set -euo pipefail
         shopt -s nullglob
+
         if [ "${{ parameters.action }}" != "deploy" ]; then
           echo "Skip deploy for action=${{ parameters.action }}"
           exit 0
         fi
-        echo "==> TABLES"
-        for f in $(ls -1v db/schema/tables/*.sql); do
-          echo "---- $f"
-          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-        done
-        echo "==> INDEXES"
-        for f in $(ls -1v db/schema/indexes/*.sql); do
-          echo "---- $f"
-          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-        done
-        echo "==> DML SEED"
-        for f in $(ls -1v db/dml/seed/*.sql); do
-          echo "---- $f"
-          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-        done
-      displayName: DEPLOY Dev (Tables → Indexes → DML)
 
+        run_folder () {
+          local title="$1"; shift
+          local pattern="$1"; shift
+
+          echo "==> ${title}"
+          files=( ${pattern} )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No files found for ${title}; skipping."
+            return 0
+          fi
+
+          for f in "${files[@]}"; do
+            echo "---- $f"
+            sqlcmd -C -b -l 60 -I \
+              -S "$SQLSERVER" -d "$DATABASE" -U "$SQLUSER" -P "$SQLPASSWORD" \
+              -i "$f"
+          done
+        }
+
+        run_folder "TABLES"  "db/schema/tables/*.sql"
+        run_folder "INDEXES" "db/schema/indexes/*.sql"
+        run_folder "DML SEED" "db/dml/seed/*.sql"
+      displayName: DEPLOY (Tables → Indexes → DML)
+      env:
+        SQLSERVER: $(SqlServer)
+        DATABASE: $(DatabaseName)
+        SQLUSER: $(SqlUser)
+        SQLPASSWORD: $(SqlPassword)
+
+    # Rollback path
     - bash: |
         set -euo pipefail
         shopt -s nullglob
+
         if [ "${{ parameters.action }}" != "rollback" ]; then
           echo "Skip rollback for action=${{ parameters.action }}"
           exit 0
         fi
+
         echo "==> ROLLBACK"
-        for f in $(ls -1v db/rollback/*.sql); do
-          echo "---- $f"
-          sqlcmd -C -b -l 120 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-        done
-      displayName: ROLLBACK Dev
-
-# ========================= QA =========================
-- stage: QA
-  displayName: "DB: ${{ parameters.action }} → QA"
-  condition: and(succeeded(), eq('${{ parameters.targetEnv }}','qa'))
-  variables:
-  - group: swa-secrets-qa
-  jobs:
-  - job: ExecuteQA
-    displayName: "Execute SQL (${{ parameters.action }}) - QA"
-    steps:
-    - checkout: self
-      clean: true
-
-    - bash: |
-        set -euo pipefail
-        curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
-        curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
-        sudo apt-get update
-        sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
-        echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
-      displayName: Install sqlcmd (mssql-tools18)
-
-    - bash: |
-        set -euo pipefail
-        echo "Action: ${{ parameters.action }}"
-        echo "Server: $(SqlServer)"
-        echo "DB:     $(DatabaseName)"
-        echo "Listing files..."
-        ls -1v db/schema/tables/*.sql   2>/dev/null || true
-        ls -1v db/schema/indexes/*.sql  2>/dev/null || true
-        ls -1v db/dml/seed/*.sql        2>/dev/null || true
-        ls -1v db/rollback/*.sql        2>/dev/null || true
-      displayName: Inspect file lists
-
-    - bash: |
-        set -euo pipefail
-        shopt -s nullglob
-        if [ "${{ parameters.action }}" != "deploy" ]; then
-          echo "Skip deploy for action=${{ parameters.action }}"
+        files=( db/rollback/*.sql )
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "No rollback scripts found; skipping."
           exit 0
         fi
-        echo "==> TABLES"
-        for f in $(ls -1v db/schema/tables/*.sql); do
-          echo "---- $f"
-          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-        done
-        echo "==> INDEXES"
-        for f in $(ls -1v db/schema/indexes/*.sql); do
-          echo "---- $f"
-          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-        done
-        echo "==> DML SEED"
-        for f in $(ls -1v db/dml/seed/*.sql); do
-          echo "---- $f"
-          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-        done
-      displayName: DEPLOY QA (Tables → Indexes → DML)
 
-    - bash: |
-        set -euo pipefail
-        shopt -s nullglob
-        if [ "${{ parameters.action }}" != "rollback" ]; then
-          echo "Skip rollback for action=${{ parameters.action }}"
-          exit 0
-        fi
-        echo "==> ROLLBACK"
-        for f in $(ls -1v db/rollback/*.sql); do
+        for f in "${files[@]}"; do
           echo "---- $f"
-          sqlcmd -C -b -l 120 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+          sqlcmd -C -b -l 120 -I \
+            -S "$SQLSERVER" -d "$DATABASE" -U "$SQLUSER" -P "$SQLPASSWORD" \
+            -i "$f"
         done
-      displayName: ROLLBACK QA
+      displayName: ROLLBACK
+      env:
+        SQLSERVER: $(SqlServer)
+        DATABASE: $(DatabaseName)
+        SQLUSER: $(SqlUser)
+        SQLPASSWORD: $(SqlPassword)

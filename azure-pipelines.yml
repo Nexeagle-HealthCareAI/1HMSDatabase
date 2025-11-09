@@ -15,7 +15,6 @@ parameters:
 
 - name: targetEnv
   type: string
-  default: dev
   values: [ dev, qa ]
 
 pool: { vmImage: ubuntu-latest }
@@ -100,7 +99,7 @@ stages:
   # Use a deployment job to attach an Environment (approvals, history, etc.)
   - deployment: ExecuteQA
     displayName: "Execute SQL (${{ parameters.action }}) - QA"
-    environment: 'qa'   # <-- valid here on deployment jobs
+    environment: 'QA'   # <-- valid here on deployment jobs
     strategy:
       runOnce:
         deploy:

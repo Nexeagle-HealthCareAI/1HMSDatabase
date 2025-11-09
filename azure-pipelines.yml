@@ -1,115 +1,78 @@
-# easyHMSDatabase – SQL deploy via sqlcmd in container
+jobs:
+- job: run_sql
+  displayName: "Execute SQL scripts with sqlcmd"
+  pool:
+    vmImage: 'ubuntu-latest'
+  container: mcr.microsoft.com/mssql-tools:18-ubuntu-22.04
 
-trigger:
-  branches: { include: [ main ] }
-  paths:
-    include:
-      - db/*
-      - pipelines/*
-      - pipelines/azure-pipelines-db.yml
-      - pipelines/vars.*.yml
+  steps:
+  - checkout: self
+    clean: true
 
-pr:
-  branches: { include: [ main ] }
-  paths:
-    include:
-      - db/*
-      - pipelines/*
+  - script: |
+      echo "Validating variables..."
+      echo "Server: $(serverName)"
+      echo "Database: $(databaseName)"
+      echo "User: $(sqlUser)"
+      test -n "$(serverName)"   || { echo "serverName not set"; exit 1; }
+      test -n "$(databaseName)" || { echo "databaseName not set"; exit 1; }
+      test -n "$(sqlUser)"      || { echo "sqlUser not set"; exit 1; }
+      test -n "$(sqlPassword)"  || { echo "sqlPassword not set"; exit 1; }
+    displayName: "Sanity check (masked)"
 
-parameters:
-  - name: environment
-    displayName: Target environment
-    type: string
-    default: dev
-    values: [ dev, qa ]
+  - script: |
+      set -euo pipefail
 
-  - name: action
-    displayName: What to run
-    type: string
-    default: deploy
-    values: [ deploy, seed-only, rollback ]
+      export PATH="/opt/mssql-tools18/bin:/opt/mssql-tools/bin:$PATH"
+      command -v sqlcmd >/dev/null || { echo "sqlcmd not found"; exit 127; }
+      export SQLCMDPASSWORD="$(sqlPassword)"
 
-# Pull secrets from Library → Variable groups
-variables:
-  - ${{ if eq(parameters.environment, 'dev') }}:
-    - group: 'swa-secrets-dev'
-  - ${{ if eq(parameters.environment, 'qa') }}:
-    - group: 'swa-secrets-qa'
+      ROOT="$(Build.SourcesDirectory)"
+      SCHEMA_DIR="$ROOT/db/schema"
+      SCHEMA_TABLES_DIR="$SCHEMA_DIR/tables"
+      SCHEMA_INDEXES_DIR="$SCHEMA_DIR/indexes"
+      SEED_DIR="$ROOT/db/data/seed"
+      ROLLBACK_DIR="$ROOT/db/rollback"
 
-stages:
-- stage: Deploy_${{ parameters.environment }}
-  displayName: "DB ${{ parameters.environment }} – ${{ parameters.action }}"
-  jobs:
-  - job: run_sql
-    displayName: "Execute SQL scripts with sqlcmd"
-    pool:
-      vmImage: 'ubuntu-latest'
-    container: mcr.microsoft.com/mssql-tools:latest
+      SQLCMD="sqlcmd -S $(serverName) -d $(databaseName) -U $(sqlUser) -b -l 60 -I"
 
-    steps:
-    - checkout: self
-      clean: true
-
-    - script: |
-        echo "Validating variables for ${{ parameters.environment }}..."
-        echo "Server: $(serverName)"
-        echo "Database: $(databaseName)"
-        echo "User: $(sqlUser)"
-        # DO NOT echo the password
-        test -n "$(serverName)"    || { echo "serverName not set"; exit 1; }
-        test -n "$(databaseName)"  || { echo "databaseName not set"; exit 1; }
-        test -n "$(sqlUser)"       || { echo "sqlUser not set"; exit 1; }
-        test -n "$(sqlPassword)"   || { echo "sqlPassword not set"; exit 1; }
-      displayName: "Sanity check (masked)"
-
-    - script: |
-        set -euo pipefail
-
-        export SQLCMDPASSWORD="$(sqlPassword)"   # prefer env var over -P
-        ROOT="$(Build.SourcesDirectory)"
-        SCHEMA_DIR="$ROOT/db/schema"
-        SEED_DIR="$ROOT/db/data/seed"
-        ROLLBACK_DIR="$ROOT/db/rollback"
-
-        # -b: abort on error, -l: login timeout, -I: quoted identifiers on
-        SQLCMD="sqlcmd -S $(serverName) -d $(databaseName) -U $(sqlUser) -b -l 60 -I"
-
-        run_dir () {
-          local dir="$1"
-          if [ -d "$dir" ]; then
-            echo "==> Running scripts in $dir"
-            files=$(git -C "$ROOT" ls-files -- "$dir/*.sql" | sort || true)
-            if [ -z "$files" ]; then
-              files=$(find "$dir" -maxdepth 1 -type f -name "*.sql" | sort || true)
-            fi
-            if [ -z "$files" ]; then
-              echo "No .sql files found in $dir"
-              return 0
-            fi
-            for f in $files; do
-              echo "---- sqlcmd: $(basename "$f")"
-              $SQLCMD -i "$f"
-            done
-          else
-            echo "Directory $dir not found (skipping)"
+      run_dir () {
+        local dir="$1"
+        if [ -d "$dir" ]; then
+          echo "==> Running scripts in $dir"
+          # Recurse and sort for deterministic order
+          mapfile -t files < <(find "$dir" -type f -name "*.sql" | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No .sql files found in $dir"
+            return 0
           fi
-        }
+          for f in "${files[@]}"; do
+            echo "---- sqlcmd: $(realpath --relative-to="$ROOT" "$f")"
+            $SQLCMD -i "$f"
+          done
+        else
+          echo "Directory $dir not found (skipping)"
+        fi
+      }
 
-        case "${{ parameters.action }}" in
-          deploy)
-            run_dir "$SCHEMA_DIR"
-            run_dir "$SEED_DIR"
-            ;;
-          seed-only)
-            run_dir "$SEED_DIR"
-            ;;
-          rollback)
-            run_dir "$ROLLBACK_DIR"
-            ;;
-          *)
-            echo "Unknown action"; exit 2
-            ;;
-        esac
+      case "${{ parameters.action }}" in
+        deploy)
+          # Run schema in a clear order
+          run_dir "$SCHEMA_DIR"          # any top-level schema .sql (optional)
+          run_dir "$SCHEMA_TABLES_DIR"   # create tables first
+          run_dir "$SCHEMA_INDEXES_DIR"  # then indexes/constraints
+          run_dir "$SEED_DIR"            # then seed data
+          ;;
+        seed-only)
+          run_dir "$SEED_DIR"
+          ;;
+        rollback)
+          run_dir "$ROLLBACK_DIR"
+          ;;
+        *)
+          echo "Unknown action"; exit 2
+          ;;
+      esac
 
-        echo "All done."
-      displayName: "Run sqlcmd over scripts"
+      echo "All done."
+    displayName: "Run sqlcmd over scripts"

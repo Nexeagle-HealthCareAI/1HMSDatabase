@@ -100,7 +100,7 @@ stages:
   # Use a deployment job to attach an Environment (approvals, history, etc.)
   - deployment: ExecuteQA
     displayName: "Execute SQL (${{ parameters.action }}) - QA"
-    environment: 'qa-db'   # <-- valid here on deployment jobs
+    environment: 'qa'   # <-- valid here on deployment jobs
     strategy:
       runOnce:
         deploy:

@@ -1,3 +1,4 @@
+# azure-pipelines.yml — DEV + QA (QA gated by Environment approval)
 trigger:
   branches: { include: [ main ] }
 
@@ -8,12 +9,12 @@ parameters:
   values: [ deploy, seed-only, rollback ]
 
 stages:
-# ---------------- DEV ----------------
+# ======================= DEV =======================
 - stage: Deploy_dev
   displayName: "DB dev – ${{ parameters.action }}"
   condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
   variables:
-  - group: swa-secrets-dev
+  - group: swa-secrets-dev   # serverName, databaseName, sqlUser, sqlPassword
   jobs:
   - deployment: DevDeploy
     environment: DEV
@@ -24,7 +25,6 @@ stages:
           - checkout: self
             clean: true
 
-          # Install sqlcmd (mssql-tools18) on the agent
           - script: |
               set -euo pipefail
               sudo apt-get update
@@ -39,7 +39,6 @@ stages:
               echo "sqlcmd installed OK"
             displayName: "Install sqlcmd (DEV)"
 
-          # Sanity + connectivity
           - script: |
               set -euo pipefail
               export PATH="$PATH:/opt/mssql-tools18/bin"
@@ -56,7 +55,6 @@ stages:
               sqlcmd -S "$(serverName)" -d "$(databaseName)" -U "$(sqlUser)" -b -l 30 -I -Q "SELECT DB_NAME() AS Db;"
             displayName: "Validate inputs & test connection (DEV)"
 
-          # Run scripts (schema -> seed) or rollback
           - script: |
               set -euo pipefail
               export PATH="$PATH:/opt/mssql-tools18/bin"
@@ -91,7 +89,6 @@ stages:
 
               case "${{ parameters.action }}" in
                 deploy)
-                  # order matters: base -> tables -> indexes -> views -> procs -> seed
                   list_and_run "$SCHEMA_DIR"
                   list_and_run "$SCHEMA_DIR/tables"
                   list_and_run "$SCHEMA_DIR/indexes"
@@ -110,16 +107,16 @@ stages:
               echo "DEV deployment complete."
             displayName: "Run SQL scripts (DEV)"
 
-# ---------------- QA (approval-gated) ----------------
+# ======================= QA (approval-gated) =======================
 - stage: Deploy_qa
   displayName: "DB qa – ${{ parameters.action }}"
   dependsOn: Deploy_dev
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
   variables:
-  - group: swa-secrets-qa
+  - group: swa-secrets-qa   # serverName, databaseName, sqlUser, sqlPassword
   jobs:
   - deployment: QaDeploy
-    environment: QA     # attach approvals/checks to this Environment in DevOps
+    environment: QA          # add Approvals & checks to this Environment in DevOps
     strategy:
       runOnce:
         deploy:
@@ -165,4 +162,46 @@ stages:
               ROOT="$(Build.SourcesDirectory)"
               SCHEMA_DIR="$ROOT/db/schema"
               SEED_DIR="$ROOT/db/data/seed"
-              ROLLBACK_DIR="$ROOT/db/rollback_
+              ROLLBACK_DIR="$ROOT/db/rollback"
+
+              SQLCMD="sqlcmd -S $(serverName) -d $(databaseName) -U $(sqlUser) -b -l 60 -I"
+
+              list_and_run () {
+                local dir="$1"
+                if [ ! -d "$dir" ]; then
+                  echo "SKIP (missing dir): $dir"
+                  return 0
+                fi
+                echo "==> Searching: $dir"
+                mapfile -t files < <(find "$dir" -type f -name "*.sql" | sort)
+                if [ "${#files[@]}" -eq 0 ]; then
+                  echo "No .sql files in $dir"
+                  return 0
+                fi
+                echo "Files to run:"
+                for f in "${files[@]}"; do echo "  - ${f#$ROOT/}"; done
+                for f in "${files[@]}"; do
+                  echo "---- RUN: ${f#$ROOT/}"
+                  $SQLCMD -i "$f"
+                done
+              }
+
+              case "${{ parameters.action }}" in
+                deploy)
+                  list_and_run "$SCHEMA_DIR"
+                  list_and_run "$SCHEMA_DIR/tables"
+                  list_and_run "$SCHEMA_DIR/indexes"
+                  list_and_run "$SCHEMA_DIR/views"
+                  list_and_run "$SCHEMA_DIR/procs"
+                  list_and_run "$SEED_DIR"
+                  ;;
+                seed-only)
+                  list_and_run "$SEED_DIR"
+                  ;;
+                rollback)
+                  list_and_run "$ROLLBACK_DIR"
+                  ;;
+              esac
+
+              echo "QA deployment complete."
+            displayName: "Run SQL scripts (QA)"

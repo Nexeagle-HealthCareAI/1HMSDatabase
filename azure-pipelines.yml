@@ -52,7 +52,7 @@ stages:
         echo "Server: $(SqlServer), DB: $(DatabaseName)"
         ls -1v db/schema/tables/*.sql   2>/dev/null || true
         ls -1v db/schema/indexes/*.sql  2>/dev/null || true
-        ls -1v db/dml/seed/*.sql        2>/dev/null || true
+        ls -1v db/data/seed/*.sql        2>/dev/null || true
         ls -1v db/rollback/*.sql        2>/dev/null || true
       displayName: Inspect files
     - bash: |
@@ -62,7 +62,7 @@ stages:
           echo "Skip deploy"; exit 0; fi
         for f in $(ls -1v db/schema/tables/*.sql);   do echo "TABLE -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
         for f in $(ls -1v db/schema/indexes/*.sql);  do echo "INDEX -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
-        for f in $(ls -1v db/dml/seed/*.sql);        do echo "DML   -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
+        for f in $(ls -1v db/data/seed/*.sql);        do echo "DML   -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
       displayName: DEPLOY DEV (Tables → Indexes → DML)
     - bash: |
         set -euo pipefail
@@ -99,7 +99,7 @@ stages:
         echo "Server: $(SqlServer), DB: $(DatabaseName)"
         ls -1v db/schema/tables/*.sql   2>/dev/null || true
         ls -1v db/schema/indexes/*.sql  2>/dev/null || true
-        ls -1v db/dml/seed/*.sql        2>/dev/null || true
+        ls -1v db/data/seed/*.sql        2>/dev/null || true
         ls -1v db/rollback/*.sql        2>/dev/null || true
       displayName: Inspect files
     - bash: |
@@ -109,7 +109,7 @@ stages:
           echo "Skip deploy"; exit 0; fi
         for f in $(ls -1v db/schema/tables/*.sql);   do echo "TABLE -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
         for f in $(ls -1v db/schema/indexes/*.sql);  do echo "INDEX -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
-        for f in $(ls -1v db/dml/seed/*.sql);        do echo "DML   -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
+        for f in $(ls -1v db/data/seed/*.sql);        do echo "DML   -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
       displayName: DEPLOY QA (Tables → Indexes → DML)
     - bash: |
         set -euo pipefail

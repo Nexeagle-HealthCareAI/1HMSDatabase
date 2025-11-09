@@ -40,7 +40,7 @@ stages:
   displayName: "DB: ${{ parameters.action }} → DEV"
   condition: and(succeeded(), eq('${{ parameters.targetEnv }}','dev'))
   variables:
-  - group: easyhms-dev-db  # DEFINE THIS VARIABLE GROUP IN LIBRARY
+  - group: swa-secrets-dev
   jobs:
   - job: ExecuteDev
     displayName: "Execute SQL (${{ parameters.action }}) - DEV"
@@ -112,7 +112,7 @@ stages:
   displayName: "DB: ${{ parameters.action }} → QA"
   condition: and(succeeded(), eq('${{ parameters.targetEnv }}','qa'))
   variables:
-  - group: easyhms-qa-db  # DEFINE THIS VARIABLE GROUP IN LIBRARY
+  - group: swa-secrets-qa
   jobs:
   - job: ExecuteQA
     displayName: "Execute SQL (${{ parameters.action }}) - QA"

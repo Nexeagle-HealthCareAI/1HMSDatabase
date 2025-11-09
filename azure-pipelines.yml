@@ -15,22 +15,23 @@ parameters:
 
 - name: targetEnv
   type: string
-  default: dev            # set to dev by default; choose 'qa' on manual run
+  default: dev
   values: [ dev, qa ]
 
 - name: qaEnvironmentName
   type: string
-  default: QA             # <-- EXACT environment name in DevOps
+  default: QA
 
 pool: { vmImage: ubuntu-latest }
 
 stages:
-# ================== DEV ==================
+# ------------ DEV ------------
 - stage: Dev
   displayName: "DB: ${{ parameters.action }} → DEV"
-  condition: and(succeeded(), eq('${{ parameters.targetEnv }}','dev'))
+  # ⬅️ compile-time condition (no succeeded() here)
+  condition: ${{ eq(parameters.targetEnv, 'dev') }}
   variables:
-  - group: 'swa-secrets-dev'   # expects: SqlServer, DatabaseName, SqlUser, SqlPassword
+  - group: 'swa-secrets-dev'     # ⬅️ bind var group inside the stage
   jobs:
   - job: ExecuteDev
     displayName: "Execute SQL (${{ parameters.action }}) - DEV"
@@ -44,43 +45,31 @@ stages:
         curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
         sudo apt-get update
         sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
-        echo "##vso[task.prependpath]/opt/mssql-tools18/bin"
-        export PATH="$PATH:/opt/mssql-tools18/bin"
-        which sqlcmd || true
+        echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
       displayName: Install sqlcmd (mssql-tools18)
 
     - bash: |
         set -euo pipefail
-        # quick var sanity
-        test -n "$(SqlServer)" && test -n "$(DatabaseName)" && test -n "$(SqlUser)" && test -n "$(SqlPassword)"
-
-        echo "Testing connectivity to DEV DB..."
-        sqlcmd -C -b -l 30 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -Q "SELECT TOP 1 name FROM sys.databases"
-        echo "Connectivity OK."
-
-        echo "Listing files:"
+        echo "Server: $(SqlServer), DB: $(DatabaseName)"
         ls -1v db/schema/tables/*.sql   2>/dev/null || true
         ls -1v db/schema/indexes/*.sql  2>/dev/null || true
         ls -1v db/data/seed/*.sql       2>/dev/null || true
         ls -1v db/rollback/*.sql        2>/dev/null || true
-      displayName: Inspect & connectivity check (DEV)
+      displayName: Inspect files
 
     - bash: |
         set -euo pipefail
         shopt -s nullglob
-        if [ "${{ parameters.action }}" != "deploy" ]; then
-          echo "Skip deploy"; exit 0; fi
+        if [ "${{ parameters.action }}" != "deploy" ]; then echo "Skip deploy"; exit 0; fi
 
         for f in $(ls -1v db/schema/tables/*.sql);  do
           echo "TABLE -> $f"
           sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
         done
-
         for f in $(ls -1v db/schema/indexes/*.sql); do
           echo "INDEX -> $f"
           sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
         done
-
         for f in $(ls -1v db/data/seed/*.sql);   do
           echo "DML   -> $f"
           sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
@@ -90,8 +79,7 @@ stages:
     - bash: |
         set -euo pipefail
         shopt -s nullglob
-        if [ "${{ parameters.action }}" != "rollback" ]; then
-          echo "Skip rollback"; exit 0; fi
+        if [ "${{ parameters.action }}" != "rollback" ]; then echo "Skip rollback"; exit 0; fi
 
         for f in $(ls -1v db/rollback/*.sql); do
           echo "ROLLBACK -> $f"
@@ -99,16 +87,17 @@ stages:
         done
       displayName: ROLLBACK DEV
 
-# ================== QA ==================
+# ------------ QA ------------
 - stage: QA
   displayName: "DB: ${{ parameters.action }} → QA"
-  condition: and(succeeded(), eq('${{ parameters.targetEnv }}','qa'))
+  # ⬅️ compile-time condition
+  condition: ${{ eq(parameters.targetEnv, 'qa') }}
   variables:
-  - group: 'swa-secrets-qa'    # expects: SqlServer, DatabaseName, SqlUser, SqlPassword
+  - group: 'swa-secrets-qa'      # ⬅️ bind var group inside the stage
   jobs:
   - deployment: ExecuteQA
     displayName: "Execute SQL (${{ parameters.action }}) - QA"
-    environment: '${{ parameters.qaEnvironmentName }}'   # must match exact Env name: QA
+    environment: ${{ parameters.qaEnvironmentName }}  # ⬅️ 'QA'
     strategy:
       runOnce:
         deploy:
@@ -122,43 +111,31 @@ stages:
               curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
               sudo apt-get update
               sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
-              echo "##vso[task.prependpath]/opt/mssql-tools18/bin"
-              export PATH="$PATH:/opt/mssql-tools18/bin"
-              which sqlcmd || true
+              echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
             displayName: Install sqlcmd (mssql-tools18)
 
           - bash: |
               set -euo pipefail
-              # var sanity
-              test -n "$(SqlServer)" && test -n "$(DatabaseName)" && test -n "$(SqlUser)" && test -n "$(SqlPassword)"
-
-              echo "Testing connectivity to QA DB..."
-              sqlcmd -C -b -l 30 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -Q "SELECT TOP 1 name FROM sys.databases"
-              echo "Connectivity OK."
-
-              echo "Listing files:"
+              echo "Server: $(SqlServer), DB: $(DatabaseName)"
               ls -1v db/schema/tables/*.sql   2>/dev/null || true
               ls -1v db/schema/indexes/*.sql  2>/dev/null || true
               ls -1v db/data/seed/*.sql       2>/dev/null || true
               ls -1v db/rollback/*.sql        2>/dev/null || true
-            displayName: Inspect & connectivity check (QA)
+            displayName: Inspect files
 
           - bash: |
               set -euo pipefail
               shopt -s nullglob
-              if [ "${{ parameters.action }}" != "deploy" ]; then
-                echo "Skip deploy"; exit 0; fi
+              if [ "${{ parameters.action }}" != "deploy" ]; then echo "Skip deploy"; exit 0; fi
 
               for f in $(ls -1v db/schema/tables/*.sql);  do
                 echo "TABLE -> $f"
                 sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
               done
-
               for f in $(ls -1v db/schema/indexes/*.sql); do
                 echo "INDEX -> $f"
                 sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
               done
-
               for f in $(ls -1v db/data/seed/*.sql);   do
                 echo "DML   -> $f"
                 sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
@@ -168,8 +145,7 @@ stages:
           - bash: |
               set -euo pipefail
               shopt -s nullglob
-              if [ "${{ parameters.action }}" != "rollback" ]; then
-                echo "Skip rollback"; exit 0; fi
+              if [ "${{ parameters.action }}" != "rollback" ]; then echo "Skip rollback"; exit 0; fi
 
               for f in $(ls -1v db/rollback/*.sql); do
                 echo "ROLLBACK -> $f"

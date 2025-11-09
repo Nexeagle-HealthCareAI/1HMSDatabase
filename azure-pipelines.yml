@@ -1,5 +1,4 @@
 # azure-pipelines-db.yml
-
 trigger:
   branches:
     include: [ main ]
@@ -32,21 +31,19 @@ pool:
 # Variables (selected once based on targetEnv)
 # ---------------------------------------------
 variables:
-# Use exactly one variable group based on target env
 - ${{ if eq(parameters.targetEnv, 'dev') }}:
-  - group: swa-secrets-dev
+  - group: 'swa-secrets-dev'
 - ${{ if eq(parameters.targetEnv, 'qa') }}:
-  - group: swa-secrets-qa
-
-# Expect these keys inside the selected group:
+  - group: 'swa-secrets-qa'
+# Required keys in the selected group:
 #   SqlServer, DatabaseName, SqlUser, SqlPassword
 
 stages:
 - stage: DB
-  displayName: "DB: ${{ parameters.action }} → ${{ parameters.targetEnv | upper }}"
+  displayName: "DB: ${{ parameters.action }} → ${{ upper(parameters.targetEnv) }}"
   jobs:
   - job: Execute
-    displayName: "Execute SQL (${{ parameters.action }}) - ${{ parameters.targetEnv | upper }}"
+    displayName: "Execute SQL (${{ parameters.action }}) - ${{ upper(parameters.targetEnv) }}"
     steps:
     - checkout: self
       clean: true
@@ -60,7 +57,7 @@ stages:
         sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
         echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
         which sqlcmd || true
-        sqlcmd -?      || true
+        sqlcmd -? || true
       displayName: Install sqlcmd (mssql-tools18)
 
     # Show what we’re about to run
@@ -68,17 +65,14 @@ stages:
         set -euo pipefail
         echo "Env:       ${{ parameters.targetEnv }}"
         echo "Action:    ${{ parameters.action }}"
-        echo "Server:    $SQLSERVER"
-        echo "Database:  $DATABASE"
+        echo "Server:    $(SqlServer)"
+        echo "Database:  $(DatabaseName)"
         echo "Listing files (if any):"
         ls -1v db/schema/tables/*.sql   2>/dev/null || true
         ls -1v db/schema/indexes/*.sql  2>/dev/null || true
         ls -1v db/dml/seed/*.sql        2>/dev/null || true
         ls -1v db/rollback/*.sql        2>/dev/null || true
       displayName: Inspect file lists
-      env:
-        SQLSERVER: $(SqlServer)
-        DATABASE: $(DatabaseName)
 
     # Deploy path: Tables -> Indexes -> DML
     - bash: |
@@ -104,20 +98,15 @@ stages:
           for f in "${files[@]}"; do
             echo "---- $f"
             sqlcmd -C -b -l 60 -I \
-              -S "$SQLSERVER" -d "$DATABASE" -U "$SQLUSER" -P "$SQLPASSWORD" \
+              -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" \
               -i "$f"
           done
         }
 
-        run_folder "TABLES"  "db/schema/tables/*.sql"
-        run_folder "INDEXES" "db/schema/indexes/*.sql"
+        run_folder "TABLES"   "db/schema/tables/*.sql"
+        run_folder "INDEXES"  "db/schema/indexes/*.sql"
         run_folder "DML SEED" "db/dml/seed/*.sql"
       displayName: DEPLOY (Tables → Indexes → DML)
-      env:
-        SQLSERVER: $(SqlServer)
-        DATABASE: $(DatabaseName)
-        SQLUSER: $(SqlUser)
-        SQLPASSWORD: $(SqlPassword)
 
     # Rollback path
     - bash: |
@@ -139,12 +128,7 @@ stages:
         for f in "${files[@]}"; do
           echo "---- $f"
           sqlcmd -C -b -l 120 -I \
-            -S "$SQLSERVER" -d "$DATABASE" -U "$SQLUSER" -P "$SQLPASSWORD" \
+            -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" \
             -i "$f"
         done
       displayName: ROLLBACK
-      env:
-        SQLSERVER: $(SqlServer)
-        DATABASE: $(DatabaseName)
-        SQLUSER: $(SqlUser)
-        SQLPASSWORD: $(SqlPassword)

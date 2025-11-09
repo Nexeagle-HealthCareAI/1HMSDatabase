@@ -1,36 +1,35 @@
 /*
-  easyHMS Seed: NONPHARM_ADVICE items into dbo.LookupMaster
+  easyHMS Seed (UPSERT, MERGE-free): NONPHARM_ADVICE into dbo.LookupMaster
   SeedId: 2025-11-01-NONPHARM
   Version: v1
-  LookupTypeId: 11 (Nonpharmacologic Advice)
-  Idempotent: existing rows with same Code will be updated; missing ones inserted.
+  LookupTypeId: 11
 */
+
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
 
 BEGIN TRY
-    BEGIN TRAN;
+  BEGIN TRAN;
 
-    DECLARE @SeedId NVARCHAR(50) = N'2025-11-01-NONPHARM';
-    DECLARE @SeedVersion NVARCHAR(20) = N'v1';
+  DECLARE @SeedId      NVARCHAR(50) = N'2025-11-01-NONPHARM';
+  DECLARE @SeedVersion NVARCHAR(20) = N'v1';
 
-    /* Staging table */
-    DECLARE @Items TABLE (
-        Code                   NVARCHAR(100) NOT NULL PRIMARY KEY,
-        Name                   NVARCHAR(200) NOT NULL,
-        ShortDesc              NVARCHAR(500) NULL,
-        Synonyms               NVARCHAR(400) NULL,
-        Category               NVARCHAR(80)  NULL,
-        SpecializationsJson    NVARCHAR(MAX) NULL, -- JSON array
-        TagsJson               NVARCHAR(MAX) NULL, -- JSON array
-        StepsJson              NVARCHAR(MAX) NULL, -- JSON array
-        ContraindicationsJson  NVARCHAR(MAX) NULL, -- JSON array
-        Frequency              NVARCHAR(200) NULL,
-        Notes                  NVARCHAR(800) NULL
-    );
+  /* ---------- STAGE INPUT ---------- */
+  DECLARE @Items TABLE (
+      Code                   NVARCHAR(100) NOT NULL PRIMARY KEY,
+      Name                   NVARCHAR(200) NOT NULL,
+      ShortDesc              NVARCHAR(500) NULL,
+      Synonyms               NVARCHAR(400) NULL,
+      Category               NVARCHAR(80)  NULL,
+      SpecializationsJson    NVARCHAR(MAX) NULL, -- JSON array string
+      TagsJson               NVARCHAR(MAX) NULL, -- JSON array string
+      StepsJson              NVARCHAR(MAX) NULL, -- JSON array string
+      ContraindicationsJson  NVARCHAR(MAX) NULL, -- JSON array string
+      Frequency              NVARCHAR(200) NULL,
+      Notes                  NVARCHAR(800) NULL
+  );
 
-    /* ========= Load items (from your list) ========= */
-    INSERT INTO @Items VALUES
+  INSERT INTO @Items VALUES
     (N'NP-GEN-DASH', N'DASH/Mediterranean Diet', N'High fruits/veg, whole grains; low salt and trans fat', N'Heart-healthy diet',
       N'Lifestyle', N'["General Medicine","Cardiology","Nephrology","Endocrinology"]', N'["diet","hypertension","lipids"]',
       N'["Fill half the plate with vegetables/fruits","Use whole grains","Choose fish/legumes; limit red/processed meat","Use oils like olive/mustard; avoid trans fats","Limit sodium to ~2g (≈5g salt)/day"]',
@@ -351,182 +350,144 @@ BEGIN TRY
       N'["Every 20 min, look 20 feet away for 20 seconds","Ensure proper screen height/distance"]',
       N'[]', N'', N'');
 
-    /* ===== MERGE and normalize MetaJson ===== */
-    DECLARE @MergeOut TABLE (Action NVARCHAR(10));
+  /* ---------- UPDATE EXISTING ---------- */
+  UPDATE L
+     SET L.Name      = I.Name,
+         L.ShortDesc = I.ShortDesc,
+         L.Synonyms  = I.Synonyms,
+         L.MetaJson  =
+           JSON_MODIFY(
+           JSON_MODIFY(
+           JSON_MODIFY(
+           JSON_MODIFY(
+           JSON_MODIFY(
+           JSON_MODIFY(
+           JSON_MODIFY(
+           JSON_MODIFY(
+             CASE WHEN ISJSON(L.MetaJson)=1 THEN L.MetaJson ELSE N'{}' END,
+             '$.category', I.Category),
+             '$.group',
+               CASE
+                 WHEN I.Code LIKE N'NP-GEN-%'   THEN 'General'
+                 WHEN I.Code LIKE N'NP-CARD-%'  THEN 'Cardiology'
+                 WHEN I.Code LIKE N'NP-PULM-%'  THEN 'Pulmonology'
+                 WHEN I.Code LIKE N'NP-ENDO-%'  THEN 'Endocrinology'
+                 WHEN I.Code LIKE N'NP-NEPH-%'  THEN 'Nephrology'
+                 WHEN I.Code LIKE N'NP-NEURO-%' THEN 'Neurology'
+                 WHEN I.Code LIKE N'NP-PSY-%'   THEN 'Psychiatry'
+                 WHEN I.Code LIKE N'NP-DERM-%'  THEN 'Dermatology'
+                 WHEN I.Code LIKE N'NP-GI-%'    THEN 'Gastroenterology'
+                 WHEN I.Code LIKE N'NP-HEP-%'   THEN 'Hepatology'
+                 WHEN I.Code LIKE N'NP-ID-%'    THEN 'Infectious Diseases'
+                 WHEN I.Code LIKE N'NP-ONC-%'   THEN 'Oncology'
+                 WHEN I.Code LIKE N'NP-PALL-%'  THEN 'Palliative'
+                 WHEN I.Code LIKE N'NP-PED-%'   THEN 'Pediatrics'
+                 WHEN I.Code LIKE N'NP-OBG-%'   THEN 'Obstetrics/Gynecology'
+                 WHEN I.Code LIKE N'NP-ORTH-%'  THEN 'Orthopedics'
+                 WHEN I.Code LIKE N'NP-OPH-%'   THEN 'Ophthalmology'
+                 WHEN I.Code LIKE N'NP-ENT-%'   THEN 'ENT'
+                 WHEN I.Code LIKE N'NP-URO-%'   THEN 'Urology'
+                 WHEN I.Code LIKE N'NP-EMR-%'   THEN 'Emergency'
+                 WHEN I.Code LIKE N'NP-ICU-%'   THEN 'ICU'
+                 WHEN I.Code LIKE N'NP-GER-%'   THEN 'Geriatrics'
+                 WHEN I.Code LIKE N'NP-REHAB-%' THEN 'Rehabilitation'
+                 WHEN I.Code LIKE N'NP-DENT-%'  THEN 'Dentistry'
+                 ELSE NULL
+               END),
+             '$.specializations',   JSON_QUERY(COALESCE(I.SpecializationsJson, N'[]'))),
+             '$.tags',              JSON_QUERY(COALESCE(I.TagsJson,              N'[]'))),
+             '$.steps',             JSON_QUERY(COALESCE(I.StepsJson,             N'[]'))),
+             '$.contraindications', JSON_QUERY(COALESCE(I.ContraindicationsJson, N'[]'))),
+             '$.frequency',         I.Frequency),
+             '$.notes',             I.Notes)
+  FROM dbo.LookupMaster AS L
+  JOIN @Items I
+    ON L.LookupTypeId = 11
+   AND L.Code = I.Code;
 
-    MERGE dbo.LookupMaster AS tgt
-    USING @Items AS src
-      ON tgt.LookupTypeId = 11 AND tgt.Code = src.Code
-    WHEN MATCHED THEN
-      UPDATE SET
-        tgt.Name      = src.Name,
-        tgt.ShortDesc = src.ShortDesc,
-        tgt.Synonyms  = src.Synonyms,
-        tgt.MetaJson  =
-          CASE WHEN ISJSON(tgt.MetaJson)=1
-               THEN
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                   tgt.MetaJson,
-                   '$.category', src.Category),
-                   '$.group',
-                     CASE
-                       WHEN src.Code LIKE N'NP-GEN-%'   THEN 'General'
-                       WHEN src.Code LIKE N'NP-CARD-%'  THEN 'Cardiology'
-                       WHEN src.Code LIKE N'NP-PULM-%'  THEN 'Pulmonology'
-                       WHEN src.Code LIKE N'NP-ENDO-%'  THEN 'Endocrinology'
-                       WHEN src.Code LIKE N'NP-NEPH-%'  THEN 'Nephrology'
-                       WHEN src.Code LIKE N'NP-NEURO-%' THEN 'Neurology'
-                       WHEN src.Code LIKE N'NP-PSY-%'   THEN 'Psychiatry'
-                       WHEN src.Code LIKE N'NP-DERM-%'  THEN 'Dermatology'
-                       WHEN src.Code LIKE N'NP-GI-%'    THEN 'Gastroenterology'
-                       WHEN src.Code LIKE N'NP-HEP-%'   THEN 'Hepatology'
-                       WHEN src.Code LIKE N'NP-ID-%'    THEN 'Infectious Diseases'
-                       WHEN src.Code LIKE N'NP-ONC-%'   THEN 'Oncology'
-                       WHEN src.Code LIKE N'NP-PALL-%'  THEN 'Palliative'
-                       WHEN src.Code LIKE N'NP-PED-%'   THEN 'Pediatrics'
-                       WHEN src.Code LIKE N'NP-OBG-%'   THEN 'Obstetrics/Gynecology'
-                       WHEN src.Code LIKE N'NP-ORTH-%'  THEN 'Orthopedics'
-                       WHEN src.Code LIKE N'NP-OPH-%'   THEN 'Ophthalmology'
-                       WHEN src.Code LIKE N'NP-ENT-%'   THEN 'ENT'
-                       WHEN src.Code LIKE N'NP-URO-%'   THEN 'Urology'
-                       WHEN src.Code LIKE N'NP-EMR-%'   THEN 'Emergency'
-                       WHEN src.Code LIKE N'NP-ICU-%'   THEN 'ICU'
-                       WHEN src.Code LIKE N'NP-GER-%'   THEN 'Geriatrics'
-                       WHEN src.Code LIKE N'NP-REHAB-%' THEN 'Rehabilitation'
-                       WHEN src.Code LIKE N'NP-DENT-%'  THEN 'Dentistry'
-                       WHEN src.Code LIKE N'NP-REHAB-%' THEN 'Rehabilitation'
-                       ELSE NULL END),
-                   '$.specializations',   JSON_QUERY(src.SpecializationsJson)),
-                   '$.tags',              JSON_QUERY(src.TagsJson)),
-                   '$.steps',             JSON_QUERY(src.StepsJson)),
-                   '$.contraindications', JSON_QUERY(src.ContraindicationsJson)),
-                   '$.frequency',         src.Frequency),
-                   '$.notes',             src.Notes),
-                   '$.version',           '1.0')
-               ELSE
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                 JSON_MODIFY(
-                   N'{}',
-                   '$.category', src.Category),
-                   '$.group',
-                     CASE
-                       WHEN src.Code LIKE N'NP-GEN-%'   THEN 'General'
-                       WHEN src.Code LIKE N'NP-CARD-%'  THEN 'Cardiology'
-                       WHEN src.Code LIKE N'NP-PULM-%'  THEN 'Pulmonology'
-                       WHEN src.Code LIKE N'NP-ENDO-%'  THEN 'Endocrinology'
-                       WHEN src.Code LIKE N'NP-NEPH-%'  THEN 'Nephrology'
-                       WHEN src.Code LIKE N'NP-NEURO-%' THEN 'Neurology'
-                       WHEN src.Code LIKE N'NP-PSY-%'   THEN 'Psychiatry'
-                       WHEN src.Code LIKE N'NP-DERM-%'  THEN 'Dermatology'
-                       WHEN src.Code LIKE N'NP-GI-%'    THEN 'Gastroenterology'
-                       WHEN src.Code LIKE N'NP-HEP-%'   THEN 'Hepatology'
-                       WHEN src.Code LIKE N'NP-ID-%'    THEN 'Infectious Diseases'
-                       WHEN src.Code LIKE N'NP-ONC-%'   THEN 'Oncology'
-                       WHEN src.Code LIKE N'NP-PALL-%'  THEN 'Palliative'
-                       WHEN src.Code LIKE N'NP-PED-%'   THEN 'Pediatrics'
-                       WHEN src.Code LIKE N'NP-OBG-%'   THEN 'Obstetrics/Gynecology'
-                       WHEN src.Code LIKE N'NP-ORTH-%'  THEN 'Orthopedics'
-                       WHEN src.Code LIKE N'NP-OPH-%'   THEN 'Ophthalmology'
-                       WHEN src.Code LIKE N'NP-ENT-%'   THEN 'ENT'
-                       WHEN src.Code LIKE N'NP-URO-%'   THEN 'Urology'
-                       WHEN src.Code LIKE N'NP-EMR-%'   THEN 'Emergency'
-                       WHEN src.Code LIKE N'NP-ICU-%'   THEN 'ICU'
-                       WHEN src.Code LIKE N'NP-GER-%'   THEN 'Geriatrics'
-                       WHEN src.Code LIKE N'NP-REHAB-%' THEN 'Rehabilitation'
-                       WHEN src.Code LIKE N'NP-DENT-%'  THEN 'Dentistry'
-                       ELSE NULL END),
-                   '$.specializations',   JSON_QUERY(src.SpecializationsJson)),
-                   '$.tags',              JSON_QUERY(src.TagsJson)),
-                   '$.steps',             JSON_QUERY(src.StepsJson)),
-                   '$.contraindications', JSON_QUERY(src.ContraindicationsJson)),
-                   '$.frequency',         src.Frequency),
-                   '$.notes',             src.Notes),
-                   '$.version',           '1.0')
-          END
-    WHEN NOT MATCHED THEN
-      INSERT (LookupTypeId, Code, Name, ShortDesc, Synonyms, MetaJson)
-      VALUES (
-        11, src.Code, src.Name, src.ShortDesc, src.Synonyms,
-        JSON_MODIFY(
-        JSON_MODIFY(
-        JSON_MODIFY(
-        JSON_MODIFY(
-        JSON_MODIFY(
-        JSON_MODIFY(
-        JSON_MODIFY(
-          N'{}',
-          '$.category',           src.Category),
-          '$.group',
-            CASE
-              WHEN src.Code LIKE N'NP-GEN-%'   THEN 'General'
-              WHEN src.Code LIKE N'NP-CARD-%'  THEN 'Cardiology'
-              WHEN src.Code LIKE N'NP-PULM-%'  THEN 'Pulmonology'
-              WHEN src.Code LIKE N'NP-ENDO-%'  THEN 'Endocrinology'
-              WHEN src.Code LIKE N'NP-NEPH-%'  THEN 'Nephrology'
-              WHEN src.Code LIKE N'NP-NEURO-%' THEN 'Neurology'
-              WHEN src.Code LIKE N'NP-PSY-%'   THEN 'Psychiatry'
-              WHEN src.Code LIKE N'NP-DERM-%'  THEN 'Dermatology'
-              WHEN src.Code LIKE N'NP-GI-%'    THEN 'Gastroenterology'
-              WHEN src.Code LIKE N'NP-HEP-%'   THEN 'Hepatology'
-              WHEN src.Code LIKE N'NP-ID-%'    THEN 'Infectious Diseases'
-              WHEN src.Code LIKE N'NP-ONC-%'   THEN 'Oncology'
-              WHEN src.Code LIKE N'NP-PALL-%'  THEN 'Palliative'
-              WHEN src.Code LIKE N'NP-PED-%'   THEN 'Pediatrics'
-              WHEN src.Code LIKE N'NP-OBG-%'   THEN 'Obstetrics/Gynecology'
-              WHEN src.Code LIKE N'NP-ORTH-%'  THEN 'Orthopedics'
-              WHEN src.Code LIKE N'NP-OPH-%'   THEN 'Ophthalmology'
-              WHEN src.Code LIKE N'NP-ENT-%'   THEN 'ENT'
-              WHEN src.Code LIKE N'NP-URO-%'   THEN 'Urology'
-              WHEN src.Code LIKE N'NP-EMR-%'   THEN 'Emergency'
-              WHEN src.Code LIKE N'NP-ICU-%'   THEN 'ICU'
-              WHEN src.Code LIKE N'NP-GER-%'   THEN 'Geriatrics'
-              WHEN src.Code LIKE N'NP-REHAB-%' THEN 'Rehabilitation'
-              WHEN src.Code LIKE N'NP-DENT-%'  THEN 'Dentistry'
-              ELSE NULL END),
-          '$.specializations',   JSON_QUERY(src.SpecializationsJson)),
-          '$.tags',              JSON_QUERY(src.TagsJson)),
-          '$.steps',             JSON_QUERY(src.StepsJson)),
-          '$.contraindications', JSON_QUERY(src.ContraindicationsJson)),
-          '$.frequency',         src.Frequency),
-          '$.notes',             src.Notes)
-      )
-    OUTPUT $action INTO @MergeOut;
+  DECLARE @Updated INT = @@ROWCOUNT;
 
-    -- Seed stamping
-    UPDATE L
-       SET L.MetaJson =
+  /* ---------- INSERT MISSING ---------- */
+  DECLARE @Inserted TABLE(Code NVARCHAR(100) PRIMARY KEY);
+
+  INSERT INTO dbo.LookupMaster (LookupTypeId, Code, Name, ShortDesc, Synonyms, MetaJson)
+  OUTPUT inserted.Code INTO @Inserted(Code)
+  SELECT
+    11,
+    I.Code,
+    I.Name,
+    I.ShortDesc,
+    I.Synonyms,
+    JSON_MODIFY(
+    JSON_MODIFY(
+    JSON_MODIFY(
+    JSON_MODIFY(
+    JSON_MODIFY(
+    JSON_MODIFY(
+      N'{}',
+      '$.category', I.Category),
+      '$.group',
+        CASE
+          WHEN I.Code LIKE N'NP-GEN-%'   THEN 'General'
+          WHEN I.Code LIKE N'NP-CARD-%'  THEN 'Cardiology'
+          WHEN I.Code LIKE N'NP-PULM-%'  THEN 'Pulmonology'
+          WHEN I.Code LIKE N'NP-ENDO-%'  THEN 'Endocrinology'
+          WHEN I.Code LIKE N'NP-NEPH-%'  THEN 'Nephrology'
+          WHEN I.Code LIKE N'NP-NEURO-%' THEN 'Neurology'
+          WHEN I.Code LIKE N'NP-PSY-%'   THEN 'Psychiatry'
+          WHEN I.Code LIKE N'NP-DERM-%'  THEN 'Dermatology'
+          WHEN I.Code LIKE N'NP-GI-%'    THEN 'Gastroenterology'
+          WHEN I.Code LIKE N'NP-HEP-%'   THEN 'Hepatology'
+          WHEN I.Code LIKE N'NP-ID-%'    THEN 'Infectious Diseases'
+          WHEN I.Code LIKE N'NP-ONC-%'   THEN 'Oncology'
+          WHEN I.Code LIKE N'NP-PALL-%'  THEN 'Palliative'
+          WHEN I.Code LIKE N'NP-PED-%'   THEN 'Pediatrics'
+          WHEN I.Code LIKE N'NP-OBG-%'   THEN 'Obstetrics/Gynecology'
+          WHEN I.Code LIKE N'NP-ORTH-%'  THEN 'Orthopedics'
+          WHEN I.Code LIKE N'NP-OPH-%'   THEN 'Ophthalmology'
+          WHEN I.Code LIKE N'NP-ENT-%'   THEN 'ENT'
+          WHEN I.Code LIKE N'NP-URO-%'   THEN 'Urology'
+          WHEN I.Code LIKE N'NP-EMR-%'   THEN 'Emergency'
+          WHEN I.Code LIKE N'NP-ICU-%'   THEN 'ICU'
+          WHEN I.Code LIKE N'NP-GER-%'   THEN 'Geriatrics'
+          WHEN I.Code LIKE N'NP-REHAB-%' THEN 'Rehabilitation'
+          WHEN I.Code LIKE N'NP-DENT-%'  THEN 'Dentistry'
+          ELSE NULL
+        END),
+      '$.specializations',   JSON_QUERY(COALESCE(I.SpecializationsJson,   N'[]'))),
+      '$.tags',              JSON_QUERY(COALESCE(I.TagsJson,              N'[]'))),
+      '$.steps',             JSON_QUERY(COALESCE(I.StepsJson,             N'[]'))),
+      '$.contraindications', JSON_QUERY(COALESCE(I.ContraindicationsJson, N'[]')))
+  FROM @Items I
+  WHERE NOT EXISTS (
+    SELECT 1 FROM dbo.LookupMaster L
+     WHERE L.LookupTypeId = 11 AND L.Code = I.Code
+  );
+
+  DECLARE @InsertedCount INT = (SELECT COUNT(*) FROM @Inserted);
+
+  /* ---------- SEED STAMP (both inserted & updated) ---------- */
+  UPDATE L
+     SET L.MetaJson =
          CASE WHEN ISJSON(L.MetaJson)=1
               THEN JSON_MODIFY(
                      JSON_MODIFY(L.MetaJson, '$.seed_id',     @SeedId),
                                  '$.seed_version', @SeedVersion)
               ELSE N'{"seed_id":"'+@SeedId+'","seed_version":"'+@SeedVersion+'"}'
          END
-      FROM dbo.LookupMaster AS L
-     WHERE L.LookupTypeId = 11
-       AND L.Code IN (SELECT Code FROM @Items);
+  FROM dbo.LookupMaster L
+  WHERE L.LookupTypeId = 11
+    AND L.Code IN (
+        SELECT Code FROM @Inserted
+        UNION ALL
+        SELECT Code FROM @Items I
+        WHERE EXISTS (SELECT 1 FROM dbo.LookupMaster x WHERE x.LookupTypeId=11 AND x.Code=I.Code)
+    );
 
-    DECLARE @Inserted INT = (SELECT COUNT(1) FROM @MergeOut WHERE Action='INSERT');
-    DECLARE @Updated  INT = (SELECT COUNT(1) FROM @MergeOut WHERE Action='UPDATE');
-
-    COMMIT;
-    PRINT CONCAT('Seed ', @SeedId, ' applied. Inserted=', @Inserted, ', Updated=', @Updated);
+  COMMIT;
+  PRINT CONCAT('Seed ', @SeedId, ' applied. Inserted=', @InsertedCount, ', Updated=', @Updated);
 END TRY
 BEGIN CATCH
-    IF (XACT_STATE()) <> 0 ROLLBACK;
-    THROW;
+  IF (XACT_STATE()) <> 0 ROLLBACK;
+  THROW;
 END CATCH;

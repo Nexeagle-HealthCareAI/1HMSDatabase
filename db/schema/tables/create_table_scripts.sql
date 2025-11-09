@@ -88,6 +88,8 @@ BEGIN
 END
 GO
 
+
+
 /* =========================================================
    HOSPITALS / STATUS / USERS
    ========================================================= */
@@ -342,6 +344,34 @@ BEGIN
         [Description] NVARCHAR(255) NULL,
         IsActive BIT NOT NULL CONSTRAINT DF_HospitalTypes_IsActive DEFAULT(1)
     );
+END
+GO
+
+
+/* =========================================================
+   UserInvitations
+   ========================================================= */
+
+IF OBJECT_ID('dbo.UserInvitations','U') IS NULL
+BEGIN
+CREATE TABLE UserInvitations (
+  InvitationID     UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+  HospitalID       UNIQUEIDENTIFIER NOT NULL,
+  RoleID           UNIQUEIDENTIFIER NOT NULL,
+  InvitedByUserID  UNIQUEIDENTIFIER NOT NULL,
+  RecipientName    VARCHAR(150) NULL,
+  RecipientMobile  VARCHAR(20) NOT NULL,
+  RecipientEmail   VARCHAR(150) NULL,
+  TokenHash        VARBINARY(64) NOT NULL,   -- SHA-256 of opaque token
+  ExpiresAt        DATETIME NOT NULL,        -- e.g., GETUTCDATE()+7
+  AcceptedAt       DATETIME NULL,
+  RevokedAt        DATETIME NULL,
+  Status           VARCHAR(20) NOT NULL DEFAULT 'Pending', -- Pending/Accepted/Revoked/Expired
+  CreatedAt        DATETIME DEFAULT GETDATE(),
+  FOREIGN KEY(RoleID) REFERENCES Roles(RoleID),
+  FOREIGN KEY(HospitalID) REFERENCES Hospitals(HospitalID),
+  FOREIGN KEY(InvitedByUserID) REFERENCES Users(UserID)
+);
 END
 GO
 

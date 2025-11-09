@@ -1,119 +1,117 @@
 /* =========================================================
    easyHMS – Azure SQL Rollback (Dev/QA)
-   Drops objects created by the deploy script, in dependency-safe order.
-   Safe to re-run: guards on each object.
+   Strategy: drop ALL dbo FKs first, then drop objects.
+   Safe to re-run: guards + existence checks.
+   NOTE: No GO separators => single batch; XACT_ABORT ON.
    ========================================================= */
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
 
--- 1) Attachments / leafs
-IF OBJECT_ID('dbo.PrescriptionAttachment','U') IS NOT NULL DROP TABLE dbo.PrescriptionAttachment;
-GO
+BEGIN TRY
+    BEGIN TRAN;
 
--- 2) Prescription children, then root
-IF OBJECT_ID('dbo.PrescriptionInvestigation','U') IS NOT NULL DROP TABLE dbo.PrescriptionInvestigation;
-GO
-IF OBJECT_ID('dbo.PrescriptionAdvice','U') IS NOT NULL DROP TABLE dbo.PrescriptionAdvice;
-GO
-IF OBJECT_ID('dbo.Prescription','U') IS NOT NULL DROP TABLE dbo.Prescription;
-GO
+    ---------------------------------------------------------
+    -- 0) Drop ALL FOREIGN KEYS in dbo (user objects only)
+    ---------------------------------------------------------
+    DECLARE @sql nvarchar(max) = N'';
 
--- 3) Doctor UI / preferences
-IF OBJECT_ID('dbo.DoctorSectionPreferences','U') IS NOT NULL DROP TABLE dbo.DoctorSectionPreferences;
-GO
+    ;WITH fks AS (
+        SELECT
+            fk.name           AS fk_name,
+            QUOTENAME(SCHEMA_NAME(so.schema_id)) + N'.' + QUOTENAME(so.name) AS parent_table
+        FROM sys.foreign_keys fk
+        JOIN sys.objects so    ON so.object_id = fk.parent_object_id
+        WHERE so.is_ms_shipped = 0
+          AND SCHEMA_NAME(so.schema_id) = N'dbo'      -- limit to dbo; remove if you want all schemas
+    )
+    SELECT @sql = STRING_AGG(
+        N'IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N''' + REPLACE(fk_name,'''','''''') + N''')
+          ALTER TABLE ' + parent_table + N' DROP CONSTRAINT ' + QUOTENAME(fk_name) + N';'
+        , CHAR(10)
+    )
+    FROM fks;
 
--- 4) Lookups (personal -> master -> types)
-IF OBJECT_ID('dbo.LookupPersonal','U') IS NOT NULL DROP TABLE dbo.LookupPersonal;
-GO
-IF OBJECT_ID('dbo.LookupMaster','U') IS NOT NULL DROP TABLE dbo.LookupMaster;
-GO
-IF OBJECT_ID('dbo.LookupTypes','U') IS NOT NULL DROP TABLE dbo.LookupTypes;
-GO
+    IF @sql IS NOT NULL AND LEN(@sql) > 0
+    BEGIN
+        PRINT N'Dropping foreign keys...';
+        EXEC sys.sp_executesql @sql;
+    END
 
--- 5) Appointment ecosystem (most-dependent first)
-IF OBJECT_ID('dbo.AppointmentVitals','U') IS NOT NULL DROP TABLE dbo.AppointmentVitals;
-GO
-IF OBJECT_ID('dbo.AppointmentTokens','U') IS NOT NULL DROP TABLE dbo.AppointmentTokens;
-GO
-IF OBJECT_ID('dbo.DoctorQueues','U') IS NOT NULL DROP TABLE dbo.DoctorQueues;
-GO
-IF OBJECT_ID('dbo.Appointments','U') IS NOT NULL DROP TABLE dbo.Appointments;
-GO
-IF OBJECT_ID('dbo.StatusMaster','U') IS NOT NULL DROP TABLE dbo.StatusMaster;
-GO
-IF OBJECT_ID('dbo.PatientRegistrations','U') IS NOT NULL DROP TABLE dbo.PatientRegistrations;
-GO
+    ---------------------------------------------------------
+    -- 1) Drop tables (order agnostic now that FKs are gone)
+    --    Add or remove names here as your schema evolves.
+    ---------------------------------------------------------
+    DECLARE @tablesToDrop TABLE (t sysname);
+    INSERT INTO @tablesToDrop(t) VALUES
+    (N'PrescriptionAttachment'),
+    (N'PrescriptionInvestigation'),
+    (N'PrescriptionAdvice'),
+    (N'Prescription'),
+    (N'DoctorSectionPreferences'),
+    (N'LookupPersonal'),
+    (N'LookupMaster'),
+    (N'LookupTypes'),
+    (N'AppointmentVitals'),
+    (N'AppointmentTokens'),
+    (N'DoctorQueues'),
+    (N'Appointments'),
+    (N'StatusMaster'),
+    (N'PatientRegistrations'),
+    (N'UserRoles'),
+    (N'RolePermissions'),
+    (N'Permissions'),
+    (N'Roles'),
+    (N'PrescriptionAssets'),
+    (N'PrescriptionSettings'),
+    (N'DoctorSpecializations'),
+    (N'Specializations'),
+    (N'DoctorDepartments'),
+    (N'DoctorTimeOffs'),
+    (N'DoctorShiftOverrides'),
+    (N'DoctorShiftTemplates'),
+    (N'DoctorAvailability'),
+    (N'HospitalDepartmentMappings'),
+    (N'DoctorPreferredMedicine'),
+    (N'Doctors'),
+    (N'Departments'),
+    (N'HospitalUsers'),
+    (N'HospitalProfileStatus'),
+    (N'Hospitals'),
+    (N'HospitalTypes'),
+    (N'UserProfiles'),
+    (N'UserAuth'),
+    (N'Users')
+    -- Add any other tables you introduced later (e.g., LabResult, LabResultItem, etc.)
 
--- 6) Roles & permissions (mapping → master)
-IF OBJECT_ID('dbo.UserRoles','U') IS NOT NULL DROP TABLE dbo.UserRoles;
-GO
-IF OBJECT_ID('dbo.RolePermissions','U') IS NOT NULL DROP TABLE dbo.RolePermissions;
-GO
-IF OBJECT_ID('dbo.Permissions','U') IS NOT NULL DROP TABLE dbo.Permissions;
-GO
-IF OBJECT_ID('dbo.Roles','U') IS NOT NULL DROP TABLE dbo.Roles;
-GO
+    SET @sql = N'';
+    SELECT @sql = @sql +
+        N'IF OBJECT_ID(N''dbo.' + REPLACE(t,'''','''''') + N''',''U'') IS NOT NULL DROP TABLE dbo.' + QUOTENAME(t) + N';' + CHAR(10)
+    FROM @tablesToDrop;
 
--- 7) Prescription settings / assets
-IF OBJECT_ID('dbo.PrescriptionAssets','U') IS NOT NULL DROP TABLE dbo.PrescriptionAssets;
-GO
-IF OBJECT_ID('dbo.PrescriptionSettings','U') IS NOT NULL DROP TABLE dbo.PrescriptionSettings;
-GO
+    IF LEN(@sql) > 0
+    BEGIN
+        PRINT N'Dropping tables...';
+        EXEC sys.sp_executesql @sql;
+    END
 
--- 8) Clinical taxonomy / mappings (children before parents)
-IF OBJECT_ID('dbo.DoctorSpecializations','U') IS NOT NULL DROP TABLE dbo.DoctorSpecializations;
-GO
-IF OBJECT_ID('dbo.Specializations','U') IS NOT NULL DROP TABLE dbo.Specializations;
-GO
-IF OBJECT_ID('dbo.DoctorDepartments','U') IS NOT NULL DROP TABLE dbo.DoctorDepartments;
-GO
+    ---------------------------------------------------------
+    -- 2) Drop sequences
+    ---------------------------------------------------------
+    IF OBJECT_ID(N'dbo.PrescriptionNumberSeq', N'SO') IS NOT NULL
+    BEGIN
+        PRINT N'Dropping sequence dbo.PrescriptionNumberSeq...';
+        DROP SEQUENCE dbo.PrescriptionNumberSeq;
+    END
 
--- 9) Doctor schedules (must be before Doctors)
-IF OBJECT_ID('dbo.DoctorTimeOffs','U') IS NOT NULL DROP TABLE dbo.DoctorTimeOffs;
-GO
-IF OBJECT_ID('dbo.DoctorShiftOverrides','U') IS NOT NULL DROP TABLE dbo.DoctorShiftOverrides;
-GO
-IF OBJECT_ID('dbo.DoctorShiftTemplates','U') IS NOT NULL DROP TABLE dbo.DoctorShiftTemplates;
-GO
-IF OBJECT_ID('dbo.DoctorAvailability','U') IS NOT NULL DROP TABLE dbo.DoctorAvailability;
-GO
+    COMMIT TRAN;
+    PRINT N'easyHMS rollback completed (FK-first, dependency-agnostic).';
 
--- 10) Hospital mappings (before Departments/Hospitals)
-IF OBJECT_ID('dbo.HospitalDepartmentMappings','U') IS NOT NULL DROP TABLE dbo.HospitalDepartmentMappings;
-GO
-
--- 11) Doctor preferred medicine (depends on Doctors)
-IF OBJECT_ID('dbo.DoctorPreferredMedicine','U') IS NOT NULL DROP TABLE dbo.DoctorPreferredMedicine;
-GO
-
--- 12) Doctors / Departments (parents after all dependents are gone)
-IF OBJECT_ID('dbo.Doctors','U') IS NOT NULL DROP TABLE dbo.Doctors;
-GO
-IF OBJECT_ID('dbo.Departments','U') IS NOT NULL DROP TABLE dbo.Departments;
-GO
-
--- 13) Hospital membership & status (before Hospitals)
-IF OBJECT_ID('dbo.HospitalUsers','U') IS NOT NULL DROP TABLE dbo.HospitalUsers;
-GO
-IF OBJECT_ID('dbo.HospitalProfileStatus','U') IS NOT NULL DROP TABLE dbo.HospitalProfileStatus;
-GO
-
--- 14) Hospitals & types (Hospitals before Users; Types independent)
-IF OBJECT_ID('dbo.Hospitals','U') IS NOT NULL DROP TABLE dbo.Hospitals;
-GO
-IF OBJECT_ID('dbo.HospitalTypes','U') IS NOT NULL DROP TABLE dbo.HospitalTypes;
-GO
-
--- 15) Users & auth (children first)
-IF OBJECT_ID('dbo.UserProfiles','U') IS NOT NULL DROP TABLE dbo.UserProfiles;
-GO
-IF OBJECT_ID('dbo.UserAuth','U') IS NOT NULL DROP TABLE dbo.UserAuth;
-GO
-IF OBJECT_ID('dbo.Users','U') IS NOT NULL DROP TABLE dbo.Users;
-GO
-
--- 16) Sequences
-IF OBJECT_ID('dbo.PrescriptionNumberSeq','SO') IS NOT NULL DROP SEQUENCE dbo.PrescriptionNumberSeq;
-GO
-
-PRINT N'easyHMS rollback completed (dependency-safe).';
+END TRY
+BEGIN CATCH
+    DECLARE @msg nvarchar(4000) = ERROR_MESSAGE();
+    DECLARE @num int = ERROR_NUMBER();
+    DECLARE @sev int = ERROR_SEVERITY();
+    DECLARE @st  int = ERROR_STATE();
+    IF XACT_STATE() <> 0 ROLLBACK TRAN;
+    RAISERROR(N'Rollback failed (%d, sev %d, state %d): %s', 16, 1, @num, @sev, @st, @msg);
+END CATCH;

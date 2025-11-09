@@ -26,7 +26,7 @@ variables:
   - group: 'swa-secrets-dev'
 - ${{ if eq(parameters.targetEnv, 'qa') }}:
   - group: 'swa-secrets-qa'
-# Expect: SqlServer, DatabaseName, SqlUser, SqlPassword
+# Expected in the selected group: SqlServer, DatabaseName, SqlUser, SqlPassword
 
 stages:
 # ------------ DEV ------------
@@ -39,6 +39,7 @@ stages:
     steps:
     - checkout: self
       clean: true
+
     - bash: |
         set -euo pipefail
         curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
@@ -47,74 +48,114 @@ stages:
         sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
         echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
       displayName: Install sqlcmd (mssql-tools18)
+
     - bash: |
         set -euo pipefail
         echo "Server: $(SqlServer), DB: $(DatabaseName)"
         ls -1v db/schema/tables/*.sql   2>/dev/null || true
         ls -1v db/schema/indexes/*.sql  2>/dev/null || true
-        ls -1v db/data/seed/*.sql        2>/dev/null || true
+        ls -1v db/data/seed/*.sql       2>/dev/null || true
         ls -1v db/rollback/*.sql        2>/dev/null || true
       displayName: Inspect files
+
     - bash: |
         set -euo pipefail
         shopt -s nullglob
         if [ "${{ parameters.action }}" != "deploy" ]; then
           echo "Skip deploy"; exit 0; fi
-        for f in $(ls -1v db/schema/tables/*.sql);   do echo "TABLE -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
-        for f in $(ls -1v db/schema/indexes/*.sql);  do echo "INDEX -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
-        for f in $(ls -1v db/data/seed/*.sql);        do echo "DML   -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
+
+        for f in $(ls -1v db/schema/tables/*.sql);  do
+          echo "TABLE -> $f"
+          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+        done
+
+        for f in $(ls -1v db/schema/indexes/*.sql); do
+          echo "INDEX -> $f"
+          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+        done
+
+        for f in $(ls -1v db/data/seed/*.sql);   do
+          echo "DML   -> $f"
+          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+        done
       displayName: DEPLOY DEV (Tables → Indexes → DML)
+
     - bash: |
         set -euo pipefail
         shopt -s nullglob
         if [ "${{ parameters.action }}" != "rollback" ]; then
           echo "Skip rollback"; exit 0; fi
-        for f in $(ls -1v db/rollback/*.sql); do echo "ROLLBACK -> $f"; sqlcmd -C -b -l 120 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
+
+        for f in $(ls -1v db/rollback/*.sql); do
+          echo "ROLLBACK -> $f"
+          sqlcmd -C -b -l 120 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+        done
       displayName: ROLLBACK DEV
 
 # ------------ QA ------------
 - stage: QA
   displayName: "DB: ${{ parameters.action }} → QA"
-  # Only run when targetEnv=qa
   condition: and(succeeded(), eq('${{ parameters.targetEnv }}','qa'))
-  # Optional approvals: attach to an Environment named 'qa-db'
-  # (Create an Environment in DevOps and set approvals there)
-  environment: 'qa-db'
   jobs:
-  - job: ExecuteQA
+  # Use a deployment job to attach an Environment (approvals, history, etc.)
+  - deployment: ExecuteQA
     displayName: "Execute SQL (${{ parameters.action }}) - QA"
-    steps:
-    - checkout: self
-      clean: true
-    - bash: |
-        set -euo pipefail
-        curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
-        curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
-        sudo apt-get update
-        sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
-        echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
-      displayName: Install sqlcmd (mssql-tools18)
-    - bash: |
-        set -euo pipefail
-        echo "Server: $(SqlServer), DB: $(DatabaseName)"
-        ls -1v db/schema/tables/*.sql   2>/dev/null || true
-        ls -1v db/schema/indexes/*.sql  2>/dev/null || true
-        ls -1v db/data/seed/*.sql        2>/dev/null || true
-        ls -1v db/rollback/*.sql        2>/dev/null || true
-      displayName: Inspect files
-    - bash: |
-        set -euo pipefail
-        shopt -s nullglob
-        if [ "${{ parameters.action }}" != "deploy" ]; then
-          echo "Skip deploy"; exit 0; fi
-        for f in $(ls -1v db/schema/tables/*.sql);   do echo "TABLE -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
-        for f in $(ls -1v db/schema/indexes/*.sql);  do echo "INDEX -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
-        for f in $(ls -1v db/data/seed/*.sql);        do echo "DML   -> $f";  sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
-      displayName: DEPLOY QA (Tables → Indexes → DML)
-    - bash: |
-        set -euo pipefail
-        shopt -s nullglob
-        if [ "${{ parameters.action }}" != "rollback" ]; then
-          echo "Skip rollback"; exit 0; fi
-        for f in $(ls -1v db/rollback/*.sql); do echo "ROLLBACK -> $f"; sqlcmd -C -b -l 120 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"; done
-      displayName: ROLLBACK QA
+    environment: 'qa-db'   # <-- valid here on deployment jobs
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            clean: true
+
+          - bash: |
+              set -euo pipefail
+              curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+              curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
+              sudo apt-get update
+              sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+              echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
+            displayName: Install sqlcmd (mssql-tools18)
+
+          - bash: |
+              set -euo pipefail
+              echo "Server: $(SqlServer), DB: $(DatabaseName)"
+              ls -1v db/schema/tables/*.sql   2>/dev/null || true
+              ls -1v db/schema/indexes/*.sql  2>/dev/null || true
+              ls -1v db/data/seed/*.sql       2>/dev/null || true
+              ls -1v db/rollback/*.sql        2>/dev/null || true
+            displayName: Inspect files
+
+          - bash: |
+              set -euo pipefail
+              shopt -s nullglob
+              if [ "${{ parameters.action }}" != "deploy" ]; then
+                echo "Skip deploy"; exit 0; fi
+
+              for f in $(ls -1v db/schema/tables/*.sql);  do
+                echo "TABLE -> $f"
+                sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+              done
+
+              for f in $(ls -1v db/schema/indexes/*.sql); do
+                echo "INDEX -> $f"
+                sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+              done
+
+              for f in $(ls -1v db/data/seed/*.sql);   do
+                echo "DML   -> $f"
+                sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+              done
+            displayName: DEPLOY QA (Tables → Indexes → DML)
+
+          - bash: |
+              set -euo pipefail
+              shopt -s nullglob
+              if [ "${{ parameters.action }}" != "rollback" ]; then
+                echo "Skip rollback"; exit 0; fi
+
+              for f in $(ls -1v db/rollback/*.sql); do
+                echo "ROLLBACK -> $f"
+                sqlcmd -C -b -l 120 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+              done
+            displayName: ROLLBACK QA

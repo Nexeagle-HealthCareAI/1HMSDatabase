@@ -1,78 +1,83 @@
-jobs:
-- job: run_sql
-  displayName: "Execute SQL scripts with sqlcmd"
-  pool:
-    vmImage: 'ubuntu-latest'
-  container: mcr.microsoft.com/mssql-tools:18-ubuntu-22.04
+# azure-pipelines.yml
 
-  steps:
-  - checkout: self
-    clean: true
+trigger:
+  branches: { include: [ main ] }
 
-  - script: |
-      echo "Validating variables..."
-      echo "Server: $(serverName)"
-      echo "Database: $(databaseName)"
-      echo "User: $(sqlUser)"
-      test -n "$(serverName)"   || { echo "serverName not set"; exit 1; }
-      test -n "$(databaseName)" || { echo "databaseName not set"; exit 1; }
-      test -n "$(sqlUser)"      || { echo "sqlUser not set"; exit 1; }
-      test -n "$(sqlPassword)"  || { echo "sqlPassword not set"; exit 1; }
-    displayName: "Sanity check (masked)"
+pr:
+  branches: { include: [ main ] }
 
-  - script: |
-      set -euo pipefail
+# 1) Define parameters BEFORE they are referenced anywhere
+parameters:
+- name: environment
+  type: string
+  default: dev
+  values: [ dev, qa ]
+- name: action
+  type: string
+  default: deploy
+  values: [ deploy, seed-only, rollback ]
 
-      export PATH="/opt/mssql-tools18/bin:/opt/mssql-tools/bin:$PATH"
-      command -v sqlcmd >/dev/null || { echo "sqlcmd not found"; exit 127; }
-      export SQLCMDPASSWORD="$(sqlPassword)"
+# 2) Variable groups selected via template conditionals (compile-time)
+variables:
+- ${{ if eq(parameters.environment, 'dev') }}:
+  - group: swa-secrets-dev
+- ${{ if eq(parameters.environment, 'qa') }}:
+  - group: swa-secrets-qa
 
-      ROOT="$(Build.SourcesDirectory)"
-      SCHEMA_DIR="$ROOT/db/schema"
-      SCHEMA_TABLES_DIR="$SCHEMA_DIR/tables"
-      SCHEMA_INDEXES_DIR="$SCHEMA_DIR/indexes"
-      SEED_DIR="$ROOT/db/data/seed"
-      ROLLBACK_DIR="$ROOT/db/rollback"
+stages:
+- stage: Deploy_${{ parameters.environment }}
+  displayName: "DB ${{ parameters.environment }} – ${{ parameters.action }}"
+  jobs:
+  - job: run_sql
+    displayName: "Execute SQL scripts with sqlcmd"
+    pool:
+      vmImage: ubuntu-latest
+    container: mcr.microsoft.com/mssql-tools:18-ubuntu-22.04
 
-      SQLCMD="sqlcmd -S $(serverName) -d $(databaseName) -U $(sqlUser) -b -l 60 -I"
+    steps:
+    - checkout: self
+      clean: true
 
-      run_dir () {
-        local dir="$1"
-        if [ -d "$dir" ]; then
-          echo "==> Running scripts in $dir"
-          # Recurse and sort for deterministic order
-          mapfile -t files < <(find "$dir" -type f -name "*.sql" | sort)
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "No .sql files found in $dir"
-            return 0
+    - script: |
+        echo "Env: ${{ parameters.environment }}"
+        echo "Action: ${{ parameters.action }}"
+        echo "Server: $(serverName)"
+        echo "DB: $(databaseName)"
+        echo "User: $(sqlUser)"
+        test -n "$(sqlPassword)" || { echo "sqlPassword missing"; exit 1; }
+      displayName: Sanity check
+
+    - script: |
+        set -euo pipefail
+        export PATH="/opt/mssql-tools18/bin:/opt/mssql-tools/bin:$PATH"
+        export SQLCMDPASSWORD="$(sqlPassword)"
+        ROOT="$(Build.SourcesDirectory)"
+        SQLCMD="sqlcmd -S $(serverName) -d $(databaseName) -U $(sqlUser) -b -l 60 -I"
+
+        run_dir () {
+          local dir="$1"
+          if [ -d "$dir" ]; then
+            echo "==> $dir"
+            mapfile -t files < <(find "$dir" -type f -name "*.sql" | sort)
+            for f in "${files[@]}"; do
+              echo "---- $(realpath --relative-to="$ROOT" "$f")"
+              $SQLCMD -i "$f"
+            done
           fi
-          for f in "${files[@]}"; do
-            echo "---- sqlcmd: $(realpath --relative-to="$ROOT" "$f")"
-            $SQLCMD -i "$f"
-          done
-        else
-          echo "Directory $dir not found (skipping)"
-        fi
-      }
+        }
 
-      case "${{ parameters.action }}" in
-        deploy)
-          # Run schema in a clear order
-          run_dir "$SCHEMA_DIR"          # any top-level schema .sql (optional)
-          run_dir "$SCHEMA_TABLES_DIR"   # create tables first
-          run_dir "$SCHEMA_INDEXES_DIR"  # then indexes/constraints
-          run_dir "$SEED_DIR"            # then seed data
-          ;;
-        seed-only)
-          run_dir "$SEED_DIR"
-          ;;
-        rollback)
-          run_dir "$ROLLBACK_DIR"
-          ;;
-        *)
-          echo "Unknown action"; exit 2
-          ;;
-      esac
-
-      echo "All done."
-    displayName: "Run sqlcmd over scripts"
+        case "${{ parameters.action }}" in
+          deploy)
+            run_dir "$ROOT/db/schema"
+            run_dir "$ROOT/db/schema/tables"
+            run_dir "$ROOT/db/schema/indexes"
+            run_dir "$ROOT/db/data/seed"
+            ;;
+          seed-only)
+            run_dir "$ROOT/db/data/seed"
+            ;;
+          rollback)
+            run_dir "$ROOT/db/rollback"
+            ;;
+        esac
+      displayName: Run sqlcmd over scripts

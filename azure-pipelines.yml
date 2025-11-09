@@ -1,3 +1,4 @@
+# azure-pipelines-db.yml
 trigger:
   branches:
     include:
@@ -14,49 +15,39 @@ pr:
     include:
       - db/**
 
-# Choose once at queue time:
-# - action: deploy | rollback
-# - targetEnv: dev | qa
 parameters:
 - name: action
   displayName: Action
   type: string
   default: deploy
-  values:
-    - deploy
-    - rollback
+  values: [ deploy, rollback ]
 
 - name: targetEnv
   displayName: Target Environment
   type: string
   default: dev
-  values:
-    - dev
-    - qa
-
-# Map variable groups by environment
-variables:
-- ${{ if eq(parameters.targetEnv, 'dev') }}:
-  - group: easyhms-dev-db
-- ${{ if eq(parameters.targetEnv, 'qa') }}:
-  - group: easyhms-qa-db
+  values: [ dev, qa ]
 
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: ubuntu-latest
+
+# Re-usable job steps to avoid duplication
+# (YAML anchors are not supported; we just copy steps between stages)
 
 stages:
-- stage: RunDB
-  displayName: 'DB: ${{ parameters.action }} → ${{ parameters.targetEnv | upper }}'
+# ========================= DEV =========================
+- stage: Dev
+  displayName: "DB: ${{ parameters.action }} → DEV"
+  condition: and(succeeded(), eq('${{ parameters.targetEnv }}','dev'))
+  variables:
+  - group: easyhms-dev-db  # DEFINE THIS VARIABLE GROUP IN LIBRARY
   jobs:
-  - job: Execute
-    displayName: 'Execute SQL (${{ parameters.action }})'
+  - job: ExecuteDev
+    displayName: "Execute SQL (${{ parameters.action }}) - DEV"
     steps:
-
-    # 1) Checkout
     - checkout: self
       clean: true
 
-    # 2) Install sqlcmd (mssql-tools18) on Ubuntu agent
     - bash: |
         set -euo pipefail
         curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
@@ -64,67 +55,126 @@ stages:
         sudo apt-get update
         sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
         echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
-      displayName: 'Install sqlcmd (mssql-tools18)'
+      displayName: Install sqlcmd (mssql-tools18)
 
-    # 3) Sanity: show what will run
     - bash: |
         set -euo pipefail
-        echo "Env: ${{ parameters.targetEnv }}"
         echo "Action: ${{ parameters.action }}"
-        echo "SQL Server: $(SqlServer)"
-        echo "Database:   $(DatabaseName)"
-        echo "Files (tables):"
-        ls -1v db/schema/tables/*.sql || true
-        echo "Files (indexes):"
-        ls -1v db/schema/indexes/*.sql || true
-        echo "Files (dml seed):"
-        ls -1v db/dml/seed/*.sql || true
-        echo "Files (rollback):"
-        ls -1v db/rollback/*.sql || true
-      displayName: 'List files'
+        echo "Server: $(SqlServer)"
+        echo "DB:     $(DatabaseName)"
+        echo "Listing files..."
+        ls -1v db/schema/tables/*.sql   2>/dev/null || true
+        ls -1v db/schema/indexes/*.sql  2>/dev/null || true
+        ls -1v db/dml/seed/*.sql        2>/dev/null || true
+        ls -1v db/rollback/*.sql        2>/dev/null || true
+      displayName: Inspect file lists
 
-    # 4) DEPLOY path (tables → indexes → DML) — idempotent scripts recommended
     - bash: |
         set -euo pipefail
         shopt -s nullglob
-
         if [ "${{ parameters.action }}" != "deploy" ]; then
-          echo "Skipping deploy phase (action=${{ parameters.action }})"
+          echo "Skip deploy for action=${{ parameters.action }}"
           exit 0
         fi
-
-        echo "==> Running TABLE CREATE scripts..."
+        echo "==> TABLES"
         for f in $(ls -1v db/schema/tables/*.sql); do
-          echo "---- RUN (TABLE): $f"
+          echo "---- $f"
           sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
         done
-
-        echo "==> Running INDEX scripts..."
+        echo "==> INDEXES"
         for f in $(ls -1v db/schema/indexes/*.sql); do
-          echo "---- RUN (INDEX): $f"
+          echo "---- $f"
           sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
         done
-
-        echo "==> Running DML SEED scripts..."
+        echo "==> DML SEED"
         for f in $(ls -1v db/dml/seed/*.sql); do
-          echo "---- RUN (DML): $f"
+          echo "---- $f"
           sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
         done
-      displayName: 'DEPLOY: Tables → Indexes → DML'
+      displayName: DEPLOY Dev (Tables → Indexes → DML)
 
-    # 5) ROLLBACK path (run everything under db/rollback in order)
     - bash: |
         set -euo pipefail
         shopt -s nullglob
-
         if [ "${{ parameters.action }}" != "rollback" ]; then
-          echo "Skipping rollback phase (action=${{ parameters.action }})"
+          echo "Skip rollback for action=${{ parameters.action }}"
           exit 0
         fi
-
-        echo "==> RUNNING ROLLBACK scripts (ordered)..."
+        echo "==> ROLLBACK"
         for f in $(ls -1v db/rollback/*.sql); do
-          echo "---- RUN (ROLLBACK): $f"
+          echo "---- $f"
           sqlcmd -C -b -l 120 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
         done
-      displayName: 'ROLLBACK: Drop FKs/Tables/Sequences'
+      displayName: ROLLBACK Dev
+
+# ========================= QA =========================
+- stage: QA
+  displayName: "DB: ${{ parameters.action }} → QA"
+  condition: and(succeeded(), eq('${{ parameters.targetEnv }}','qa'))
+  variables:
+  - group: easyhms-qa-db  # DEFINE THIS VARIABLE GROUP IN LIBRARY
+  jobs:
+  - job: ExecuteQA
+    displayName: "Execute SQL (${{ parameters.action }}) - QA"
+    steps:
+    - checkout: self
+      clean: true
+
+    - bash: |
+        set -euo pipefail
+        curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+        curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
+        sudo apt-get update
+        sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+        echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
+      displayName: Install sqlcmd (mssql-tools18)
+
+    - bash: |
+        set -euo pipefail
+        echo "Action: ${{ parameters.action }}"
+        echo "Server: $(SqlServer)"
+        echo "DB:     $(DatabaseName)"
+        echo "Listing files..."
+        ls -1v db/schema/tables/*.sql   2>/dev/null || true
+        ls -1v db/schema/indexes/*.sql  2>/dev/null || true
+        ls -1v db/dml/seed/*.sql        2>/dev/null || true
+        ls -1v db/rollback/*.sql        2>/dev/null || true
+      displayName: Inspect file lists
+
+    - bash: |
+        set -euo pipefail
+        shopt -s nullglob
+        if [ "${{ parameters.action }}" != "deploy" ]; then
+          echo "Skip deploy for action=${{ parameters.action }}"
+          exit 0
+        fi
+        echo "==> TABLES"
+        for f in $(ls -1v db/schema/tables/*.sql); do
+          echo "---- $f"
+          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+        done
+        echo "==> INDEXES"
+        for f in $(ls -1v db/schema/indexes/*.sql); do
+          echo "---- $f"
+          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+        done
+        echo "==> DML SEED"
+        for f in $(ls -1v db/dml/seed/*.sql); do
+          echo "---- $f"
+          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+        done
+      displayName: DEPLOY QA (Tables → Indexes → DML)
+
+    - bash: |
+        set -euo pipefail
+        shopt -s nullglob
+        if [ "${{ parameters.action }}" != "rollback" ]; then
+          echo "Skip rollback for action=${{ parameters.action }}"
+          exit 0
+        fi
+        echo "==> ROLLBACK"
+        for f in $(ls -1v db/rollback/*.sql); do
+          echo "---- $f"
+          sqlcmd -C -b -l 120 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
+        done
+      displayName: ROLLBACK QA

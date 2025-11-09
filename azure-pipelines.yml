@@ -22,10 +22,93 @@ stages:
         deploy:
           steps:
           - checkout: self
+            clean: true
+
+          # Install sqlcmd (mssql-tools18) on the agent
           - script: |
-              echo "Deploying to DEV..."
-              # run your sqlcmd step(s) here
-            displayName: Run sqlcmd (DEV)
+              set -euo pipefail
+              sudo apt-get update
+              sudo apt-get install -y curl gnupg apt-transport-https software-properties-common
+              curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+              curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+              sudo apt-get update
+              sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+              echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
+              export PATH="$PATH:/opt/mssql-tools18/bin"
+              sqlcmd -? >/dev/null
+              echo "sqlcmd installed OK"
+            displayName: "Install sqlcmd (DEV)"
+
+          # Sanity + connectivity
+          - script: |
+              set -euo pipefail
+              export PATH="$PATH:/opt/mssql-tools18/bin"
+              echo "Action     : ${{ parameters.action }}"
+              echo "Server     : $(serverName)"
+              echo "Database   : $(databaseName)"
+              echo "User       : $(sqlUser)"
+              test -n "$(serverName)"   || { echo "serverName not set"; exit 1; }
+              test -n "$(databaseName)" || { echo "databaseName not set"; exit 1; }
+              test -n "$(sqlUser)"      || { echo "sqlUser not set"; exit 1; }
+              test -n "$(sqlPassword)"  || { echo "sqlPassword not set"; exit 1; }
+              export SQLCMDPASSWORD="$(sqlPassword)"
+              echo "Testing sqlcmd connectivity..."
+              sqlcmd -S "$(serverName)" -d "$(databaseName)" -U "$(sqlUser)" -b -l 30 -I -Q "SELECT DB_NAME() AS Db;"
+            displayName: "Validate inputs & test connection (DEV)"
+
+          # Run scripts (schema -> seed) or rollback
+          - script: |
+              set -euo pipefail
+              export PATH="$PATH:/opt/mssql-tools18/bin"
+              export SQLCMDPASSWORD="$(sqlPassword)"
+
+              ROOT="$(Build.SourcesDirectory)"
+              SCHEMA_DIR="$ROOT/db/schema"
+              SEED_DIR="$ROOT/db/data/seed"
+              ROLLBACK_DIR="$ROOT/db/rollback"
+
+              SQLCMD="sqlcmd -S $(serverName) -d $(databaseName) -U $(sqlUser) -b -l 60 -I"
+
+              list_and_run () {
+                local dir="$1"
+                if [ ! -d "$dir" ]; then
+                  echo "SKIP (missing dir): $dir"
+                  return 0
+                fi
+                echo "==> Searching: $dir"
+                mapfile -t files < <(find "$dir" -type f -name "*.sql" | sort)
+                if [ "${#files[@]}" -eq 0 ]; then
+                  echo "No .sql files in $dir"
+                  return 0
+                fi
+                echo "Files to run:"
+                for f in "${files[@]}"; do echo "  - ${f#$ROOT/}"; done
+                for f in "${files[@]}"; do
+                  echo "---- RUN: ${f#$ROOT/}"
+                  $SQLCMD -i "$f"
+                done
+              }
+
+              case "${{ parameters.action }}" in
+                deploy)
+                  # order matters: base -> tables -> indexes -> views -> procs -> seed
+                  list_and_run "$SCHEMA_DIR"
+                  list_and_run "$SCHEMA_DIR/tables"
+                  list_and_run "$SCHEMA_DIR/indexes"
+                  list_and_run "$SCHEMA_DIR/views"
+                  list_and_run "$SCHEMA_DIR/procs"
+                  list_and_run "$SEED_DIR"
+                  ;;
+                seed-only)
+                  list_and_run "$SEED_DIR"
+                  ;;
+                rollback)
+                  list_and_run "$ROLLBACK_DIR"
+                  ;;
+              esac
+
+              echo "DEV deployment complete."
+            displayName: "Run SQL scripts (DEV)"
 
 # ---------------- QA (approval-gated) ----------------
 - stage: Deploy_qa
@@ -36,13 +119,50 @@ stages:
   - group: swa-secrets-qa
   jobs:
   - deployment: QaDeploy
-    environment: QA     # <— approvals/checks are attached to this env
+    environment: QA     # attach approvals/checks to this Environment in DevOps
     strategy:
       runOnce:
         deploy:
           steps:
           - checkout: self
+            clean: true
+
           - script: |
-              echo "Deploying to QA..."
-              # run your sqlcmd step(s) here
-            displayName: Run sqlcmd (QA)
+              set -euo pipefail
+              sudo apt-get update
+              sudo apt-get install -y curl gnupg apt-transport-https software-properties-common
+              curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+              curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+              sudo apt-get update
+              sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+              echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
+              export PATH="$PATH:/opt/mssql-tools18/bin"
+              sqlcmd -? >/dev/null
+              echo "sqlcmd installed OK"
+            displayName: "Install sqlcmd (QA)"
+
+          - script: |
+              set -euo pipefail
+              export PATH="$PATH:/opt/mssql-tools18/bin"
+              echo "Action     : ${{ parameters.action }}"
+              echo "Server     : $(serverName)"
+              echo "Database   : $(databaseName)"
+              echo "User       : $(sqlUser)"
+              test -n "$(serverName)"   || { echo "serverName not set"; exit 1; }
+              test -n "$(databaseName)" || { echo "databaseName not set"; exit 1; }
+              test -n "$(sqlUser)"      || { echo "sqlUser not set"; exit 1; }
+              test -n "$(sqlPassword)"  || { echo "sqlPassword not set"; exit 1; }
+              export SQLCMDPASSWORD="$(sqlPassword)"
+              echo "Testing sqlcmd connectivity..."
+              sqlcmd -S "$(serverName)" -d "$(databaseName)" -U "$(sqlUser)" -b -l 30 -I -Q "SELECT DB_NAME() AS Db;"
+            displayName: "Validate inputs & test connection (QA)"
+
+          - script: |
+              set -euo pipefail
+              export PATH="$PATH:/opt/mssql-tools18/bin"
+              export SQLCMDPASSWORD="$(sqlPassword)"
+
+              ROOT="$(Build.SourcesDirectory)"
+              SCHEMA_DIR="$ROOT/db/schema"
+              SEED_DIR="$ROOT/db/data/seed"
+              ROLLBACK_DIR="$ROOT/db/rollback_

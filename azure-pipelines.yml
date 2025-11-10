@@ -30,7 +30,7 @@ stages:
   displayName: "DB: ${{ parameters.action }} → DEV"
   condition: ${{ eq(parameters.targetEnv, 'dev') }}
   variables:
-  - group: 'swa-secrets-dev'
+  - group: 'swa-secrets-dev'      # SqlServer, DatabaseName, SqlUser, SqlPassword
   jobs:
   - job: ExecuteDev
     displayName: "Execute SQL (${{ parameters.action }}) - DEV"
@@ -38,50 +38,60 @@ stages:
     - checkout: self
       clean: true
 
-    # Install sqlcmd (mssql-tools18) with proper key dearmor
     - bash: |
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive
+        sudo apt-get update
+        sudo apt-get install -y curl gnupg apt-transport-https software-properties-common
+
+        # Microsoft repo key (dearmored) and 24.04 repo
         curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
           | gpg --dearmor \
           | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg >/dev/null
-        curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list \
+        curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/prod.list \
           | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
+
         sudo apt-get update
         sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+
+        # Make sqlcmd available NOW (this step) and in later steps
+        export PATH="$PATH:/opt/mssql-tools18/bin"
         echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
-        sqlcmd -? >/dev/null
-        echo "sqlcmd installed OK"
+
+        /opt/mssql-tools18/bin/sqlcmd -? >/dev/null
+        echo "sqlcmd installed at: $(command -v sqlcmd)"
       displayName: Install sqlcmd (DEV)
 
-    # Connectivity + warm-up (handles serverless) 
     - bash: |
         set -euo pipefail
-        echo "Server: $(SqlServer), DB: $(DatabaseName), User: $(SqlUser)"
+        export PATH="$PATH:/opt/mssql-tools18/bin"
+
+        echo "Server: $(SqlServer)"
+        echo "DB    : $(DatabaseName)"
+        echo "User  : $(SqlUser)"
         test -n "$(SqlServer)"    || { echo "SqlServer not set"; exit 1; }
         test -n "$(DatabaseName)" || { echo "DatabaseName not set"; exit 1; }
         test -n "$(SqlUser)"      || { echo "SqlUser not set"; exit 1; }
         test -n "$(SqlPassword)"  || { echo "SqlPassword not set"; exit 1; }
 
         export SQLCMDPASSWORD="$(SqlPassword)"
-        # Pre-warm master (ignore failures) then target DB (must succeed)
+        # Warm-up (ignore master ping failure)
         sqlcmd -S "$(SqlServer)" -d master            -U "$(SqlUser)" -l 30 -I -Q "SELECT 1" || true
-        sqlcmd -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -l 30 -I -Q "SELECT DB_NAME();" 
+        sqlcmd -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -l 30 -I -Q "SELECT DB_NAME();"
       displayName: Sanity & connectivity (DEV)
 
-    # Execute (deploy or rollback)
     - bash: |
         set -euo pipefail
+        export PATH="$PATH:/opt/mssql-tools18/bin"
         export SQLCMDPASSWORD="$(SqlPassword)"
         ROOT="$(Build.SourcesDirectory)"
 
-        # Add '-C' to trust server cert if your corp proxy breaks TLS (optional)
+        # Add "-C" to SQLCMD array if you need to trust server certs behind a proxy
         SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I")
 
         list_files() {
           local dir="$1"
           if [ -d "$dir" ]; then
-            # Print null-separated list to handle spaces; sort deterministically
             find "$dir" -maxdepth 1 -type f -name "*.sql" -print0 | sort -z
           fi
         }
@@ -125,16 +135,16 @@ stages:
         echo "DEV completed."
       displayName: Execute (${{ parameters.action }}) – DEV
 
-# ================= QA (approval-gated via Environment) =================
+# ================= QA (approval-gated Environment) =================
 - stage: QA
   displayName: "DB: ${{ parameters.action }} → QA"
   condition: ${{ eq(parameters.targetEnv, 'qa') }}
   variables:
-  - group: 'swa-secrets-qa'
+  - group: 'swa-secrets-qa'      # SqlServer, DatabaseName, SqlUser, SqlPassword
   jobs:
   - deployment: ExecuteQA
     displayName: "Execute SQL (${{ parameters.action }}) - QA"
-    environment: ${{ parameters.qaEnvironmentName }}   # Ensure 'QA' Environment exists w/ approvals
+    environment: ${{ parameters.qaEnvironmentName }}   # Create 'QA' Env and add approvals/checks
     strategy:
       runOnce:
         deploy:
@@ -145,21 +155,32 @@ stages:
           - bash: |
               set -euo pipefail
               export DEBIAN_FRONTEND=noninteractive
+              sudo apt-get update
+              sudo apt-get install -y curl gnupg apt-transport-https software-properties-common
+
               curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
                 | gpg --dearmor \
                 | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg >/dev/null
-              curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list \
+              curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/prod.list \
                 | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
+
               sudo apt-get update
               sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+
+              export PATH="$PATH:/opt/mssql-tools18/bin"
               echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
-              sqlcmd -? >/dev/null
-              echo "sqlcmd installed OK"
+
+              /opt/mssql-tools18/bin/sqlcmd -? >/dev/null
+              echo "sqlcmd installed at: $(command -v sqlcmd)"
             displayName: Install sqlcmd (QA)
 
           - bash: |
               set -euo pipefail
-              echo "Server: $(SqlServer), DB: $(DatabaseName), User: $(SqlUser)"
+              export PATH="$PATH:/opt/mssql-tools18/bin"
+
+              echo "Server: $(SqlServer)"
+              echo "DB    : $(DatabaseName)"
+              echo "User  : $(SqlUser)"
               test -n "$(SqlServer)"    || { echo "SqlServer not set"; exit 1; }
               test -n "$(DatabaseName)" || { echo "DatabaseName not set"; exit 1; }
               test -n "$(SqlUser)"      || { echo "SqlUser not set"; exit 1; }
@@ -172,11 +193,12 @@ stages:
 
           - bash: |
               set -euo pipefail
+              export PATH="$PATH:/opt/mssql-tools18/bin"
               export SQLCMDPASSWORD="$(SqlPassword)"
               ROOT="$(Build.SourcesDirectory)"
 
               SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I")
-              # To ignore TLS chain issues, append "-C": SQLCMD+=("-C")
+              # To bypass proxy TLS issues temporarily: SQLCMD+=("-C")
 
               list_files() {
                 local dir="$1"

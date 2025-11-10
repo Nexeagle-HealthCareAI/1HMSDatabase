@@ -88,8 +88,6 @@ BEGIN
 END
 GO
 
-
-
 /* =========================================================
    HOSPITALS / STATUS / USERS
    ========================================================= */
@@ -347,31 +345,30 @@ BEGIN
 END
 GO
 
-
 /* =========================================================
-   UserInvitations
+   UserInvitations  (FIXED: schema-qualified + UTC timestamps)
    ========================================================= */
-
 IF OBJECT_ID('dbo.UserInvitations','U') IS NULL
 BEGIN
-CREATE TABLE UserInvitations (
-  InvitationID     UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
-  HospitalID       UNIQUEIDENTIFIER NOT NULL,
-  RoleID           UNIQUEIDENTIFIER NOT NULL,
-  InvitedByUserID  UNIQUEIDENTIFIER NOT NULL,
-  RecipientName    VARCHAR(150) NULL,
-  RecipientMobile  VARCHAR(20) NOT NULL,
-  RecipientEmail   VARCHAR(150) NULL,
-  TokenHash        VARBINARY(64) NOT NULL,   -- SHA-256 of opaque token
-  ExpiresAt        DATETIME NOT NULL,        -- e.g., GETUTCDATE()+7
-  AcceptedAt       DATETIME NULL,
-  RevokedAt        DATETIME NULL,
-  Status           VARCHAR(20) NOT NULL DEFAULT 'Pending', -- Pending/Accepted/Revoked/Expired
-  CreatedAt        DATETIME DEFAULT GETDATE(),
-  FOREIGN KEY(RoleID) REFERENCES Roles(RoleID),
-  FOREIGN KEY(HospitalID) REFERENCES Hospitals(HospitalID),
-  FOREIGN KEY(InvitedByUserID) REFERENCES Users(UserID)
-);
+    CREATE TABLE dbo.UserInvitations (
+      InvitationID     UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_UserInvitations PRIMARY KEY DEFAULT NEWID(),
+      HospitalID       UNIQUEIDENTIFIER NOT NULL,
+      RoleID           UNIQUEIDENTIFIER NOT NULL,
+      InvitedByUserID  UNIQUEIDENTIFIER NOT NULL,
+      RecipientName    NVARCHAR(150) NULL,
+      RecipientMobile  NVARCHAR(20)  NOT NULL,
+      RecipientEmail   NVARCHAR(150) NULL,
+      TokenHash        VARBINARY(64) NOT NULL,   -- SHA-256 of opaque token
+      ExpiresAt        DATETIME2(3)   NOT NULL,  -- e.g., SYSUTCDATETIME()+7 (compute in app)
+      AcceptedAt       DATETIME2(3)   NULL,
+      RevokedAt        DATETIME2(3)   NULL,
+      Status           NVARCHAR(20)   NOT NULL CONSTRAINT DF_UserInv_Status DEFAULT N'Pending', -- Pending/Accepted/Revoked/Expired
+      CreatedAt        DATETIME2(3)   NOT NULL CONSTRAINT DF_UserInv_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+      CONSTRAINT FK_UserInv_Role      FOREIGN KEY(RoleID)          REFERENCES dbo.Roles(RoleID),
+      CONSTRAINT FK_UserInv_Hospital  FOREIGN KEY(HospitalID)      REFERENCES dbo.Hospitals(HospitalID),
+      CONSTRAINT FK_UserInv_InvitedBy FOREIGN KEY(InvitedByUserID) REFERENCES dbo.Users(UserID)
+    );
 END
 GO
 

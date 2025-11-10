@@ -24,9 +24,6 @@ parameters:
 
 pool: { vmImage: ubuntu-latest }
 
-# ---------- helpers (bash snippets reused in both stages) ----------
-# We’ll inline identical steps in both stages to keep it single-file.
-
 stages:
 # ================= DEV =================
 - stage: Dev
@@ -41,40 +38,50 @@ stages:
     - checkout: self
       clean: true
 
+    # Install sqlcmd (mssql-tools18) with proper key dearmor
     - bash: |
         set -euo pipefail
-        curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
-        curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
+        export DEBIAN_FRONTEND=noninteractive
+        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+          | gpg --dearmor \
+          | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg >/dev/null
+        curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list \
+          | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
         sudo apt-get update
         sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
         echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
         sqlcmd -? >/dev/null
-      displayName: Install sqlcmd (mssql-tools18)
+        echo "sqlcmd installed OK"
+      displayName: Install sqlcmd (DEV)
 
+    # Connectivity + warm-up (handles serverless) 
     - bash: |
         set -euo pipefail
         echo "Server: $(SqlServer), DB: $(DatabaseName), User: $(SqlUser)"
-        test -n "$(SqlServer)"     || { echo "SqlServer not set"; exit 1; }
-        test -n "$(DatabaseName)"  || { echo "DatabaseName not set"; exit 1; }
-        test -n "$(SqlUser)"       || { echo "SqlUser not set"; exit 1; }
-        test -n "$(SqlPassword)"   || { echo "SqlPassword not set"; exit 1; }
+        test -n "$(SqlServer)"    || { echo "SqlServer not set"; exit 1; }
+        test -n "$(DatabaseName)" || { echo "DatabaseName not set"; exit 1; }
+        test -n "$(SqlUser)"      || { echo "SqlUser not set"; exit 1; }
+        test -n "$(SqlPassword)"  || { echo "SqlPassword not set"; exit 1; }
 
-        # Pre-warm (handles serverless wake-up)
         export SQLCMDPASSWORD="$(SqlPassword)"
+        # Pre-warm master (ignore failures) then target DB (must succeed)
         sqlcmd -S "$(SqlServer)" -d master            -U "$(SqlUser)" -l 30 -I -Q "SELECT 1" || true
-        sqlcmd -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -l 30 -I -Q "SELECT DB_NAME();"
+        sqlcmd -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -l 30 -I -Q "SELECT DB_NAME();" 
       displayName: Sanity & connectivity (DEV)
 
+    # Execute (deploy or rollback)
     - bash: |
         set -euo pipefail
         export SQLCMDPASSWORD="$(SqlPassword)"
         ROOT="$(Build.SourcesDirectory)"
-        SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I" "-C")
+
+        # Add '-C' to trust server cert if your corp proxy breaks TLS (optional)
+        SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I")
 
         list_files() {
           local dir="$1"
           if [ -d "$dir" ]; then
-            # Use find (not ls) so empty dirs don't error and names with spaces are OK
+            # Print null-separated list to handle spaces; sort deterministically
             find "$dir" -maxdepth 1 -type f -name "*.sql" -print0 | sort -z
           fi
         }
@@ -84,8 +91,13 @@ stages:
           while :; do
             echo "---- RUN: ${file#$ROOT/} (try $attempt/$tries)"
             if "${SQLCMD[@]}" -i "$file"; then return 0; fi
-            if [ $attempt -ge $tries ]; then echo "FAILED: $file"; return 1; fi
-            sleep "$delay"; delay=$(( delay < 30 ? delay*2 : 30 )); attempt=$((attempt+1))
+            if [ $attempt -ge $tries ]; then
+              echo "FAILED after $tries attempts: $file"
+              return 1
+            fi
+            sleep "$delay"
+            delay=$(( delay < 30 ? delay*2 : 30 ))
+            attempt=$((attempt+1))
           done
         }
 
@@ -110,9 +122,10 @@ stages:
         else
           run_dir "$ROOT/db/rollback"         "ROLLBACK"
         fi
+        echo "DEV completed."
       displayName: Execute (${{ parameters.action }}) – DEV
 
-# ================= QA =================
+# ================= QA (approval-gated via Environment) =================
 - stage: QA
   displayName: "DB: ${{ parameters.action }} → QA"
   condition: ${{ eq(parameters.targetEnv, 'qa') }}
@@ -121,7 +134,7 @@ stages:
   jobs:
   - deployment: ExecuteQA
     displayName: "Execute SQL (${{ parameters.action }}) - QA"
-    environment: ${{ parameters.qaEnvironmentName }}
+    environment: ${{ parameters.qaEnvironmentName }}   # Ensure 'QA' Environment exists w/ approvals
     strategy:
       runOnce:
         deploy:
@@ -131,21 +144,26 @@ stages:
 
           - bash: |
               set -euo pipefail
-              curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
-              curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
+              export DEBIAN_FRONTEND=noninteractive
+              curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+                | gpg --dearmor \
+                | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg >/dev/null
+              curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list \
+                | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
               sudo apt-get update
               sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
               echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
               sqlcmd -? >/dev/null
-            displayName: Install sqlcmd (mssql-tools18)
+              echo "sqlcmd installed OK"
+            displayName: Install sqlcmd (QA)
 
           - bash: |
               set -euo pipefail
               echo "Server: $(SqlServer), DB: $(DatabaseName), User: $(SqlUser)"
-              test -n "$(SqlServer)"     || { echo "SqlServer not set"; exit 1; }
-              test -n "$(DatabaseName)"  || { echo "DatabaseName not set"; exit 1; }
-              test -n "$(SqlUser)"       || { echo "SqlUser not set"; exit 1; }
-              test -n "$(SqlPassword)"   || { echo "SqlPassword not set"; exit 1; }
+              test -n "$(SqlServer)"    || { echo "SqlServer not set"; exit 1; }
+              test -n "$(DatabaseName)" || { echo "DatabaseName not set"; exit 1; }
+              test -n "$(SqlUser)"      || { echo "SqlUser not set"; exit 1; }
+              test -n "$(SqlPassword)"  || { echo "SqlPassword not set"; exit 1; }
 
               export SQLCMDPASSWORD="$(SqlPassword)"
               sqlcmd -S "$(SqlServer)" -d master            -U "$(SqlUser)" -l 30 -I -Q "SELECT 1" || true
@@ -156,7 +174,9 @@ stages:
               set -euo pipefail
               export SQLCMDPASSWORD="$(SqlPassword)"
               ROOT="$(Build.SourcesDirectory)"
-              SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I" "-C")
+
+              SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I")
+              # To ignore TLS chain issues, append "-C": SQLCMD+=("-C")
 
               list_files() {
                 local dir="$1"
@@ -170,8 +190,13 @@ stages:
                 while :; do
                   echo "---- RUN: ${file#$ROOT/} (try $attempt/$tries)"
                   if "${SQLCMD[@]}" -i "$file"; then return 0; fi
-                  if [ $attempt -ge $tries ]; then echo "FAILED: $file"; return 1; fi
-                  sleep "$delay"; delay=$(( delay < 30 ? delay*2 : 30 )); attempt=$((attempt+1))
+                  if [ $attempt -ge $tries ]; then
+                    echo "FAILED after $tries attempts: $file"
+                    return 1
+                  fi
+                  sleep "$delay"
+                  delay=$(( delay < 30 ? delay*2 : 30 ))
+                  attempt=$((attempt+1))
                 done
               }
 
@@ -196,4 +221,5 @@ stages:
               else
                 run_dir "$ROOT/db/rollback"         "ROLLBACK"
               fi
+              echo "QA completed."
             displayName: Execute (${{ parameters.action }}) – QA

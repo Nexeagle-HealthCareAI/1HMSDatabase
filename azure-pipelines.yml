@@ -24,14 +24,16 @@ parameters:
 
 pool: { vmImage: ubuntu-latest }
 
+# ---------- helpers (bash snippets reused in both stages) ----------
+# We’ll inline identical steps in both stages to keep it single-file.
+
 stages:
-# ------------ DEV ------------
+# ================= DEV =================
 - stage: Dev
   displayName: "DB: ${{ parameters.action }} → DEV"
-  # ⬅️ compile-time condition (no succeeded() here)
   condition: ${{ eq(parameters.targetEnv, 'dev') }}
   variables:
-  - group: 'swa-secrets-dev'     # ⬅️ bind var group inside the stage
+  - group: 'swa-secrets-dev'
   jobs:
   - job: ExecuteDev
     displayName: "Execute SQL (${{ parameters.action }}) - DEV"
@@ -46,58 +48,80 @@ stages:
         sudo apt-get update
         sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
         echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
+        sqlcmd -? >/dev/null
       displayName: Install sqlcmd (mssql-tools18)
 
     - bash: |
         set -euo pipefail
-        echo "Server: $(SqlServer), DB: $(DatabaseName)"
-        ls -1v db/schema/tables/*.sql   2>/dev/null || true
-        ls -1v db/schema/indexes/*.sql  2>/dev/null || true
-        ls -1v db/data/seed/*.sql       2>/dev/null || true
-        ls -1v db/rollback/*.sql        2>/dev/null || true
-      displayName: Inspect files
+        echo "Server: $(SqlServer), DB: $(DatabaseName), User: $(SqlUser)"
+        test -n "$(SqlServer)"     || { echo "SqlServer not set"; exit 1; }
+        test -n "$(DatabaseName)"  || { echo "DatabaseName not set"; exit 1; }
+        test -n "$(SqlUser)"       || { echo "SqlUser not set"; exit 1; }
+        test -n "$(SqlPassword)"   || { echo "SqlPassword not set"; exit 1; }
+
+        # Pre-warm (handles serverless wake-up)
+        export SQLCMDPASSWORD="$(SqlPassword)"
+        sqlcmd -S "$(SqlServer)" -d master            -U "$(SqlUser)" -l 30 -I -Q "SELECT 1" || true
+        sqlcmd -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -l 30 -I -Q "SELECT DB_NAME();"
+      displayName: Sanity & connectivity (DEV)
 
     - bash: |
         set -euo pipefail
-        shopt -s nullglob
-        if [ "${{ parameters.action }}" != "deploy" ]; then echo "Skip deploy"; exit 0; fi
+        export SQLCMDPASSWORD="$(SqlPassword)"
+        ROOT="$(Build.SourcesDirectory)"
+        SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I" "-C")
 
-        for f in $(ls -1v db/schema/tables/*.sql);  do
-          echo "TABLE -> $f"
-          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-        done
-        for f in $(ls -1v db/schema/indexes/*.sql); do
-          echo "INDEX -> $f"
-          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-        done
-        for f in $(ls -1v db/data/seed/*.sql);   do
-          echo "DML   -> $f"
-          sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-        done
-      displayName: DEPLOY DEV (Tables → Indexes → DML)
+        list_files() {
+          local dir="$1"
+          if [ -d "$dir" ]; then
+            # Use find (not ls) so empty dirs don't error and names with spaces are OK
+            find "$dir" -maxdepth 1 -type f -name "*.sql" -print0 | sort -z
+          fi
+        }
 
-    - bash: |
-        set -euo pipefail
-        shopt -s nullglob
-        if [ "${{ parameters.action }}" != "rollback" ]; then echo "Skip rollback"; exit 0; fi
+        run_with_retry() {
+          local file="$1" tries=8 delay=3 attempt=1
+          while :; do
+            echo "---- RUN: ${file#$ROOT/} (try $attempt/$tries)"
+            if "${SQLCMD[@]}" -i "$file"; then return 0; fi
+            if [ $attempt -ge $tries ]; then echo "FAILED: $file"; return 1; fi
+            sleep "$delay"; delay=$(( delay < 30 ? delay*2 : 30 )); attempt=$((attempt+1))
+          done
+        }
 
-        for f in $(ls -1v db/rollback/*.sql); do
-          echo "ROLLBACK -> $f"
-          sqlcmd -C -b -l 120 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-        done
-      displayName: ROLLBACK DEV
+        run_dir() {
+          local dir="$1" label="$2"
+          if [ ! -d "$dir" ]; then echo "SKIP (missing): $dir"; return 0; fi
+          echo "==> $label : $dir"
+          local any=0
+          while IFS= read -r -d '' f; do
+            any=1; run_with_retry "$f"
+          done < <(list_files "$dir")
+          [ $any -eq 0 ] && echo "No .sql files in $dir"
+        }
 
-# ------------ QA ------------
+        if [ "${{ parameters.action }}" = "deploy" ]; then
+          run_dir "$ROOT/db/schema"           "SCHEMA root"
+          run_dir "$ROOT/db/schema/tables"    "TABLES"
+          run_dir "$ROOT/db/schema/indexes"   "INDEXES"
+          run_dir "$ROOT/db/schema/views"     "VIEWS"
+          run_dir "$ROOT/db/schema/procs"     "PROCS"
+          run_dir "$ROOT/db/data/seed"        "SEED"
+        else
+          run_dir "$ROOT/db/rollback"         "ROLLBACK"
+        fi
+      displayName: Execute (${{ parameters.action }}) – DEV
+
+# ================= QA =================
 - stage: QA
   displayName: "DB: ${{ parameters.action }} → QA"
-  # ⬅️ compile-time condition
   condition: ${{ eq(parameters.targetEnv, 'qa') }}
   variables:
-  - group: 'swa-secrets-qa'      # ⬅️ bind var group inside the stage
+  - group: 'swa-secrets-qa'
   jobs:
   - deployment: ExecuteQA
     displayName: "Execute SQL (${{ parameters.action }}) - QA"
-    environment: ${{ parameters.qaEnvironmentName }}  # ⬅️ 'QA'
+    environment: ${{ parameters.qaEnvironmentName }}
     strategy:
       runOnce:
         deploy:
@@ -112,43 +136,64 @@ stages:
               sudo apt-get update
               sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
               echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
+              sqlcmd -? >/dev/null
             displayName: Install sqlcmd (mssql-tools18)
 
           - bash: |
               set -euo pipefail
-              echo "Server: $(SqlServer), DB: $(DatabaseName)"
-              ls -1v db/schema/tables/*.sql   2>/dev/null || true
-              ls -1v db/schema/indexes/*.sql  2>/dev/null || true
-              ls -1v db/data/seed/*.sql       2>/dev/null || true
-              ls -1v db/rollback/*.sql        2>/dev/null || true
-            displayName: Inspect files
+              echo "Server: $(SqlServer), DB: $(DatabaseName), User: $(SqlUser)"
+              test -n "$(SqlServer)"     || { echo "SqlServer not set"; exit 1; }
+              test -n "$(DatabaseName)"  || { echo "DatabaseName not set"; exit 1; }
+              test -n "$(SqlUser)"       || { echo "SqlUser not set"; exit 1; }
+              test -n "$(SqlPassword)"   || { echo "SqlPassword not set"; exit 1; }
+
+              export SQLCMDPASSWORD="$(SqlPassword)"
+              sqlcmd -S "$(SqlServer)" -d master            -U "$(SqlUser)" -l 30 -I -Q "SELECT 1" || true
+              sqlcmd -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -l 30 -I -Q "SELECT DB_NAME();"
+            displayName: Sanity & connectivity (QA)
 
           - bash: |
               set -euo pipefail
-              shopt -s nullglob
-              if [ "${{ parameters.action }}" != "deploy" ]; then echo "Skip deploy"; exit 0; fi
+              export SQLCMDPASSWORD="$(SqlPassword)"
+              ROOT="$(Build.SourcesDirectory)"
+              SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I" "-C")
 
-              for f in $(ls -1v db/schema/tables/*.sql);  do
-                echo "TABLE -> $f"
-                sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-              done
-              for f in $(ls -1v db/schema/indexes/*.sql); do
-                echo "INDEX -> $f"
-                sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-              done
-              for f in $(ls -1v db/data/seed/*.sql);   do
-                echo "DML   -> $f"
-                sqlcmd -C -b -l 60 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-              done
-            displayName: DEPLOY QA (Tables → Indexes → DML)
+              list_files() {
+                local dir="$1"
+                if [ -d "$dir" ]; then
+                  find "$dir" -maxdepth 1 -type f -name "*.sql" -print0 | sort -z
+                fi
+              }
 
-          - bash: |
-              set -euo pipefail
-              shopt -s nullglob
-              if [ "${{ parameters.action }}" != "rollback" ]; then echo "Skip rollback"; exit 0; fi
+              run_with_retry() {
+                local file="$1" tries=8 delay=3 attempt=1
+                while :; do
+                  echo "---- RUN: ${file#$ROOT/} (try $attempt/$tries)"
+                  if "${SQLCMD[@]}" -i "$file"; then return 0; fi
+                  if [ $attempt -ge $tries ]; then echo "FAILED: $file"; return 1; fi
+                  sleep "$delay"; delay=$(( delay < 30 ? delay*2 : 30 )); attempt=$((attempt+1))
+                done
+              }
 
-              for f in $(ls -1v db/rollback/*.sql); do
-                echo "ROLLBACK -> $f"
-                sqlcmd -C -b -l 120 -I -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -P "$(SqlPassword)" -i "$f"
-              done
-            displayName: ROLLBACK QA
+              run_dir() {
+                local dir="$1" label="$2"
+                if [ ! -d "$dir" ]; then echo "SKIP (missing): $dir"; return 0; fi
+                echo "==> $label : $dir"
+                local any=0
+                while IFS= read -r -d '' f; do
+                  any=1; run_with_retry "$f"
+                done < <(list_files "$dir")
+                [ $any -eq 0 ] && echo "No .sql files in $dir"
+              }
+
+              if [ "${{ parameters.action }}" = "deploy" ]; then
+                run_dir "$ROOT/db/schema"           "SCHEMA root"
+                run_dir "$ROOT/db/schema/tables"    "TABLES"
+                run_dir "$ROOT/db/schema/indexes"   "INDEXES"
+                run_dir "$ROOT/db/schema/views"     "VIEWS"
+                run_dir "$ROOT/db/schema/procs"     "PROCS"
+                run_dir "$ROOT/db/data/seed"        "SEED"
+              else
+                run_dir "$ROOT/db/rollback"         "ROLLBACK"
+              fi
+            displayName: Execute (${{ parameters.action }}) – QA

@@ -30,7 +30,7 @@ stages:
   displayName: "DB: ${{ parameters.action }} → DEV"
   condition: ${{ eq(parameters.targetEnv, 'dev') }}
   variables:
-  - group: 'swa-secrets-dev'      # SqlServer, DatabaseName, SqlUser, SqlPassword
+  - group: 'swa-secrets-dev'   # SqlServer, DatabaseName, SqlUser, SqlPassword
   jobs:
   - job: ExecuteDev
     displayName: "Execute SQL (${{ parameters.action }}) - DEV"
@@ -38,13 +38,13 @@ stages:
     - checkout: self
       clean: true
 
+    # Install sqlcmd (Ubuntu 24.04 repo + dearmored key). PATH works in this step and next ones.
     - bash: |
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive
         sudo apt-get update
         sudo apt-get install -y curl gnupg apt-transport-https software-properties-common
 
-        # Microsoft repo key (dearmored) and 24.04 repo
         curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
           | gpg --dearmor \
           | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg >/dev/null
@@ -54,7 +54,6 @@ stages:
         sudo apt-get update
         sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
 
-        # Make sqlcmd available NOW (this step) and in later steps
         export PATH="$PATH:/opt/mssql-tools18/bin"
         echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
 
@@ -62,6 +61,7 @@ stages:
         echo "sqlcmd installed at: $(command -v sqlcmd)"
       displayName: Install sqlcmd (DEV)
 
+    # Connectivity warm-up
     - bash: |
         set -euo pipefail
         export PATH="$PATH:/opt/mssql-tools18/bin"
@@ -75,25 +75,45 @@ stages:
         test -n "$(SqlPassword)"  || { echo "SqlPassword not set"; exit 1; }
 
         export SQLCMDPASSWORD="$(SqlPassword)"
-        # Warm-up (ignore master ping failure)
+        # Ping master (ignore failure) then target DB (must succeed)
         sqlcmd -S "$(SqlServer)" -d master            -U "$(SqlUser)" -l 30 -I -Q "SELECT 1" || true
         sqlcmd -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -l 30 -I -Q "SELECT DB_NAME();"
       displayName: Sanity & connectivity (DEV)
 
+    # Execute (deploy or rollback) with file inventory + retries
     - bash: |
         set -euo pipefail
         export PATH="$PATH:/opt/mssql-tools18/bin"
         export SQLCMDPASSWORD="$(SqlPassword)"
         ROOT="$(Build.SourcesDirectory)"
 
-        # Add "-C" to SQLCMD array if you need to trust server certs behind a proxy
+        # Add "-C" to trust server certs if your proxy breaks TLS: SQLCMD+=("-C")
         SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I")
+
+        echo "== File inventory =="
+        for d in \
+          "$ROOT/db/schema" \
+          "$ROOT/db/schema/tables" \
+          "$ROOT/db/schema/indexes" \
+          "$ROOT/db/schema/views" \
+          "$ROOT/db/schema/procs" \
+          "$ROOT/db/data/seed" \
+          "$ROOT/db/rollback"
+        do
+          if [ -d "$d" ]; then
+            echo "-- $d"
+            find "$d" -type f -name "*.sql" | sort || true
+          else
+            echo "-- $d (missing)"
+          fi
+        done
+        echo "====================="
 
         list_files() {
           local dir="$1"
-          if [ -d "$dir" ]; then
-            find "$dir" -maxdepth 1 -type f -name "*.sql" -print0 | sort -z
-          fi
+          [ -d "$dir" ] || return 0
+          # recursive + null-separated to handle spaces; sorted
+          find "$dir" -type f -name "*.sql" -print0 | sort -z
         }
 
         run_with_retry() {
@@ -132,10 +152,11 @@ stages:
         else
           run_dir "$ROOT/db/rollback"         "ROLLBACK"
         fi
+
         echo "DEV completed."
       displayName: Execute (${{ parameters.action }}) – DEV
 
-# ================= QA (approval-gated Environment) =================
+# ================= QA (approval-gated via Environment) =================
 - stage: QA
   displayName: "DB: ${{ parameters.action }} → QA"
   condition: ${{ eq(parameters.targetEnv, 'qa') }}
@@ -144,7 +165,7 @@ stages:
   jobs:
   - deployment: ExecuteQA
     displayName: "Execute SQL (${{ parameters.action }}) - QA"
-    environment: ${{ parameters.qaEnvironmentName }}   # Create 'QA' Env and add approvals/checks
+    environment: ${{ parameters.qaEnvironmentName }}   # Create 'QA' Environment and add approvals/checks
     strategy:
       runOnce:
         deploy:
@@ -198,13 +219,31 @@ stages:
               ROOT="$(Build.SourcesDirectory)"
 
               SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I")
-              # To bypass proxy TLS issues temporarily: SQLCMD+=("-C")
+              # To bypass TLS chain issues temporarily: SQLCMD+=("-C")
+
+              echo "== File inventory =="
+              for d in \
+                "$ROOT/db/schema" \
+                "$ROOT/db/schema/tables" \
+                "$ROOT/db/schema/indexes" \
+                "$ROOT/db/schema/views" \
+                "$ROOT/db/schema/procs" \
+                "$ROOT/db/data/seed" \
+                "$ROOT/db/rollback"
+              do
+                if [ -d "$d" ]; then
+                  echo "-- $d"
+                  find "$d" -type f -name "*.sql" | sort || true
+                else
+                  echo "-- $d (missing)"
+                fi
+              done
+              echo "====================="
 
               list_files() {
                 local dir="$1"
-                if [ -d "$dir" ]; then
-                  find "$dir" -maxdepth 1 -type f -name "*.sql" -print0 | sort -z
-                fi
+                [ -d "$dir" ] || return 0
+                find "$dir" -type f -name "*.sql" -print0 | sort -z
               }
 
               run_with_retry() {

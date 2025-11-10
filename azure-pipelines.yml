@@ -30,7 +30,7 @@ stages:
   displayName: "DB: ${{ parameters.action }} → DEV"
   condition: ${{ eq(parameters.targetEnv, 'dev') }}
   variables:
-  - group: 'swa-secrets-dev'   # SqlServer, DatabaseName, SqlUser, SqlPassword
+  - group: 'swa-secrets-dev'   # expects: SqlServer, DatabaseName, SqlUser, SqlPassword
   jobs:
   - job: ExecuteDev
     displayName: "Execute SQL (${{ parameters.action }}) - DEV"
@@ -38,7 +38,7 @@ stages:
     - checkout: self
       clean: true
 
-    # Install sqlcmd (Ubuntu 24.04 repo + dearmored key). PATH works in this step and next ones.
+    # Install sqlcmd (Ubuntu 24.04 repo + dearmored key)
     - bash: |
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive
@@ -80,17 +80,17 @@ stages:
         sqlcmd -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -l 30 -I -Q "SELECT DB_NAME();"
       displayName: Sanity & connectivity (DEV)
 
-    # Execute (deploy or rollback) with file inventory + retries
+    # Execute (deploy or rollback) – FLAT search per folder (no recursion at root)
     - bash: |
         set -euo pipefail
         export PATH="$PATH:/opt/mssql-tools18/bin"
         export SQLCMDPASSWORD="$(SqlPassword)"
         ROOT="$(Build.SourcesDirectory)"
 
-        # Add "-C" to trust server certs if your proxy breaks TLS: SQLCMD+=("-C")
+        # Add "-C" to trust server certs behind a proxy: SQLCMD+=("-C")
         SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I")
 
-        echo "== File inventory =="
+        echo "== File inventory (flat per folder) =="
         for d in \
           "$ROOT/db/schema" \
           "$ROOT/db/schema/tables" \
@@ -102,18 +102,17 @@ stages:
         do
           if [ -d "$d" ]; then
             echo "-- $d"
-            find "$d" -type f -name "*.sql" | sort || true
+            find "$d" -maxdepth 1 -type f -name "*.sql" | sort || true
           else
             echo "-- $d (missing)"
           fi
         done
         echo "====================="
 
-        list_files() {
+        list_files_flat() {
           local dir="$1"
           [ -d "$dir" ] || return 0
-          # recursive + null-separated to handle spaces; sorted
-          find "$dir" -type f -name "*.sql" -print0 | sort -z
+          find "$dir" -maxdepth 1 -type f -name "*.sql" -print0 | sort -z
         }
 
         run_with_retry() {
@@ -131,26 +130,26 @@ stages:
           done
         }
 
-        run_dir() {
+        run_dir_flat() {
           local dir="$1" label="$2"
           if [ ! -d "$dir" ]; then echo "SKIP (missing): $dir"; return 0; fi
           echo "==> $label : $dir"
           local any=0
           while IFS= read -r -d '' f; do
             any=1; run_with_retry "$f"
-          done < <(list_files "$dir")
+          done < <(list_files_flat "$dir")
           [ $any -eq 0 ] && echo "No .sql files in $dir"
         }
 
         if [ "${{ parameters.action }}" = "deploy" ]; then
-          run_dir "$ROOT/db/schema"           "SCHEMA root"
-          run_dir "$ROOT/db/schema/tables"    "TABLES"
-          run_dir "$ROOT/db/schema/indexes"   "INDEXES"
-          run_dir "$ROOT/db/schema/views"     "VIEWS"
-          run_dir "$ROOT/db/schema/procs"     "PROCS"
-          run_dir "$ROOT/db/data/seed"        "SEED"
+          run_dir_flat "$ROOT/db/schema"         "SCHEMA root"
+          run_dir_flat "$ROOT/db/schema/tables"  "TABLES"
+          run_dir_flat "$ROOT/db/schema/indexes" "INDEXES"
+          run_dir_flat "$ROOT/db/schema/views"   "VIEWS"
+          run_dir_flat "$ROOT/db/schema/procs"   "PROCS"
+          run_dir_flat "$ROOT/db/data/seed"      "SEED"
         else
-          run_dir "$ROOT/db/rollback"         "ROLLBACK"
+          run_dir_flat "$ROOT/db/rollback"       "ROLLBACK"
         fi
 
         echo "DEV completed."
@@ -161,11 +160,11 @@ stages:
   displayName: "DB: ${{ parameters.action }} → QA"
   condition: ${{ eq(parameters.targetEnv, 'qa') }}
   variables:
-  - group: 'swa-secrets-qa'      # SqlServer, DatabaseName, SqlUser, SqlPassword
+  - group: 'swa-secrets-qa'   # expects: SqlServer, DatabaseName, SqlUser, SqlPassword
   jobs:
   - deployment: ExecuteQA
     displayName: "Execute SQL (${{ parameters.action }}) - QA"
-    environment: ${{ parameters.qaEnvironmentName }}   # Create 'QA' Environment and add approvals/checks
+    environment: ${{ parameters.qaEnvironmentName }}   # Create 'QA' Environment + approvals
     strategy:
       runOnce:
         deploy:
@@ -221,7 +220,7 @@ stages:
               SQLCMD=("sqlcmd" "-S" "$(SqlServer)" "-d" "$(DatabaseName)" "-U" "$(SqlUser)" "-b" "-l" "60" "-I")
               # To bypass TLS chain issues temporarily: SQLCMD+=("-C")
 
-              echo "== File inventory =="
+              echo "== File inventory (flat per folder) =="
               for d in \
                 "$ROOT/db/schema" \
                 "$ROOT/db/schema/tables" \
@@ -233,17 +232,17 @@ stages:
               do
                 if [ -d "$d" ]; then
                   echo "-- $d"
-                  find "$d" -type f -name "*.sql" | sort || true
+                  find "$d" -maxdepth 1 -type f -name "*.sql" | sort || true
                 else
                   echo "-- $d (missing)"
                 fi
               done
               echo "====================="
 
-              list_files() {
+              list_files_flat() {
                 local dir="$1"
                 [ -d "$dir" ] || return 0
-                find "$dir" -type f -name "*.sql" -print0 | sort -z
+                find "$dir" -maxdepth 1 -type f -name "*.sql" -print0 | sort -z
               }
 
               run_with_retry() {
@@ -261,26 +260,27 @@ stages:
                 done
               }
 
-              run_dir() {
+              run_dir_flat() {
                 local dir="$1" label="$2"
                 if [ ! -d "$dir" ]; then echo "SKIP (missing): $dir"; return 0; fi
                 echo "==> $label : $dir"
                 local any=0
                 while IFS= read -r -d '' f; do
                   any=1; run_with_retry "$f"
-                done < <(list_files "$dir")
+                done < <(list_files_flat "$dir")
                 [ $any -eq 0 ] && echo "No .sql files in $dir"
               }
 
               if [ "${{ parameters.action }}" = "deploy" ]; then
-                run_dir "$ROOT/db/schema"           "SCHEMA root"
-                run_dir "$ROOT/db/schema/tables"    "TABLES"
-                run_dir "$ROOT/db/schema/indexes"   "INDEXES"
-                run_dir "$ROOT/db/schema/views"     "VIEWS"
-                run_dir "$ROOT/db/schema/procs"     "PROCS"
-                run_dir "$ROOT/db/data/seed"        "SEED"
+                run_dir_flat "$ROOT/db/schema"         "SCHEMA root"
+                run_dir_flat "$ROOT/db/schema/tables"  "TABLES"
+                run_dir_flat "$ROOT/db/schema/indexes" "INDEXES"
+                run_dir_flat "$ROOT/db/schema/views"   "VIEWS"
+                run_dir_flat "$ROOT/db/schema/procs"   "PROCS"
+                run_dir_flat "$ROOT/db/data/seed"      "SEED"
               else
-                run_dir "$ROOT/db/rollback"         "ROLLBACK"
+                run_dir_flat "$ROOT/db/rollback"       "ROLLBACK"
               fi
+
               echo "QA completed."
             displayName: Execute (${{ parameters.action }}) – QA

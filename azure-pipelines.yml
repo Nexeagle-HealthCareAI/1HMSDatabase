@@ -1,9 +1,7 @@
-# azure-pipelines-db.yml (DEV only)
+# azure-pipelines-db.yml (DEV only, simple & robust)
 trigger:
-  branches:
-    include: [ main ]
-  paths:
-    include: [ db/** ]
+  branches: { include: [ main ] }
+  paths:    { include: [ db/** ] }
 
 pool:
   vmImage: ubuntu-latest
@@ -12,7 +10,7 @@ stages:
 - stage: Dev
   displayName: "DB: deploy → DEV"
   variables:
-  - group: 'swa-secrets-dev'   # must define: SqlServer, DatabaseName, SqlUser, SqlPassword
+  - group: swa-secrets-dev   # must define: SqlServer, DatabaseName, SqlUser, SqlPassword
   jobs:
   - job: DevJob
     displayName: "Run DB scripts (DEV)"
@@ -20,7 +18,6 @@ stages:
     - checkout: self
       clean: true
 
-    # Install ODBC + mssql-tools18; verify with absolute path
     - bash: |
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive
@@ -28,106 +25,81 @@ stages:
         sudo apt-get install -y curl gnupg apt-transport-https software-properties-common
 
         . /etc/os-release
-        case "$VERSION_ID" in
-          22.04) MS_LIST_URL="https://packages.microsoft.com/config/ubuntu/22.04/prod.list" ;;
-          24.04) MS_LIST_URL="https://packages.microsoft.com/config/ubuntu/24.04/prod.list" ;;
-          *)     MS_LIST_URL="https://packages.microsoft.com/config/ubuntu/22.04/prod.list" ;;
-        esac
-
-        # Add Microsoft repo key (dearmored) + repo
-        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
-          | gpg --dearmor \
-          | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg >/dev/null
-        curl -fsSL "$MS_LIST_URL" \
-          | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
+        MS_LIST_URL="https://packages.microsoft.com/config/ubuntu/${VERSION_ID:-22.04}/prod.list"
+        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg >/dev/null
+        curl -fsSL "$MS_LIST_URL" | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
 
         sudo apt-get update -y
         sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev
 
-        # Make sqlcmd available to *this* shell and future steps
-        export PATH="$PATH:/opt/mssql-tools18/bin"
         echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
-
-        # Verify using absolute path (works even if PATH not set)
         /opt/mssql-tools18/bin/sqlcmd -? >/dev/null
-        echo "sqlcmd OK at: $(/usr/bin/which sqlcmd || echo '/opt/mssql-tools18/bin/sqlcmd')"
-      displayName: "Install sqlcmd (DEV)"
+        echo "sqlcmd ready at: $(command -v sqlcmd)"
+      displayName: "Install sqlcmd"
 
-    # Connectivity warm-up
+    # Connectivity warm-up + wait until DB is ONLINE (handles 40613)
     - bash: |
         set -euo pipefail
         export PATH="$PATH:/opt/mssql-tools18/bin"
-
-        echo "Server: $(SqlServer)"
-        echo "DB    : $(DatabaseName)"
-        echo "User  : $(SqlUser)"
-        test -n "$(SqlServer)"    || { echo "SqlServer not set"; exit 1; }
-        test -n "$(DatabaseName)" || { echo "DatabaseName not set"; exit 1; }
-        test -n "$(SqlUser)"      || { echo "SqlUser not set"; exit 1; }
-        test -n "$(SqlPassword)"  || { echo "SqlPassword not set"; exit 1; }
-
         export SQLCMDPASSWORD="$(SqlPassword)"
-        # Touch master (ignore failure) then target DB (must succeed)
-        sqlcmd -S "$(SqlServer)" -d master            -U "$(SqlUser)" -l 30 -I -Q "SELECT 1" || true
-        sqlcmd -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -l 30 -I -Q "SELECT DB_NAME();"
-      displayName: "Sanity & connectivity (DEV)"
 
-    # Execute scripts (flat order per folder)
+        S="$(SqlServer)"         # e.g. easyhmserver.database.windows.net
+        D="$(DatabaseName)"      # e.g. easyHMSDatabase
+        U="$(SqlUser)"           # e.g. easyhmsadmin
+        PORT="1433"
+
+        echo "Server: $S,$PORT"
+        echo "DB    : $D"
+        echo "User  : $U"
+
+        # touch server (ignore failure)
+        sqlcmd -S "$S,$PORT" -d master -U "$U" -l 15 -I -C -Q "SELECT 1" || true
+
+        # Wait until ONLINE or a direct connect works
+        tries=20; delay=5; n=1
+        while :; do
+          echo "Check DB state (attempt $n/$tries)..."
+          if sqlcmd -S "$S,$PORT" -d master -U "$U" -l 15 -I -C -h -1 -Q "SET NOCOUNT ON; SELECT state_desc FROM sys.databases WHERE name=N'$D';" | grep -qx ONLINE; then
+            echo "DB is ONLINE."; break
+          fi
+          # try connecting directly (may still throw 40613)
+          if sqlcmd -S "$S,$PORT" -d "$D" -U "$U" -l 15 -I -C -Q "SELECT DB_NAME();"; then
+            echo "Connected to $D."; break
+          fi
+          [ $n -ge $tries ] && { echo "DB not available after $tries attempts"; exit 1; }
+          sleep "$delay"; n=$((n+1)); delay=$(( delay < 30 ? delay*2 : 30 ))
+        done
+        echo "Warm-up complete."
+      displayName: "Wait for DB to be ONLINE"
+
+    # Run scripts in a simple, flat order
     - bash: |
         set -euo pipefail
         export PATH="$PATH:/opt/mssql-tools18/bin"
         export SQLCMDPASSWORD="$(SqlPassword)"
         ROOT="$(Build.SourcesDirectory)"
+        S="$(SqlServer),1433"
+        D="$(DatabaseName)"
+        U="$(SqlUser)"
 
-        # print full errors and echo input SQL
-        SQLCMD=(sqlcmd -S "$(SqlServer)" -d "$(DatabaseName)" -U "$(SqlUser)" -b -l 60 -I -r 1 -m -1 -e)
-        # If a TLS proxy breaks cert chain, you can add: SQLCMD+=(-C)
+        # -C trusts server cert (keep if your pipeline fails on TLS trust)
+        SQLCMD=(sqlcmd -S "$S" -d "$D" -U "$U" -b -l 60 -I -r 1 -m -1 -e -C)
 
-        echo "== File inventory (flat per folder) =="
-        for d in \
-          "$ROOT/db/schema" \
-          "$ROOT/db/schema/tables" \
-          "$ROOT/db/schema/indexes" \
-          "$ROOT/db/schema/views" \
-          "$ROOT/db/schema/procs" \
-          "$ROOT/db/data/seed" \
-          "$ROOT/db/rollback"
-        do
-          if [ -d "$d" ]; then
-            echo "-- $d"
-            find "$d" -maxdepth 1 -type f -name "*.sql" | sort || true
-          else
-            echo "-- $d (missing)"
-          fi
-        done
-        echo "====================="
-
-        list_files_flat() {
-          local dir="$1"
-          [ -d "$dir" ] || return 0
-          find "$dir" -maxdepth 1 -type f -name "*.sql" -print0 | sort -z
-        }
-
-        run_dir_flat() {
-          local dir="$1" label="$2"
-          if [ ! -d "$dir" ]; then echo "SKIP (missing): $dir"; return 0; fi
-          echo "==> $label : $dir"
-          local any=0
-          while IFS= read -r -d '' f; do
-            any=1
+        run_dir() { d="$1"; label="$2"; 
+          [ -d "$d" ] || { echo "SKIP (missing): $d"; return 0; }
+          echo "==> $label : $d"
+          find "$d" -maxdepth 1 -type f -name "*.sql" | sort | while read -r f; do
             echo "---- RUN: ${f#$ROOT/}"
             "${SQLCMD[@]}" -i "$f"
-          done < <(list_files_flat "$dir")
-          [ $any -eq 0 ] && echo "No .sql files in $dir"
+          done
         }
 
-        # Always deploy in this order; comment out lines you don't use
-        run_dir_flat "$ROOT/db/schema"         "SCHEMA root"
-        run_dir_flat "$ROOT/db/schema/tables"  "TABLES"
-        run_dir_flat "$ROOT/db/schema/indexes" "INDEXES"
-        run_dir_flat "$ROOT/db/schema/views"   "VIEWS"
-        run_dir_flat "$ROOT/db/schema/procs"   "PROCS"
-        run_dir_flat "$ROOT/db/data/seed"      "SEED"
+        run_dir "$ROOT/db/schema"         "SCHEMA root"
+        run_dir "$ROOT/db/schema/tables"  "TABLES"
+        run_dir "$ROOT/db/schema/indexes" "INDEXES"
+        run_dir "$ROOT/db/schema/views"   "VIEWS"
+        run_dir "$ROOT/db/schema/procs"   "PROCS"
+        run_dir "$ROOT/db/data/seed"      "SEED"
 
-        echo "DEV completed."
-      displayName: "Execute (deploy) – DEV"
+        echo "DEV deploy completed."
+      displayName: "Execute deploy"

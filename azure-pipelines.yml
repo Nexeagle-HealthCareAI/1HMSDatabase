@@ -1,7 +1,21 @@
 # azure-pipelines-db.yml (DEV then QA)
 trigger:
-  branches: { include: [ main ] }
-  paths:    { include: [ db/** ] }
+  branches:
+    include:
+      - 'release-*'
+      - 'feature/*'
+  paths:
+    include:
+      - db/**
+
+pr:
+  branches:
+    include:
+      - 'release-*'
+      - 'feature/*'
+  paths:
+    include:
+      - db/**
 
 pool:
   vmImage: ubuntu-latest
@@ -10,6 +24,12 @@ stages:
 # ================= DEV =================
 - stage: Dev
   displayName: "DB: deploy → DEV"
+  # Run for release-* and feature/* branches
+  condition: >
+    or(
+      startsWith(variables['Build.SourceBranch'], 'refs/heads/release-'),
+      startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')
+    )
   variables:
   - group: 'swa-secrets-dev'   # SqlServer, DatabaseName, SqlUser, SqlPassword
   jobs:
@@ -84,7 +104,12 @@ stages:
 - stage: QA
   displayName: "DB: deploy → QA"
   dependsOn: Dev
-  condition: succeeded()
+  # Only run for release-* branches
+  condition: >
+    and(
+      succeeded(),
+      startsWith(variables['Build.SourceBranch'], 'refs/heads/release-')
+    )
   variables:
   - group: 'swa-secrets-qa'   # SqlServer, DatabaseName, SqlUser, SqlPassword (for QA)
   jobs:

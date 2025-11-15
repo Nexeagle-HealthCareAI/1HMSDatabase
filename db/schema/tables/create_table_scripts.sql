@@ -577,7 +577,6 @@ BEGIN
         FOREIGN KEY (HospitalID) REFERENCES dbo.Hospitals(HospitalID),
         FOREIGN KEY (ApptId)     REFERENCES dbo.Appointments(ApptId)
     );
-    CREATE INDEX IX_AppointmentVitals_Appt ON dbo.AppointmentVitals (ApptId) INCLUDE (RecordedAt);
 END
 GO
 
@@ -753,9 +752,6 @@ BEGIN
 
     CONSTRAINT FK_DPM_Doctor FOREIGN KEY (DoctorId) REFERENCES dbo.Doctors(DoctorID)
   );
-
-  CREATE INDEX IX_DPM_Doctor  ON dbo.DoctorPreferredMedicine (DoctorId) INCLUDE (IsActive, GenericName);
-  CREATE INDEX IX_DPM_Generic ON dbo.DoctorPreferredMedicine (GenericName) WHERE IsActive = 1;
 END
 GO
 
@@ -831,9 +827,6 @@ BEGIN
         UpdatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_PAdvice_Updated DEFAULT (SYSUTCDATETIME()),
         RowVersion ROWVERSION NOT NULL
     );
-
-    CREATE INDEX IX_PrescriptionAdvice_PrescriptionId
-        ON dbo.PrescriptionAdvice (PrescriptionId) INCLUDE (CreatedAtUtc);
 END
 GO
 
@@ -857,8 +850,6 @@ BEGIN
         RowVersion ROWVERSION NOT NULL
     );
 
-    CREATE INDEX IX_PrescriptionInvestigation_PrescriptionId
-        ON dbo.PrescriptionInvestigation (PrescriptionId) INCLUDE (LookupTypeId, LookupCode, CreatedAtUtc);
 END
 GO
 
@@ -889,9 +880,41 @@ BEGIN
 
         CONSTRAINT CK_Att_EntityType CHECK (EntityType IN (N'LabResult', N'Prescription', N'Visit', N'Other'))
     );
+END
+GO
 
-    CREATE INDEX IX_Attachments_Appt  ON dbo.PrescriptionAttachment (ApptId) INCLUDE (EntityType, EntityId, CreatedAtUtc);
-    CREATE INDEX IX_Attachments_Entity ON dbo.PrescriptionAttachment (EntityType, EntityId) INCLUDE (ApptId, CreatedAtUtc);
+IF OBJECT_ID('dbo.DoctorSectionPreferences','U') IS NULL
+BEGIN
+     CREATE TABLE dbo.DoctorSectionPreferences (
+    PreferenceId              UNIQUEIDENTIFIER NOT NULL
+        CONSTRAINT DF_DSP_PreferenceId DEFAULT NEWSEQUENTIALID(),
+    HospitalId                UNIQUEIDENTIFIER NOT NULL,
+    DoctorId                  UNIQUEIDENTIFIER NOT NULL,
+
+    -- Section flags (default = 1)
+    Vitals                    BIT NOT NULL CONSTRAINT DF_DSP_Vitals                    DEFAULT (1),
+    ChiefComplaint            BIT NOT NULL CONSTRAINT DF_DSP_ChiefComplaint            DEFAULT (1),
+    History                   BIT NOT NULL CONSTRAINT DF_DSP_History                   DEFAULT (1),
+    Comorbidity               BIT NOT NULL CONSTRAINT DF_DSP_Comorbidity               DEFAULT (1),
+    Examination               BIT NOT NULL CONSTRAINT DF_DSP_Examination               DEFAULT (1),
+    Diagnosis                 BIT NOT NULL CONSTRAINT DF_DSP_Diagnosis                 DEFAULT (1),
+    Investigations            BIT NOT NULL CONSTRAINT DF_DSP_Investigations            DEFAULT (1),
+    Procedures                BIT NOT NULL CONSTRAINT DF_DSP_Procedures                DEFAULT (1),
+    Medications               BIT NOT NULL CONSTRAINT DF_DSP_Medications               DEFAULT (1),
+    PrivateNotes              BIT NOT NULL CONSTRAINT DF_DSP_PrivateNotes              DEFAULT (1),
+    CertificatesAndNotes      BIT NOT NULL CONSTRAINT DF_DSP_CertificatesAndNotes      DEFAULT (1),
+    Immunizations             BIT NOT NULL CONSTRAINT DF_DSP_Immunizations             DEFAULT (1),
+    FollowUpAndReferral       BIT NOT NULL CONSTRAINT DF_DSP_FollowUpAndReferral       DEFAULT (1),
+    NonPharmacologicalAdvice  BIT NOT NULL CONSTRAINT DF_DSP_NonPharmacologicalAdvice  DEFAULT (1),
+    Attachments               BIT NOT NULL CONSTRAINT DF_DSP_Attachments               DEFAULT (1),
+
+    CreatedAtUtc              DATETIME2(3) NOT NULL CONSTRAINT DF_DSP_CreatedAtUtc DEFAULT (SYSUTCDATETIME()),
+    UpdatedAtUtc              DATETIME2(3) NOT NULL CONSTRAINT DF_DSP_UpdatedAtUtc DEFAULT (SYSUTCDATETIME()),
+    RowVersion                ROWVERSION   NOT NULL,
+
+    CONSTRAINT PK_DoctorSectionPreferences PRIMARY KEY CLUSTERED (PreferenceId),
+    CONSTRAINT UQ_DoctorSectionPreferences_HospDoc UNIQUE (HospitalId, DoctorId)
+);
 END
 GO
 

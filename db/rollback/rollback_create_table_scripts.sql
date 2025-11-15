@@ -69,6 +69,7 @@ IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N''' + REPLACE(@fkname,''
         (N'RolePermissions'),
         (N'Permissions'),
         (N'Roles'),
+		(N'DoctorSectionPreferences'),
         (N'DoctorSpecializations'),
         (N'Specializations'),
         (N'DoctorDepartments'),
@@ -86,7 +87,7 @@ IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N''' + REPLACE(@fkname,''
         (N'Hospitals'),
         (N'HospitalTypes'),
         (N'UserProfiles'),
-        (N'UserAuth'),
+        (N'UserAuth'),		
         (N'Users');
 
     DECLARE @t sysname;

@@ -74,8 +74,6 @@ IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_UserRoles_User' AND object_
     DROP INDEX IX_UserRoles_User ON dbo.UserRoles;
 
 /* ============== DOCTOR SCHEDULING ======================== */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorAvailability_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorAvailability'))
-    DROP INDEX IX_DoctorAvailability_Doctor ON dbo.DoctorAvailability;
 
 IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorShiftOverrides_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorShiftOverrides'))
     DROP INDEX IX_DoctorShiftOverrides_Doctor ON dbo.DoctorShiftOverrides;
@@ -119,13 +117,6 @@ IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupPersonal_ScopeType' A
 IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupPersonal_Active' AND object_id=OBJECT_ID(N'dbo.LookupPersonal'))
     DROP INDEX IX_LookupPersonal_Active ON dbo.LookupPersonal;
 
-/* ============== PRESCRIPTION SETTINGS / ASSETS =========== */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_PrescriptionSettings_Doctor' AND object_id=OBJECT_ID(N'dbo.PrescriptionSettings'))
-    DROP INDEX IX_PrescriptionSettings_Doctor ON dbo.PrescriptionSettings;
-
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_PrescriptionAssets_Doctor' AND object_id=OBJECT_ID(N'dbo.PrescriptionAssets'))
-    DROP INDEX IX_PrescriptionAssets_Doctor ON dbo.PrescriptionAssets;
-
 /* ============== DOCTOR PREFERRED MEDICINE ================ */
 IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DPM_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorPreferredMedicine'))
     DROP INDEX IX_DPM_Doctor ON dbo.DoctorPreferredMedicine;
@@ -133,26 +124,5 @@ IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DPM_Doctor' AND object_id=O
 IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DPM_Generic_Active' AND object_id=OBJECT_ID(N'dbo.DoctorPreferredMedicine'))
     DROP INDEX IX_DPM_Generic_Active ON dbo.DoctorPreferredMedicine;
 
-/* ============== PRESCRIPTION / CHILDREN / ATTACHMENTS ==== */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Prescription_Appt' AND object_id=OBJECT_ID(N'dbo.Prescription'))
-    DROP INDEX IX_Prescription_Appt ON dbo.Prescription;
-
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Prescription_DoctorDate' AND object_id=OBJECT_ID(N'dbo.Prescription'))
-    DROP INDEX IX_Prescription_DoctorDate ON dbo.Prescription;
-
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Prescription_HospitalDate' AND object_id=OBJECT_ID(N'dbo.Prescription'))
-    DROP INDEX IX_Prescription_HospitalDate ON dbo.Prescription;
-
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_PrescriptionAdvice_PrescriptionId' AND object_id=OBJECT_ID(N'dbo.PrescriptionAdvice'))
-    DROP INDEX IX_PrescriptionAdvice_PrescriptionId ON dbo.PrescriptionAdvice;
-
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_PrescriptionInvestigation_PrescriptionId' AND object_id=OBJECT_ID(N'dbo.PrescriptionInvestigation'))
-    DROP INDEX IX_PrescriptionInvestigation_PrescriptionId ON dbo.PrescriptionInvestigation;
-
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Attachments_Appt' AND object_id=OBJECT_ID(N'dbo.PrescriptionAttachment'))
-    DROP INDEX IX_Attachments_Appt ON dbo.PrescriptionAttachment;
-
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Attachments_Entity' AND object_id=OBJECT_ID(N'dbo.PrescriptionAttachment'))
-    DROP INDEX IX_Attachments_Entity ON dbo.PrescriptionAttachment;
 
 PRINT N'All recommended secondary indexes dropped (if existed).';

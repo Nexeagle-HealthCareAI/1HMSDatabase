@@ -208,6 +208,7 @@ BEGIN
         DoctorDepartmentID UNIQUEIDENTIFIER NOT NULL
             CONSTRAINT PK_DoctorDepartments PRIMARY KEY
             CONSTRAINT DF_DocDept_ID DEFAULT NEWID(),
+		HospitalID UNIQUEIDENTIFIER NOT NULL,
         DoctorID UNIQUEIDENTIFIER NOT NULL,
         DepartmentID UNIQUEIDENTIFIER NOT NULL,
         AssignedAt DATETIME2(3) NOT NULL CONSTRAINT DF_DocDept_Assigned DEFAULT SYSUTCDATETIME(),
@@ -245,6 +246,7 @@ BEGIN
         DoctorSpecializationID UNIQUEIDENTIFIER NOT NULL
             CONSTRAINT PK_DoctorSpecializations PRIMARY KEY
             CONSTRAINT DF_DocSpec_ID DEFAULT NEWID(),
+		HospitalID UNIQUEIDENTIFIER NOT NULL,
         DoctorID UNIQUEIDENTIFIER NOT NULL,
         SpecializationID UNIQUEIDENTIFIER NOT NULL,
         AssignedAt DATETIME2(3) NOT NULL CONSTRAINT DF_DocSpec_Assigned DEFAULT SYSUTCDATETIME(),
@@ -295,15 +297,6 @@ BEGIN
 END
 GO
 
-IF OBJECT_ID('dbo.Permissions','U') IS NULL
-BEGIN
-    CREATE TABLE dbo.Permissions (
-        PermissionKey NVARCHAR(100) NOT NULL CONSTRAINT PK_Permissions PRIMARY KEY,
-        [Description] NVARCHAR(255) NULL
-    );
-END
-GO
-
 IF OBJECT_ID('dbo.RolePermissions','U') IS NULL
 BEGIN
     CREATE TABLE dbo.RolePermissions (
@@ -322,6 +315,7 @@ BEGIN
     CREATE TABLE dbo.UserRoles (
         UserID UNIQUEIDENTIFIER NOT NULL,
         RoleID UNIQUEIDENTIFIER NOT NULL,
+		HospitalID UNIQUEIDENTIFIER NOT NULL,
         CONSTRAINT PK_UserRoles PRIMARY KEY (UserID, RoleID),
         CONSTRAINT FK_UserRoles_User FOREIGN KEY (UserID) REFERENCES dbo.Users(UserID),
         CONSTRAINT FK_UserRoles_Role FOREIGN KEY (RoleID) REFERENCES dbo.Roles(RoleID)
@@ -375,26 +369,6 @@ GO
 /* =========================================================
    DOCTOR AVAILABILITY / SHIFTS / TIME OFF
    ========================================================= */
-IF OBJECT_ID('dbo.DoctorAvailability','U') IS NULL
-BEGIN
-    CREATE TABLE dbo.DoctorAvailability (
-        AvailabilityID UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT PK_DoctorAvailability PRIMARY KEY
-            CONSTRAINT DF_DocAvail_Id DEFAULT NEWID(),
-        DoctorID UNIQUEIDENTIFIER NOT NULL,
-        DayOfWeek INT NOT NULL CONSTRAINT CK_DocAvail_Day CHECK (DayOfWeek BETWEEN 0 AND 6),
-        StartTime TIME NOT NULL,
-        EndTime TIME NOT NULL,
-        SessionType NVARCHAR(50) NULL
-            CONSTRAINT CK_DocAvail_Session CHECK (SessionType IN ('Morning','Afternoon','Evening','Night') OR SessionType IS NULL),
-        IsRecurring BIT NOT NULL CONSTRAINT DF_DocAvail_Recurring DEFAULT(1),
-        IsHoliday BIT NOT NULL CONSTRAINT DF_DocAvail_Holiday DEFAULT(0),
-        CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_DocAvail_Created DEFAULT SYSUTCDATETIME(),
-        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_DocAvail_Updated DEFAULT SYSUTCDATETIME(),
-        CONSTRAINT FK_DocAvail_Doctor FOREIGN KEY (DoctorID) REFERENCES dbo.Doctors(DoctorID)
-    );
-END
-GO
 
 IF OBJECT_ID('dbo.DoctorShiftTemplates','U') IS NULL
 BEGIN
@@ -418,6 +392,7 @@ BEGIN
         OverrideID UNIQUEIDENTIFIER NOT NULL
             CONSTRAINT PK_DoctorShiftOverrides PRIMARY KEY
             CONSTRAINT DF_DocShiftOv_Id DEFAULT NEWID(),
+	    HospitalID UNIQUEIDENTIFIER NOT NULL,
         DoctorID UNIQUEIDENTIFIER NOT NULL,
         ShiftName NVARCHAR(50) NULL,
         StartTime TIME NOT NULL,
@@ -438,6 +413,7 @@ BEGIN
         TimeOffID UNIQUEIDENTIFIER NOT NULL
             CONSTRAINT PK_DoctorTimeOffs PRIMARY KEY
             CONSTRAINT DF_DocTimeOff_Id DEFAULT NEWID(),
+        HospitalID UNIQUEIDENTIFIER NOT NULL,
         DoctorID UNIQUEIDENTIFIER NOT NULL,
         FromDate DATE NOT NULL,
         ToDate DATE NOT NULL,
@@ -627,8 +603,8 @@ BEGIN
     CREATE TABLE dbo.LookupPersonal (
         PersonalId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_LookupPersonal PRIMARY KEY CONSTRAINT DF_LP_Id DEFAULT NEWID(),
 
-        HospitalID UNIQUEIDENTIFIER NULL,
-        DoctorID UNIQUEIDENTIFIER NULL,
+        HospitalID UNIQUEIDENTIFIER NOT NULL,
+        DoctorID UNIQUEIDENTIFIER NOT NULL,
 
         MasterLookupId UNIQUEIDENTIFIER NULL
             CONSTRAINT FK_LP_Master FOREIGN KEY (MasterLookupId) REFERENCES dbo.LookupMaster(LookupId),
@@ -655,72 +631,6 @@ BEGIN
 END
 GO
 
-/* =========================================================
-   PRESCRIPTION SETTINGS / ASSETS
-   ========================================================= */
-IF OBJECT_ID('dbo.PrescriptionSettings','U') IS NULL
-BEGIN
-    CREATE TABLE dbo.PrescriptionSettings
-    (
-        PrescriptionSettingId UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT PK_PrescriptionSettings PRIMARY KEY
-            CONSTRAINT DF_PrescriptionSettings_Id DEFAULT NEWID(),
-
-        DoctorId UNIQUEIDENTIFIER NOT NULL,
-
-        PageLayoutJson NVARCHAR(MAX) NOT NULL
-            CONSTRAINT DF_PrescriptionSettings_PageLayout DEFAULT (N'{"orientation":"portrait","margin":{"top":15,"right":15,"bottom":15,"left":15}}'),
-        LetterheadSettingsJson NVARCHAR(MAX) NOT NULL
-            CONSTRAINT DF_PrescriptionSettings_Letterhead DEFAULT (N'{"useLetterhead":true,"headerHeight":30,"footerHeight":20}'),
-        HeaderSettingsJson NVARCHAR(MAX) NOT NULL
-            CONSTRAINT DF_PrescriptionSettings_Header DEFAULT (N'{"height":20,"width":100,"showImage":true,"showOnAllPages":true}'),
-        FooterSettingsJson NVARCHAR(MAX) NOT NULL
-            CONSTRAINT DF_PrescriptionSettings_Footer DEFAULT (N'{"height":15,"width":100,"showImage":true,"showSignature":true,"signatureHeight":10,"signatureWidth":20,"doctorName":"","showOnAllPages":true}'),
-
-        CreatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_PrescriptionSettings_Created DEFAULT SYSUTCDATETIME(),
-        UpdatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_PrescriptionSettings_Updated DEFAULT SYSUTCDATETIME(),
-
-        RowVersion ROWVERSION NOT NULL,
-
-        CONSTRAINT UQ_PrescriptionSettings_Doctor UNIQUE (DoctorId),
-
-        CONSTRAINT CK_PrescriptionSettings_PageLayout_IsJson CHECK (ISJSON(PageLayoutJson) = 1),
-        CONSTRAINT CK_PrescriptionSettings_Letterhead_IsJson CHECK (ISJSON(LetterheadSettingsJson) = 1),
-        CONSTRAINT CK_PrescriptionSettings_Header_IsJson CHECK (ISJSON(HeaderSettingsJson) = 1),
-        CONSTRAINT CK_PrescriptionSettings_Footer_IsJson CHECK (ISJSON(FooterSettingsJson) = 1),
-
-        CONSTRAINT FK_PrescriptionSettings_Doctor FOREIGN KEY (DoctorId) REFERENCES dbo.Doctors(DoctorID)
-    );
-END
-GO
-
-IF OBJECT_ID('dbo.PrescriptionAssets','U') IS NULL
-BEGIN
-    CREATE TABLE dbo.PrescriptionAssets
-    (
-        PrescriptionAssetId UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT PK_PrescriptionAssets PRIMARY KEY
-            CONSTRAINT DF_PrescriptionAssets_Id DEFAULT NEWID(),
-
-        DoctorId UNIQUEIDENTIFIER NOT NULL,
-        PrescriptionSettingId UNIQUEIDENTIFIER NOT NULL,
-
-        AssetType NVARCHAR(20) NOT NULL
-            CONSTRAINT CK_PrescriptionAssets_AssetType CHECK (AssetType IN (N'header_image',N'footer_image',N'signature_image')),
-
-        BlobUrl NVARCHAR(255) NOT NULL,
-
-        CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_PrescriptionAssets_Created DEFAULT SYSUTCDATETIME(),
-        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_PrescriptionAssets_Updated DEFAULT SYSUTCDATETIME(),
-        RowVersion ROWVERSION NOT NULL,
-
-        CONSTRAINT UQ_PrescriptionAssets_Setting_Type UNIQUE (PrescriptionSettingId, AssetType),
-
-        CONSTRAINT FK_PrescAssets_Doctor  FOREIGN KEY (DoctorId) REFERENCES dbo.Doctors(DoctorID),
-        CONSTRAINT FK_PrescAssets_Setting FOREIGN KEY (PrescriptionSettingId) REFERENCES dbo.PrescriptionSettings(PrescriptionSettingId)
-    );
-END
-GO
 
 /* =========================================================
    DOCTOR PREFERRED MEDICINE
@@ -729,6 +639,7 @@ IF OBJECT_ID('dbo.DoctorPreferredMedicine','U') IS NULL
 BEGIN
   CREATE TABLE dbo.DoctorPreferredMedicine (
     PreferrredId   BIGINT NOT NULL IDENTITY(1,1) PRIMARY KEY,
+	HospitalID UNIQUEIDENTIFIER NOT NULL,
     DoctorId       UNIQUEIDENTIFIER NOT NULL,
     BrandName      NVARCHAR(150) NULL,
     GenericName    NVARCHAR(150) NOT NULL DEFAULT N'',
@@ -752,134 +663,6 @@ BEGIN
 
     CONSTRAINT FK_DPM_Doctor FOREIGN KEY (DoctorId) REFERENCES dbo.Doctors(DoctorID)
   );
-END
-GO
-
-/* =========================================================
-   PRESCRIPTION (SEQ / TABLE / ADVICE / INVESTIGATION)
-   ========================================================= */
-IF OBJECT_ID('dbo.PrescriptionNumberSeq','SO') IS NULL
-    CREATE SEQUENCE dbo.PrescriptionNumberSeq AS BIGINT START WITH 1 INCREMENT BY 1;
-GO
-
-IF OBJECT_ID('dbo.Prescription','U') IS NULL
-BEGIN
-    CREATE TABLE dbo.Prescription (
-        PrescriptionId UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT PK_Prescription PRIMARY KEY
-            CONSTRAINT DF_Pres_PrescriptionId DEFAULT NEWSEQUENTIALID(),
-
-        ApptId UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT FK_Pres_Appt FOREIGN KEY REFERENCES dbo.Appointments (ApptId) ON DELETE CASCADE,
-
-        HospitalId UNIQUEIDENTIFIER NULL,
-        DoctorId UNIQUEIDENTIFIER NULL,
-
-        PrescriptionNumber NVARCHAR(40) NOT NULL
-            CONSTRAINT DF_Pres_Number DEFAULT (
-                N'RX-' + CONVERT(NVARCHAR(8), SYSUTCDATETIME(), 112) + N'-' +
-                RIGHT(REPLICATE(N'0',6) + CONVERT(NVARCHAR(12), NEXT VALUE FOR dbo.PrescriptionNumberSeq), 6)
-            ),
-
-        IssueDateUtc DATETIME2(3) NOT NULL CONSTRAINT DF_Pres_Issue  DEFAULT (SYSUTCDATETIME()),
-        ValidUntilUtc DATETIME2(3) NULL,
-
-        ChiefComplaint NVARCHAR(2000) NULL,
-        History NVARCHAR(MAX) NULL,
-        Comorbidity NVARCHAR(MAX) NULL,
-        Examination NVARCHAR(MAX) NULL,
-        Diagnosis NVARCHAR(MAX) NULL,
-
-        PrivateNotes NVARCHAR(2000) NULL,
-        CertificatesAndNotes NVARCHAR(2000) NULL,
-        Immunizations NVARCHAR(1000) NULL,
-        FollowUpDateUtc DATETIME2(3) NULL,
-        Referral NVARCHAR(1000) NULL,
-        FollowUpNotes NVARCHAR(1000) NULL,
-        NonPharmacologicalAdvice NVARCHAR(2000) NULL,
-
-        Status TINYINT NOT NULL CONSTRAINT DF_Pres_Status DEFAULT (1)
-            CONSTRAINT CK_Pres_Status CHECK (Status IN (0,1,2)),
-
-        CreatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_Pres_Created DEFAULT (SYSUTCDATETIME()),
-        UpdatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_Pres_Updated DEFAULT (SYSUTCDATETIME()),
-        RowVersion ROWVERSION NOT NULL,
-
-        CONSTRAINT UQ_Pres_Number UNIQUE (PrescriptionNumber),
-        CONSTRAINT CK_Pres_FollowUpAfterIssue CHECK (FollowUpDateUtc IS NULL OR FollowUpDateUtc >= IssueDateUtc)
-    );
-END
-GO
-
-IF OBJECT_ID('dbo.PrescriptionAdvice','U') IS NULL
-BEGIN
-    CREATE TABLE dbo.PrescriptionAdvice (
-        AdviceId UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT PK_PrescriptionAdvice PRIMARY KEY
-            CONSTRAINT DF_PAdvice_AdviceId DEFAULT NEWSEQUENTIALID(),
-
-        PrescriptionId UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT FK_PAdvice_Pres FOREIGN KEY REFERENCES dbo.Prescription(PrescriptionId) ON DELETE CASCADE,
-
-        AdviceText NVARCHAR(1000) NOT NULL,
-
-        CreatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_PAdvice_Created DEFAULT (SYSUTCDATETIME()),
-        UpdatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_PAdvice_Updated DEFAULT (SYSUTCDATETIME()),
-        RowVersion ROWVERSION NOT NULL
-    );
-END
-GO
-
-IF OBJECT_ID('dbo.PrescriptionInvestigation','U') IS NULL
-BEGIN
-    CREATE TABLE dbo.PrescriptionInvestigation (
-        PresInvestigationId UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT PK_PrescriptionInvestigation PRIMARY KEY
-            CONSTRAINT DF_PI_Id DEFAULT NEWSEQUENTIALID(),
-
-        PrescriptionId UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT FK_PI_Pres FOREIGN KEY REFERENCES dbo.Prescription(PrescriptionId) ON DELETE CASCADE,
-
-        LookupTypeId INT NOT NULL CONSTRAINT DF_PI_LookupType DEFAULT (8),
-        LookupCode NVARCHAR(100) NOT NULL,
-        DisplayName NVARCHAR(200) NULL,
-        Notes NVARCHAR(500) NULL,
-
-        CreatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_PI_Created DEFAULT (SYSUTCDATETIME()),
-        UpdatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_PI_Updated DEFAULT (SYSUTCDATETIME()),
-        RowVersion ROWVERSION NOT NULL
-    );
-
-END
-GO
-
-/* =========================================================
-   ATTACHMENTS
-   ========================================================= */
-IF OBJECT_ID('dbo.PrescriptionAttachment','U') IS NULL
-BEGIN
-    CREATE TABLE dbo.PrescriptionAttachment (
-        AttachmentId UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT PK_PrescriptionAttachment PRIMARY KEY
-            CONSTRAINT DF_Att_Id DEFAULT NEWSEQUENTIALID(),
-
-        ApptId UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT FK_Att_Appt FOREIGN KEY REFERENCES dbo.Appointments(ApptId) ON DELETE CASCADE,
-
-        EntityType NVARCHAR(50)  NOT NULL,   -- 'LabResult','Prescription','Visit','Other'
-        EntityId   UNIQUEIDENTIFIER NULL,
-
-        FileName NVARCHAR(255) NOT NULL,
-        ContentType NVARCHAR(100) NULL,
-        FileSizeBytes BIGINT NULL,
-        StorageUrl NVARCHAR(500) NULL,
-        Notes NVARCHAR(500) NULL,
-
-        CreatedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_Att_Created DEFAULT (SYSUTCDATETIME()),
-        RowVersion ROWVERSION NOT NULL,
-
-        CONSTRAINT CK_Att_EntityType CHECK (EntityType IN (N'LabResult', N'Prescription', N'Visit', N'Other'))
-    );
 END
 GO
 

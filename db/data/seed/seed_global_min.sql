@@ -99,25 +99,6 @@ WHERE NOT EXISTS (
      AND x.[Name] = s.SpecName
 );
 
-------------------------------------------------------------
--- 3) Permissions (global)
-------------------------------------------------------------
-;WITH p(PermissionKey, [Description]) AS (
-  SELECT * FROM (VALUES
-    (N'admin_panel', N'Access to admin dashboard and settings'),
-    (N'appointment_scheduler', N'Access to calendar and doctor schedule'),
-    (N'appointment_booking', N'Ability to book appointments for patients'),
-    (N'billing', N'Access to billing and payment processing'),
-    (N'doc_board', N'Access to doctor’s consultation and prescriptions')
-  ) s(PermissionKey,[Description])
-)
-MERGE dbo.Permissions AS t
-USING p AS s
-  ON t.PermissionKey = s.PermissionKey
-WHEN NOT MATCHED THEN
-  INSERT (PermissionKey, [Description]) VALUES (s.PermissionKey, s.[Description])
-WHEN MATCHED AND ISNULL(t.[Description],N'') <> s.[Description] THEN
-  UPDATE SET [Description] = s.[Description];
 
 ------------------------------------------------------------
 -- 4) Roles (global system roles) + RolePermissions

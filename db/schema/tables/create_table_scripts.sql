@@ -304,8 +304,7 @@ BEGIN
         PermissionKey NVARCHAR(100) NOT NULL,
         IsAllowed BIT NOT NULL CONSTRAINT DF_RolePerm_Allowed DEFAULT(1),
         CONSTRAINT PK_RolePermissions PRIMARY KEY (RoleID, PermissionKey),
-        CONSTRAINT FK_RolePerm_Role FOREIGN KEY (RoleID) REFERENCES dbo.Roles(RoleID),
-        CONSTRAINT FK_RolePerm_Perm FOREIGN KEY (PermissionKey) REFERENCES dbo.Permissions(PermissionKey)
+        CONSTRAINT FK_RolePerm_Role FOREIGN KEY (RoleID) REFERENCES dbo.Roles(RoleID)       
     );
 END
 GO

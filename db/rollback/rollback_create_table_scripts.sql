@@ -49,12 +49,7 @@ IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N''' + REPLACE(@fkname,''
     ---------------------------------------------------------
     DECLARE @tablesToDrop TABLE (t sysname);
     INSERT INTO @tablesToDrop(t) VALUES
-        (N'PrescriptionAttachment'),
-        (N'PrescriptionInvestigation'),
-        (N'PrescriptionAdvice'),
-        (N'Prescription'),
-        (N'PrescriptionAssets'),
-        (N'PrescriptionSettings'),
+        
         (N'DoctorSectionPreferences'),
         (N'LookupPersonal'),
         (N'LookupMaster'),
@@ -66,8 +61,7 @@ IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N''' + REPLACE(@fkname,''
         (N'StatusMaster'),
         (N'PatientRegistrations'),
         (N'UserRoles'),
-        (N'RolePermissions'),
-        (N'Permissions'),
+        (N'RolePermissions'),        
         (N'Roles'),
 		(N'DoctorSectionPreferences'),
         (N'DoctorSpecializations'),
@@ -75,8 +69,7 @@ IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N''' + REPLACE(@fkname,''
         (N'DoctorDepartments'),
         (N'DoctorTimeOffs'),
         (N'DoctorShiftOverrides'),
-        (N'DoctorShiftTemplates'),
-        (N'DoctorAvailability'),
+        (N'DoctorShiftTemplates'),       
         (N'HospitalDepartmentMappings'),
         (N'DoctorPreferredMedicine'),
         (N'UserInvitations'),        -- ✅ newly added per your ask

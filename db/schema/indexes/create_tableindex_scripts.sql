@@ -74,8 +74,6 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_UserRoles_User' AND obj
     CREATE INDEX IX_UserRoles_User ON dbo.UserRoles(UserID) INCLUDE (RoleID);
 
 /* ============== DOCTOR SCHEDULING ======================== */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorAvailability_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorAvailability'))
-    CREATE INDEX IX_DoctorAvailability_Doctor ON dbo.DoctorAvailability(DoctorID, DayOfWeek) INCLUDE (StartTime, EndTime);
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorShiftOverrides_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorShiftOverrides'))
     CREATE INDEX IX_DoctorShiftOverrides_Doctor ON dbo.DoctorShiftOverrides(DoctorID, OverrideDate, StartDate, EndDate);
@@ -120,12 +118,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupPersonal_ScopeTyp
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupPersonal_Active' AND object_id=OBJECT_ID(N'dbo.LookupPersonal'))
     CREATE INDEX IX_LookupPersonal_Active ON dbo.LookupPersonal(IsActive) WHERE IsActive = 1;
 
-/* ============== PRESCRIPTION SETTINGS / ASSETS =========== */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_PrescriptionSettings_Doctor' AND object_id=OBJECT_ID(N'dbo.PrescriptionSettings'))
-    CREATE UNIQUE INDEX IX_PrescriptionSettings_Doctor ON dbo.PrescriptionSettings(DoctorId);
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_PrescriptionAssets_Doctor' AND object_id=OBJECT_ID(N'dbo.PrescriptionAssets'))
-    CREATE INDEX IX_PrescriptionAssets_Doctor ON dbo.PrescriptionAssets(DoctorId) INCLUDE (AssetType, PrescriptionSettingId);
 
 /* ============== DOCTOR PREFERRED MEDICINE ================ */
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DPM_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorPreferredMedicine'))
@@ -134,30 +127,5 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DPM_Doctor' AND object_
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DPM_Generic_Active' AND object_id=OBJECT_ID(N'dbo.DoctorPreferredMedicine'))
     CREATE INDEX IX_DPM_Generic_Active ON dbo.DoctorPreferredMedicine (GenericName) WHERE IsActive = 1;
 
-/* ============== PRESCRIPTION / CHILDREN / ATTACHMENTS ==== */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Prescription_Appt' AND object_id=OBJECT_ID(N'dbo.Prescription'))
-    CREATE INDEX IX_Prescription_Appt ON dbo.Prescription(ApptId);
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Prescription_DoctorDate' AND object_id=OBJECT_ID(N'dbo.Prescription'))
-    CREATE INDEX IX_Prescription_DoctorDate ON dbo.Prescription(DoctorId, IssueDateUtc) INCLUDE (HospitalId, Status);
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Prescription_HospitalDate' AND object_id=OBJECT_ID(N'dbo.Prescription'))
-    CREATE INDEX IX_Prescription_HospitalDate ON dbo.Prescription(HospitalId, IssueDateUtc) INCLUDE (DoctorId, Status);
-
--- Advice index already in deploy; guard in case missing:
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_PrescriptionAdvice_PrescriptionId' AND object_id=OBJECT_ID(N'dbo.PrescriptionAdvice'))
-    CREATE INDEX IX_PrescriptionAdvice_PrescriptionId ON dbo.PrescriptionAdvice (PrescriptionId) INCLUDE (CreatedAtUtc);
-
--- Investigation index already in deploy; guard in case missing:
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_PrescriptionInvestigation_PrescriptionId' AND object_id=OBJECT_ID(N'dbo.PrescriptionInvestigation'))
-    CREATE INDEX IX_PrescriptionInvestigation_PrescriptionId
-        ON dbo.PrescriptionInvestigation (PrescriptionId) INCLUDE (LookupTypeId, LookupCode, CreatedAtUtc);
-
--- Attachments indexes already in deploy; guard in case missing:
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Attachments_Appt' AND object_id=OBJECT_ID(N'dbo.PrescriptionAttachment'))
-    CREATE INDEX IX_Attachments_Appt ON dbo.PrescriptionAttachment (ApptId) INCLUDE (EntityType, EntityId, CreatedAtUtc);
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Attachments_Entity' AND object_id=OBJECT_ID(N'dbo.PrescriptionAttachment'))
-    CREATE INDEX IX_Attachments_Entity ON dbo.PrescriptionAttachment (EntityType, EntityId) INCLUDE (ApptId, CreatedAtUtc);
 
 PRINT N'All recommended indexes created/verified.';

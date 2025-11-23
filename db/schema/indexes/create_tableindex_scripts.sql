@@ -1,131 +1,510 @@
 /* =========================================================
-   easyHMS – Recommended Secondary Indexes (Idempotent)
-   Run AFTER tables are created. Safe to re-run.
+   easyHMS – Recommended Indexes (Dev/QA)
+   Safe to re-run; creates indexes only if missing.
    ========================================================= */
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
 
 ------------------------------------------------------------
--- Helper pattern: only create if index not present
--- IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Name' AND object_id=OBJECT_ID(N'dbo.Table'))
---     CREATE INDEX IX_Name ON dbo.Table (...);
+-- USERS / AUTH / PROFILES / STATUS
 ------------------------------------------------------------
+IF OBJECT_ID('dbo.Users','U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Users_UserStatusId'
+                   AND object_id = OBJECT_ID(N'dbo.Users'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_Users_UserStatusId
+        ON dbo.Users(UserStatusId);
+    END;
 
-/* ============== USERS / AUTH / PROFILES ================= */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Users_Email' AND object_id=OBJECT_ID(N'dbo.Users'))
-    CREATE INDEX IX_Users_Email ON dbo.Users(Email) INCLUDE (IsActive, CreatedAt);
+    -- For login / lookups by email (filtered, email-only)
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Users_Email'
+                   AND object_id = OBJECT_ID(N'dbo.Users'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_Users_Email
+        ON dbo.Users(Email)
+        WHERE Email IS NOT NULL;
+    END;
+END
+GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_UserAuth_UserID' AND object_id=OBJECT_ID(N'dbo.UserAuth'))
-    CREATE INDEX IX_UserAuth_UserID ON dbo.UserAuth(UserID) INCLUDE (LastLoginTime, IsLocked, FailedLoginAttempts);
+IF OBJECT_ID('dbo.UserAuth','U') IS NOT NULL
+BEGIN
+    -- FK to Users
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserAuth_UserID'
+                   AND object_id = OBJECT_ID(N'dbo.UserAuth'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserAuth_UserID
+        ON dbo.UserAuth(UserID);
+    END;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_UserProfiles_UserID' AND object_id=OBJECT_ID(N'dbo.UserProfiles'))
-    CREATE UNIQUE INDEX IX_UserProfiles_UserID ON dbo.UserProfiles(UserID);
+    -- Status on auth row (locked/active, etc.)
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserAuth_UserStatusId'
+                   AND object_id = OBJECT_ID(N'dbo.UserAuth'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserAuth_UserStatusId
+        ON dbo.UserAuth(UserStatusId);
+    END;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_UserProfiles_Name' AND object_id=OBJECT_ID(N'dbo.UserProfiles'))
-    CREATE INDEX IX_UserProfiles_Name ON dbo.UserProfiles(FullName);
+    -- For OTP verification flows
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserAuth_Otp'
+                   AND object_id = OBJECT_ID(N'dbo.UserAuth'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserAuth_Otp
+        ON dbo.UserAuth(Otp)
+        INCLUDE (UserID, IsOtpUsed, OtpExpireAt);
+    END;
+END
+GO
 
-/* ============== HOSPITALS / MEMBERSHIP / STATUS ========= */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Hospitals_Name' AND object_id=OBJECT_ID(N'dbo.Hospitals'))
-    CREATE INDEX IX_Hospitals_Name ON dbo.Hospitals(Name) INCLUDE (City, State, Country, IsActive);
+IF OBJECT_ID('dbo.UserProfiles','U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserProfiles_UserStatusId'
+                   AND object_id = OBJECT_ID(N'dbo.UserProfiles'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserProfiles_UserStatusId
+        ON dbo.UserProfiles(UserStatusId);
+    END;
+END
+GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_HospitalUsers_Hospital' AND object_id=OBJECT_ID(N'dbo.HospitalUsers'))
-    CREATE INDEX IX_HospitalUsers_Hospital ON dbo.HospitalUsers(HospitalID) INCLUDE (UserID, IsPrimary, CreatedAt);
+-- UserStatus already has PK + UNIQUE(StatusName) via constraints
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_HospitalUsers_User' AND object_id=OBJECT_ID(N'dbo.HospitalUsers'))
-    CREATE INDEX IX_HospitalUsers_User ON dbo.HospitalUsers(UserID) INCLUDE (HospitalID, IsPrimary, CreatedAt);
+------------------------------------------------------------
+-- HOSPITALS / USER HISTORY / HOSPITAL USERS / PROFILE STATUS
+------------------------------------------------------------
+IF OBJECT_ID('dbo.Hospitals','U') IS NOT NULL
+BEGIN
+    -- Who created the hospital
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Hospitals_CreatedByUserID'
+                   AND object_id = OBJECT_ID(N'dbo.Hospitals'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_Hospitals_CreatedByUserID
+        ON dbo.Hospitals(CreatedByUserID);
+    END;
 
-/* ============== DEPARTMENTS / DOCTORS / SPECS ============ */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Departments_Hospital' AND object_id=OBJECT_ID(N'dbo.Departments'))
-    CREATE INDEX IX_Departments_Hospital ON dbo.Departments(HospitalID) INCLUDE (Name, IsActive);
+    -- Business key – fast lookup by registration no.
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Hospitals_RegistrationNumber'
+                   AND object_id = OBJECT_ID(N'dbo.Hospitals'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_Hospitals_RegistrationNumber
+        ON dbo.Hospitals(RegistrationNumber);
+    END;
+END
+GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Doctors_User' AND object_id=OBJECT_ID(N'dbo.Doctors'))
-    CREATE UNIQUE INDEX IX_Doctors_User ON dbo.Doctors(UserID);
+IF OBJECT_ID('dbo.UserHistory','U') IS NOT NULL
+BEGIN
+    -- Most common query: history timeline by user
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserHistory_UserId_UpdatedDate'
+                   AND object_id = OBJECT_ID(N'dbo.UserHistory'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserHistory_UserId_UpdatedDate
+        ON dbo.UserHistory(UserId, UpdatedDate DESC);
+    END;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Doctors_PrimaryDept' AND object_id=OBJECT_ID(N'dbo.Doctors'))
-    CREATE INDEX IX_Doctors_PrimaryDept ON dbo.Doctors(PrimaryDepartmentID) INCLUDE (LicenseNumber);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserHistory_UserStatusId'
+                   AND object_id = OBJECT_ID(N'dbo.UserHistory'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserHistory_UserStatusId
+        ON dbo.UserHistory(UserStatusId);
+    END;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorDepartments_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorDepartments'))
-    CREATE INDEX IX_DoctorDepartments_Doctor ON dbo.DoctorDepartments(DoctorID) INCLUDE (DepartmentID, AssignedAt);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserHistory_UpdatedBy'
+                   AND object_id = OBJECT_ID(N'dbo.UserHistory'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserHistory_UpdatedBy
+        ON dbo.UserHistory(UpdatedBy);
+    END;
+END
+GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorDepartments_Dept' AND object_id=OBJECT_ID(N'dbo.DoctorDepartments'))
-    CREATE INDEX IX_DoctorDepartments_Dept ON dbo.DoctorDepartments(DepartmentID) INCLUDE (DoctorID, AssignedAt);
+-- HospitalProfileStatus: PK(HospitalID) already covers FK → Hospitals
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Specializations_Dept' AND object_id=OBJECT_ID(N'dbo.Specializations'))
-    CREATE INDEX IX_Specializations_Dept ON dbo.Specializations(DepartmentID) INCLUDE (HospitalID, Name, IsActive);
+IF OBJECT_ID('dbo.HospitalUsers','U') IS NOT NULL
+BEGIN
+    -- All users in a hospital
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_HospitalUsers_HospitalID_UserID'
+                   AND object_id = OBJECT_ID(N'dbo.HospitalUsers'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_HospitalUsers_HospitalID_UserID
+        ON dbo.HospitalUsers(HospitalID, UserID);
+    END;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Specializations_Hosp' AND object_id=OBJECT_ID(N'dbo.Specializations'))
-    CREATE INDEX IX_Specializations_Hosp ON dbo.Specializations(HospitalID) INCLUDE (DepartmentID, Name, IsActive);
+    -- All hospitals for a user
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_HospitalUsers_UserID'
+                   AND object_id = OBJECT_ID(N'dbo.HospitalUsers'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_HospitalUsers_UserID
+        ON dbo.HospitalUsers(UserID);
+    END;
+END
+GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorSpecializations_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorSpecializations'))
-    CREATE INDEX IX_DoctorSpecializations_Doctor ON dbo.DoctorSpecializations(DoctorID) INCLUDE (SpecializationID, AssignedAt);
+------------------------------------------------------------
+-- DEPARTMENTS / DOCTORS / MAPPINGS
+------------------------------------------------------------
+IF OBJECT_ID('dbo.Departments','U') IS NOT NULL
+BEGIN
+    -- Who created, for audits / listing
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Departments_CreatedByUserID'
+                   AND object_id = OBJECT_ID(N'dbo.Departments'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_Departments_CreatedByUserID
+        ON dbo.Departments(CreatedByUserID);
+    END;
+END
+GO
 
-/* ============== HOSPITAL DEPT MAPPINGS =================== */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_HDM_Hospital' AND object_id=OBJECT_ID(N'dbo.HospitalDepartmentMappings'))
-    CREATE INDEX IX_HDM_Hospital ON dbo.HospitalDepartmentMappings(HospitalID) INCLUDE (DepartmentID, IsActive, MappedAt);
+IF OBJECT_ID('dbo.Doctors','U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Doctors_HospitalID'
+                   AND object_id = OBJECT_ID(N'dbo.Doctors'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_Doctors_HospitalID
+        ON dbo.Doctors(HospitalID);
+    END;
 
-/* ============== ROLES / PERMISSIONS ====================== */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Roles_Hospital' AND object_id=OBJECT_ID(N'dbo.Roles'))
-    CREATE INDEX IX_Roles_Hospital ON dbo.Roles(HospitalID) INCLUDE (RoleName, IsActive);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Doctors_PrimaryDepartmentID'
+                   AND object_id = OBJECT_ID(N'dbo.Doctors'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_Doctors_PrimaryDepartmentID
+        ON dbo.Doctors(PrimaryDepartmentID);
+    END;
+END
+GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_RolePermissions_Role' AND object_id=OBJECT_ID(N'dbo.RolePermissions'))
-    CREATE INDEX IX_RolePermissions_Role ON dbo.RolePermissions(RoleID);
+IF OBJECT_ID('dbo.DoctorDepartments','U') IS NOT NULL
+BEGIN
+    -- All doctors in a department of a hospital
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DoctorDepartments_HospitalID_DepartmentID'
+                   AND object_id = OBJECT_ID(N'dbo.DoctorDepartments'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_DoctorDepartments_HospitalID_DepartmentID
+        ON dbo.DoctorDepartments(HospitalID, DepartmentID);
+    END;
+END
+GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_UserRoles_User' AND object_id=OBJECT_ID(N'dbo.UserRoles'))
-    CREATE INDEX IX_UserRoles_User ON dbo.UserRoles(UserID) INCLUDE (RoleID);
+IF OBJECT_ID('dbo.Specializations','U') IS NOT NULL
+BEGIN
+    -- List specializations for a department
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Specializations_DepartmentID'
+                   AND object_id = OBJECT_ID(N'dbo.Specializations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_Specializations_DepartmentID
+        ON dbo.Specializations(DepartmentID);
+    END;
+END
+GO
 
-/* ============== DOCTOR SCHEDULING ======================== */
+IF OBJECT_ID('dbo.DoctorSpecializations','U') IS NOT NULL
+BEGIN
+    -- Find doctors by specialization
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DoctorSpecializations_SpecializationID'
+                   AND object_id = OBJECT_ID(N'dbo.DoctorSpecializations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_DoctorSpecializations_SpecializationID
+        ON dbo.DoctorSpecializations(SpecializationID);
+    END;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorShiftOverrides_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorShiftOverrides'))
-    CREATE INDEX IX_DoctorShiftOverrides_Doctor ON dbo.DoctorShiftOverrides(DoctorID, OverrideDate, StartDate, EndDate);
+    -- All specializations for a doctor in a hospital
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DoctorSpecializations_HospitalID_DoctorID'
+                   AND object_id = OBJECT_ID(N'dbo.DoctorSpecializations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_DoctorSpecializations_HospitalID_DoctorID
+        ON dbo.DoctorSpecializations(HospitalID, DoctorID);
+    END;
+END
+GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorTimeOffs_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorTimeOffs'))
-    CREATE INDEX IX_DoctorTimeOffs_Doctor ON dbo.DoctorTimeOffs(DoctorID, FromDate, ToDate);
+IF OBJECT_ID('dbo.HospitalDepartmentMappings','U') IS NOT NULL
+BEGIN
+    -- All hospitals that have a given department mapped
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_HospDeptMap_DepartmentID'
+                   AND object_id = OBJECT_ID(N'dbo.HospitalDepartmentMappings'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_HospDeptMap_DepartmentID
+        ON dbo.HospitalDepartmentMappings(DepartmentID);
+    END;
+END
+GO
 
-/* ============== PATIENT REG / STATUS ===================== */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_PatientRegistrations_Hospital' AND object_id=OBJECT_ID(N'dbo.PatientRegistrations'))
-    CREATE INDEX IX_PatientRegistrations_Hospital ON dbo.PatientRegistrations(HospitalID, PatientID) INCLUDE (RegisteredAt, FullName, Mobile);
+------------------------------------------------------------
+-- ROLES / PERMISSIONS / USERROLES
+------------------------------------------------------------
+IF OBJECT_ID('dbo.Roles','U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Roles_HospitalID'
+                   AND object_id = OBJECT_ID(N'dbo.Roles'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_Roles_HospitalID
+        ON dbo.Roles(HospitalID);
+    END;
+END
+GO
 
-/* ============== APPOINTMENTS / QUEUE / TOKENS / VITALS === */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Appointments_DoctorDate' AND object_id=OBJECT_ID(N'dbo.Appointments'))
-    CREATE INDEX IX_Appointments_DoctorDate ON dbo.Appointments(DoctorID, ApptDate) INCLUDE (HospitalID, PatientID, CurrentStatusCode, StartAt, EndAt);
+-- RolePermissions PK(RoleID, PermissionKey) is already good
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Appointments_HospitalDate' AND object_id=OBJECT_ID(N'dbo.Appointments'))
-    CREATE INDEX IX_Appointments_HospitalDate ON dbo.Appointments(HospitalID, ApptDate) INCLUDE (DoctorID, PatientID, CurrentStatusCode);
+IF OBJECT_ID('dbo.UserRoles','U') IS NOT NULL
+BEGIN
+    -- Quick lookup of all users in a role
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserRoles_RoleID_HospitalID'
+                   AND object_id = OBJECT_ID(N'dbo.UserRoles'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserRoles_RoleID_HospitalID
+        ON dbo.UserRoles(RoleID, HospitalID)
+        INCLUDE (UserID);
+    END;
+END
+GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Appointments_Status' AND object_id=OBJECT_ID(N'dbo.Appointments'))
-    CREATE INDEX IX_Appointments_Status ON dbo.Appointments(CurrentStatusCode) INCLUDE (DoctorID, HospitalID, ApptDate);
+------------------------------------------------------------
+-- HOSPITAL TYPES / INVITATIONS
+------------------------------------------------------------
+-- HospitalTypes already has PK + UNIQUE(TypeName)
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorQueues_Lookup' AND object_id=OBJECT_ID(N'dbo.DoctorQueues'))
-    CREATE INDEX IX_DoctorQueues_Lookup ON dbo.DoctorQueues(DoctorID, TokenDate) INCLUDE (HospitalID, NextTokenNo);
+IF OBJECT_ID('dbo.UserInvitations','U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserInvitations_HospitalID'
+                   AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserInvitations_HospitalID
+        ON dbo.UserInvitations(HospitalID);
+    END;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_AppointmentTokens_Lookup' AND object_id=OBJECT_ID(N'dbo.AppointmentTokens'))
-    CREATE INDEX IX_AppointmentTokens_Lookup ON dbo.AppointmentTokens(DoctorID, TokenDate) INCLUDE (HospitalID, TokenNo, IsManual);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserInvitations_RoleID'
+                   AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserInvitations_RoleID
+        ON dbo.UserInvitations(RoleID);
+    END;
 
--- AppointmentVitals has one already in your deploy script:
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_AppointmentVitals_Appt' AND object_id=OBJECT_ID(N'dbo.AppointmentVitals'))
-    CREATE INDEX IX_AppointmentVitals_Appt ON dbo.AppointmentVitals (ApptId) INCLUDE (RecordedAt);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserInvitations_RecipientMobile'
+                   AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserInvitations_RecipientMobile
+        ON dbo.UserInvitations(RecipientMobile);
+    END;
 
-/* ============== LOOKUPS ================================= */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupMaster_Type' AND object_id=OBJECT_ID(N'dbo.LookupMaster'))
-    CREATE INDEX IX_LookupMaster_Type ON dbo.LookupMaster(LookupTypeId, NameLower);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserInvitations_RecipientEmail'
+                   AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserInvitations_RecipientEmail
+        ON dbo.UserInvitations(RecipientEmail);
+    END;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupMaster_Active' AND object_id=OBJECT_ID(N'dbo.LookupMaster'))
-    CREATE INDEX IX_LookupMaster_Active ON dbo.LookupMaster(IsActive) WHERE IsActive = 1;
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserInvitations_TokenHash'
+                   AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserInvitations_TokenHash
+        ON dbo.UserInvitations(TokenHash);
+    END;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupPersonal_ScopeType' AND object_id=OBJECT_ID(N'dbo.LookupPersonal'))
-    CREATE INDEX IX_LookupPersonal_ScopeType ON dbo.LookupPersonal(HospitalID, DoctorID, LookupTypeId, NameLower);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_UserInvitations_Status'
+                   AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_UserInvitations_Status
+        ON dbo.UserInvitations(Status)
+        INCLUDE (HospitalID, RoleID, RecipientMobile, RecipientEmail, ExpiresAt);
+    END;
+END
+GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupPersonal_Active' AND object_id=OBJECT_ID(N'dbo.LookupPersonal'))
-    CREATE INDEX IX_LookupPersonal_Active ON dbo.LookupPersonal(IsActive) WHERE IsActive = 1;
+------------------------------------------------------------
+-- DOCTOR SHIFTS / TIME OFF
+------------------------------------------------------------
+IF OBJECT_ID('dbo.DoctorShiftTemplates','U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DocShiftTpl_ShiftName'
+                   AND object_id = OBJECT_ID(N'dbo.DoctorShiftTemplates'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_DocShiftTpl_ShiftName
+        ON dbo.DoctorShiftTemplates(ShiftName);
+    END;
+END
+GO
 
+IF OBJECT_ID('dbo.DoctorShiftOverrides','U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DocShiftOv_HospitalID_DoctorID'
+                   AND object_id = OBJECT_ID(N'dbo.DoctorShiftOverrides'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_DocShiftOv_HospitalID_DoctorID
+        ON dbo.DoctorShiftOverrides(HospitalID, DoctorID);
+    END;
 
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DocShiftOv_DoctorID_OverrideDate'
+                   AND object_id = OBJECT_ID(N'dbo.DoctorShiftOverrides'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_DocShiftOv_DoctorID_OverrideDate
+        ON dbo.DoctorShiftOverrides(DoctorID, OverrideDate);
+    END;
+END
+GO
 
-/* ============== DOCTOR PREFERRED MEDICINE ================ */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DPM_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorPreferredMedicine'))
-    CREATE INDEX IX_DPM_Doctor ON dbo.DoctorPreferredMedicine (DoctorId) INCLUDE (IsActive, GenericName);
+IF OBJECT_ID('dbo.DoctorTimeOffs','U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DocTimeOffs_HospitalID_DoctorID'
+                   AND object_id = OBJECT_ID(N'dbo.DoctorTimeOffs'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_DocTimeOffs_HospitalID_DoctorID
+        ON dbo.DoctorTimeOffs(HospitalID, DoctorID);
+    END;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DPM_Generic_Active' AND object_id=OBJECT_ID(N'dbo.DoctorPreferredMedicine'))
-    CREATE INDEX IX_DPM_Generic_Active ON dbo.DoctorPreferredMedicine (GenericName) WHERE IsActive = 1;
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DocTimeOffs_DoctorID_From_To'
+                   AND object_id = OBJECT_ID(N'dbo.DoctorTimeOffs'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_DocTimeOffs_DoctorID_From_To
+        ON dbo.DoctorTimeOffs(DoctorID, FromDate, ToDate);
+    END;
+END
+GO
 
+------------------------------------------------------------
+-- PATIENT REGISTRATIONS / STATUS MASTER
+------------------------------------------------------------
+IF OBJECT_ID('dbo.PatientRegistrations','U') IS NOT NULL
+BEGIN
+    -- Core patient identity within a hospital
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_PReg_HospitalID_PatientID'
+                   AND object_id = OBJECT_ID(N'dbo.PatientRegistrations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_PReg_HospitalID_PatientID
+        ON dbo.PatientRegistrations(HospitalID, PatientID);
+    END;
 
-PRINT N'All recommended indexes created/verified.';
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_PReg_HospitalID_Mobile'
+                   AND object_id = OBJECT_ID(N'dbo.PatientRegistrations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_PReg_HospitalID_Mobile
+        ON dbo.PatientRegistrations(HospitalID, Mobile);
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_PReg_HospitalID_FullName'
+                   AND object_id = OBJECT_ID(N'dbo.PatientRegistrations'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_PReg_HospitalID_FullName
+        ON dbo.PatientRegistrations(HospitalID, FullName);
+    END;
+END
+GO
+
+-- StatusMaster: PK(StatusCode) is enough as a small static table
+
+------------------------------------------------------------
+-- APPOINTMENTS / QUEUES / TOKENS / VITALS
+------------------------------------------------------------
+IF OBJECT_ID('dbo.Appointments','U') IS NOT NULL
+BEGIN
+    -- Typical schedule view: doctor list per day
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Appointments_HospDocDate'
+                   AND object_id = OBJECT_ID(N'dbo.Appointments'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_Appointments_HospDocDate
+        ON dbo.Appointments(HospitalID, DoctorID, ApptDate)
+        INCLUDE (CurrentStatusCode, StartAt, EndAt, PatientID);
+    END;
+
+    -- Patient history: all appts for a patient in hospital
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Appointments_HospPatientDate'
+                   AND object_id = OBJECT_ID(N'dbo.Appointments'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_Appointments_HospPatientDate
+        ON dbo.Appointments(HospitalID, PatientID, ApptDate);
+    END;
+END
+GO
+
+-- DoctorQueues PK(HospitalID, DoctorID, TokenDate) is already ideal
+
+-- AppointmentTokens already has:
+--   PK(TokenID), UQ(ApptId), UQ(HospitalID, DoctorID, TokenDate, TokenNo)
+
+IF OBJECT_ID('dbo.AppointmentVitals','U') IS NOT NULL
+BEGIN
+    -- One vitals record per appointment
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_AppointmentVitals_ApptId'
+                   AND object_id = OBJECT_ID(N'dbo.AppointmentVitals'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_AppointmentVitals_ApptId
+        ON dbo.AppointmentVitals(ApptId);
+    END;
+
+    -- Vitals trends per patient in a hospital
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_AppointmentVitals_HospPatient'
+                   AND object_id = OBJECT_ID(N'dbo.AppointmentVitals'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_AppointmentVitals_HospPatient
+        ON dbo.AppointmentVitals(HospitalID, PatientID);
+    END;
+END
+GO
+
+------------------------------------------------------------
+-- LOOKUP TYPES / MASTER / PERSONAL
+------------------------------------------------------------
+-- LookupTypes already has PK + UNIQUE(LookupTypeCode)
+
+IF OBJECT_ID('dbo.LookupMaster','U') IS NOT NULL
+BEGIN
+    -- Core lookup query: by type + active + name
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_LookupMaster_Type_IsActive_NameLower'
+                   AND object_id = OBJECT_ID(N'dbo.LookupMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_LookupMaster_Type_IsActive_NameLower
+        ON dbo.LookupMaster(LookupTypeId, IsActive, NameLower);
+    END;
+
+    -- Fast lookup by (LookupTypeId, Code)
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_LookupMaster_Type_Code'
+                   AND object_id = OBJECT_ID(N'dbo.LookupMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_LookupMaster_Type_Code
+        ON dbo.LookupMaster(LookupTypeId, Code);
+    END;
+END
+GO
+
+IF OBJECT_ID('dbo.LookupPersonal','U') IS NOT NULL
+BEGIN
+    -- Personal lookups per doctor within a hospital and type
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_LookupPersonal_HospDocType_NameLower'
+                   AND object_id = OBJECT_ID(N'dbo.LookupPersonal'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_LookupPersonal_HospDocType_NameLower
+        ON dbo.LookupPersonal(HospitalID, DoctorID, LookupTypeId, NameLower)
+        INCLUDE (IsActive, Code, ShortDesc, IsOverride, HideMaster);
+    END;
+
+    -- Join back to master
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_LookupPersonal_MasterLookupId'
+                   AND object_id = OBJECT_ID(N'dbo.LookupPersonal'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_LookupPersonal_MasterLookupId
+        ON dbo.LookupPersonal(MasterLookupId);
+    END;
+END
+GO
+
+------------------------------------------------------------
+-- DOCTOR PREFERRED MEDICINE / SECTION PREFERENCES
+------------------------------------------------------------
+IF OBJECT_ID('dbo.DoctorPreferredMedicine','U') IS NOT NULL
+BEGIN
+    -- Common query: all active preferred meds for doctor in a hospital
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DPM_HospitalID_DoctorID_IsActive'
+                   AND object_id = OBJECT_ID(N'dbo.DoctorPreferredMedicine'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_DPM_HospitalID_DoctorID_IsActive
+        ON dbo.DoctorPreferredMedicine(HospitalID, DoctorId, IsActive)
+        INCLUDE (BrandName, GenericName, Form, StrengthValue, StrengthUnit,
+                 Route, Dose, Frequency, DurationValue, DurationUnit, Indication);
+    END;
+END
+GO
+
+-- DoctorSectionPreferences already has:
+--   PK(PreferenceId) + UNIQUE(HospitalId, DoctorId)
+
+PRINT N'easyHMS index creation completed.';

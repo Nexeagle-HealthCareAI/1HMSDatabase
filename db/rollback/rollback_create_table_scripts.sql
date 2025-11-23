@@ -1,121 +1,129 @@
 /* =========================================================
-   easyHMS – Azure SQL Rollback (Dev/QA)
-   Strategy: drop ALL dbo FKs first, then drop objects.
-   Safe to re-run: guards + existence checks.
-   Single batch; XACT_ABORT ON.
+   easyHMS – ROLLBACK SCRIPT (Dev/QA)
+   Drops tables in reverse dependency order.
+   Safe to re-run; only drops if table exists.
    ========================================================= */
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
 
-BEGIN TRY
-    BEGIN TRAN;
+------------------------------------------------------------
+-- DOCTOR PREFERRED / LOOKUPS / APPOINTMENT VITALS & TOKENS
+------------------------------------------------------------
+IF OBJECT_ID('dbo.DoctorSectionPreferences','U') IS NOT NULL
+    DROP TABLE dbo.DoctorSectionPreferences;
 
-    ---------------------------------------------------------
-    -- 0) Drop ALL FOREIGN KEYS in dbo (user objects only)
-    --    Using a cursor to avoid STRING_AGG 8k limitations.
-    ---------------------------------------------------------
-    DECLARE @parent  sysname,
-            @fkname  sysname,
-            @sql     nvarchar(max);
+IF OBJECT_ID('dbo.DoctorPreferredMedicine','U') IS NOT NULL
+    DROP TABLE dbo.DoctorPreferredMedicine;
 
-    DECLARE fk_cur CURSOR FAST_FORWARD FOR
-    SELECT
-      QUOTENAME(SCHEMA_NAME(o.schema_id)) + N'.' + QUOTENAME(o.name) AS parent_table,
-      fk.name AS fk_name
-    FROM sys.foreign_keys fk
-    JOIN sys.objects o ON o.object_id = fk.parent_object_id
-    WHERE o.is_ms_shipped = 0
-      AND SCHEMA_NAME(o.schema_id) = N'dbo';
+IF OBJECT_ID('dbo.LookupPersonal','U') IS NOT NULL
+    DROP TABLE dbo.LookupPersonal;
 
-    OPEN fk_cur;
-    FETCH NEXT FROM fk_cur INTO @parent, @fkname;
+IF OBJECT_ID('dbo.LookupMaster','U') IS NOT NULL
+    DROP TABLE dbo.LookupMaster;
 
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        SET @sql = N'
-IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N''' + REPLACE(@fkname,'''','''''') + N''')
-    ALTER TABLE ' + @parent + N' DROP CONSTRAINT ' + QUOTENAME(@fkname) + N';';
+IF OBJECT_ID('dbo.LookupTypes','U') IS NOT NULL
+    DROP TABLE dbo.LookupTypes;
 
-        EXEC sys.sp_executesql @sql;
-        FETCH NEXT FROM fk_cur INTO @parent, @fkname;
-    END
+IF OBJECT_ID('dbo.AppointmentVitals','U') IS NOT NULL
+    DROP TABLE dbo.AppointmentVitals;
 
-    CLOSE fk_cur;
-    DEALLOCATE fk_cur;
+IF OBJECT_ID('dbo.AppointmentTokens','U') IS NOT NULL
+    DROP TABLE dbo.AppointmentTokens;
 
-    ---------------------------------------------------------
-    -- 1) Drop tables (explicit list; order now irrelevant)
-    --    Add any new tables to this list as schema evolves.
-    ---------------------------------------------------------
-    DECLARE @tablesToDrop TABLE (t sysname);
-    INSERT INTO @tablesToDrop(t) VALUES
-        
-        (N'DoctorSectionPreferences'),
-        (N'LookupPersonal'),
-        (N'LookupMaster'),
-        (N'LookupTypes'),
-        (N'AppointmentVitals'),
-        (N'AppointmentTokens'),
-        (N'DoctorQueues'),
-        (N'Appointments'),
-        (N'StatusMaster'),
-        (N'PatientRegistrations'),
-        (N'UserRoles'),
-        (N'RolePermissions'),        
-        (N'Roles'),
-		(N'DoctorSectionPreferences'),
-        (N'DoctorSpecializations'),
-        (N'Specializations'),
-        (N'DoctorDepartments'),
-        (N'DoctorTimeOffs'),
-        (N'DoctorShiftOverrides'),
-        (N'DoctorShiftTemplates'),       
-        (N'HospitalDepartmentMappings'),
-        (N'DoctorPreferredMedicine'),
-        (N'UserInvitations'),        -- ✅ newly added per your ask
-        (N'Doctors'),
-        (N'Departments'),
-        (N'HospitalUsers'),
-        (N'HospitalProfileStatus'),
-        (N'Hospitals'),
-        (N'HospitalTypes'),
-        (N'UserProfiles'),
-        (N'UserAuth'),		
-        (N'Users');
+IF OBJECT_ID('dbo.DoctorQueues','U') IS NOT NULL
+    DROP TABLE dbo.DoctorQueues;
 
-    DECLARE @t sysname;
-    DECLARE tbl_cur CURSOR FAST_FORWARD FOR SELECT t FROM @tablesToDrop;
-    OPEN tbl_cur;
-    FETCH NEXT FROM tbl_cur INTO @t;
+IF OBJECT_ID('dbo.Appointments','U') IS NOT NULL
+    DROP TABLE dbo.Appointments;
 
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        SET @sql = N'IF OBJECT_ID(N''dbo.' + REPLACE(@t,'''','''''') + N''',''U'') IS NOT NULL
-                     DROP TABLE dbo.' + QUOTENAME(@t) + N';';
-        EXEC sys.sp_executesql @sql;
-        FETCH NEXT FROM tbl_cur INTO @t;
-    END
+IF OBJECT_ID('dbo.StatusMaster','U') IS NOT NULL
+    DROP TABLE dbo.StatusMaster;
 
-    CLOSE tbl_cur;
-    DEALLOCATE tbl_cur;
+IF OBJECT_ID('dbo.PatientRegistrations','U') IS NOT NULL
+    DROP TABLE dbo.PatientRegistrations;
 
-    ---------------------------------------------------------
-    -- 2) Drop sequences (add more here if you create them)
-    ---------------------------------------------------------
-    IF OBJECT_ID(N'dbo.PrescriptionNumberSeq', N'SO') IS NOT NULL
-        DROP SEQUENCE dbo.PrescriptionNumberSeq;
+------------------------------------------------------------
+-- DOCTOR SHIFTS / TIME OFF
+------------------------------------------------------------
+IF OBJECT_ID('dbo.DoctorTimeOffs','U') IS NOT NULL
+    DROP TABLE dbo.DoctorTimeOffs;
 
-    COMMIT TRAN;
-    PRINT N'easyHMS rollback completed (FK-first, dependency-agnostic).';
+IF OBJECT_ID('dbo.DoctorShiftOverrides','U') IS NOT NULL
+    DROP TABLE dbo.DoctorShiftOverrides;
 
-END TRY
-BEGIN CATCH
-    IF XACT_STATE() <> 0 ROLLBACK TRAN;
+IF OBJECT_ID('dbo.DoctorShiftTemplates','U') IS NOT NULL
+    DROP TABLE dbo.DoctorShiftTemplates;
 
-    DECLARE @msg nvarchar(4000) = ERROR_MESSAGE();
-    DECLARE @num int = ERROR_NUMBER();
-    DECLARE @sev int = ERROR_SEVERITY();
-    DECLARE @st  int = ERROR_STATE();
+------------------------------------------------------------
+-- INVITATIONS / HOSPITAL TYPES
+------------------------------------------------------------
+IF OBJECT_ID('dbo.UserInvitations','U') IS NOT NULL
+    DROP TABLE dbo.UserInvitations;
 
-    RAISERROR(N'Rollback failed (%d, sev %d, state %d): %s', 16, 1, @num, @sev, @st, @msg);
-END CATCH;
+IF OBJECT_ID('dbo.HospitalTypes','U') IS NOT NULL
+    DROP TABLE dbo.HospitalTypes;
+
+------------------------------------------------------------
+-- ROLES / PERMISSIONS
+------------------------------------------------------------
+IF OBJECT_ID('dbo.UserRoles','U') IS NOT NULL
+    DROP TABLE dbo.UserRoles;
+
+IF OBJECT_ID('dbo.RolePermissions','U') IS NOT NULL
+    DROP TABLE dbo.RolePermissions;
+
+IF OBJECT_ID('dbo.Roles','U') IS NOT NULL
+    DROP TABLE dbo.Roles;
+
+------------------------------------------------------------
+-- HOSPITAL–DEPARTMENT / DOCTORS / SPECIALIZATIONS
+------------------------------------------------------------
+IF OBJECT_ID('dbo.HospitalDepartmentMappings','U') IS NOT NULL
+    DROP TABLE dbo.HospitalDepartmentMappings;
+
+IF OBJECT_ID('dbo.DoctorSpecializations','U') IS NOT NULL
+    DROP TABLE dbo.DoctorSpecializations;
+
+IF OBJECT_ID('dbo.Specializations','U') IS NOT NULL
+    DROP TABLE dbo.Specializations;
+
+IF OBJECT_ID('dbo.DoctorDepartments','U') IS NOT NULL
+    DROP TABLE dbo.DoctorDepartments;
+
+IF OBJECT_ID('dbo.Doctors','U') IS NOT NULL
+    DROP TABLE dbo.Doctors;
+
+IF OBJECT_ID('dbo.Departments','U') IS NOT NULL
+    DROP TABLE dbo.Departments;
+
+------------------------------------------------------------
+-- HOSPITALS / USER-HOSPITAL LINKING / USER HISTORY
+------------------------------------------------------------
+IF OBJECT_ID('dbo.HospitalUsers','U') IS NOT NULL
+    DROP TABLE dbo.HospitalUsers;
+
+IF OBJECT_ID('dbo.HospitalProfileStatus','U') IS NOT NULL
+    DROP TABLE dbo.HospitalProfileStatus;
+
+IF OBJECT_ID('dbo.UserHistory','U') IS NOT NULL
+    DROP TABLE dbo.UserHistory;
+
+IF OBJECT_ID('dbo.Hospitals','U') IS NOT NULL
+    DROP TABLE dbo.Hospitals;
+
+------------------------------------------------------------
+-- USER STATUS / USERS / AUTH / PROFILES
+------------------------------------------------------------
+IF OBJECT_ID('dbo.UserStatus','U') IS NOT NULL
+    DROP TABLE dbo.UserStatus;
+
+IF OBJECT_ID('dbo.UserProfiles','U') IS NOT NULL
+    DROP TABLE dbo.UserProfiles;
+
+IF OBJECT_ID('dbo.UserAuth','U') IS NOT NULL
+    DROP TABLE dbo.UserAuth;
+
+IF OBJECT_ID('dbo.Users','U') IS NOT NULL
+    DROP TABLE dbo.Users;
+
+PRINT N'easyHMS schema rollback completed.';

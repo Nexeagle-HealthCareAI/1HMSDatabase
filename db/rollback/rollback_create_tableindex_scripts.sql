@@ -1,128 +1,342 @@
 /* =========================================================
-   easyHMS – Drop Recommended Secondary Indexes (Idempotent)
-   Drops ONLY the indexes created by the companion script.
+   easyHMS – Index Rollback Script
+   Drops only the nonclustered indexes created by
+   "easyHMS – Recommended Indexes (Dev/QA)".
    Safe to re-run.
    ========================================================= */
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
 
-/* Helper pattern:
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Name' AND object_id=OBJECT_ID(N'dbo.Table'))
-    DROP INDEX IX_Name ON dbo.Table;
-*/
+------------------------------------------------------------
+-- USERS / AUTH / PROFILES / STATUS
+------------------------------------------------------------
+IF OBJECT_ID('dbo.Users','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_Users_UserStatusId'
+                 AND object_id = OBJECT_ID(N'dbo.Users'))
+        DROP INDEX IX_Users_UserStatusId ON dbo.Users;
 
-/* ============== USERS / AUTH / PROFILES ================= */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Users_Email' AND object_id=OBJECT_ID(N'dbo.Users'))
-    DROP INDEX IX_Users_Email ON dbo.Users;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_Users_Email'
+                 AND object_id = OBJECT_ID(N'dbo.Users'))
+        DROP INDEX IX_Users_Email ON dbo.Users;
+END;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_UserAuth_UserID' AND object_id=OBJECT_ID(N'dbo.UserAuth'))
-    DROP INDEX IX_UserAuth_UserID ON dbo.UserAuth;
+IF OBJECT_ID('dbo.UserAuth','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserAuth_UserID'
+                 AND object_id = OBJECT_ID(N'dbo.UserAuth'))
+        DROP INDEX IX_UserAuth_UserID ON dbo.UserAuth;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_UserProfiles_UserID' AND object_id=OBJECT_ID(N'dbo.UserProfiles'))
-    DROP INDEX IX_UserProfiles_UserID ON dbo.UserProfiles;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserAuth_UserStatusId'
+                 AND object_id = OBJECT_ID(N'dbo.UserAuth'))
+        DROP INDEX IX_UserAuth_UserStatusId ON dbo.UserAuth;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_UserProfiles_Name' AND object_id=OBJECT_ID(N'dbo.UserProfiles'))
-    DROP INDEX IX_UserProfiles_Name ON dbo.UserProfiles;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserAuth_Otp'
+                 AND object_id = OBJECT_ID(N'dbo.UserAuth'))
+        DROP INDEX IX_UserAuth_Otp ON dbo.UserAuth;
+END;
 
-/* ============== HOSPITALS / MEMBERSHIP / STATUS ========= */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Hospitals_Name' AND object_id=OBJECT_ID(N'dbo.Hospitals'))
-    DROP INDEX IX_Hospitals_Name ON dbo.Hospitals;
+IF OBJECT_ID('dbo.UserProfiles','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserProfiles_UserStatusId'
+                 AND object_id = OBJECT_ID(N'dbo.UserProfiles'))
+        DROP INDEX IX_UserProfiles_UserStatusId ON dbo.UserProfiles;
+END;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_HospitalUsers_Hospital' AND object_id=OBJECT_ID(N'dbo.HospitalUsers'))
-    DROP INDEX IX_HospitalUsers_Hospital ON dbo.HospitalUsers;
+------------------------------------------------------------
+-- HOSPITALS / USER HISTORY / HOSPITAL USERS / PROFILE STATUS
+------------------------------------------------------------
+IF OBJECT_ID('dbo.Hospitals','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_Hospitals_CreatedByUserID'
+                 AND object_id = OBJECT_ID(N'dbo.Hospitals'))
+        DROP INDEX IX_Hospitals_CreatedByUserID ON dbo.Hospitals;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_HospitalUsers_User' AND object_id=OBJECT_ID(N'dbo.HospitalUsers'))
-    DROP INDEX IX_HospitalUsers_User ON dbo.HospitalUsers;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_Hospitals_RegistrationNumber'
+                 AND object_id = OBJECT_ID(N'dbo.Hospitals'))
+        DROP INDEX IX_Hospitals_RegistrationNumber ON dbo.Hospitals;
+END;
 
-/* ============== DEPARTMENTS / DOCTORS / SPECS ============ */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Departments_Hospital' AND object_id=OBJECT_ID(N'dbo.Departments'))
-    DROP INDEX IX_Departments_Hospital ON dbo.Departments;
+IF OBJECT_ID('dbo.UserHistory','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserHistory_UserId_UpdatedDate'
+                 AND object_id = OBJECT_ID(N'dbo.UserHistory'))
+        DROP INDEX IX_UserHistory_UserId_UpdatedDate ON dbo.UserHistory;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Doctors_User' AND object_id=OBJECT_ID(N'dbo.Doctors'))
-    DROP INDEX IX_Doctors_User ON dbo.Doctors;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserHistory_UserStatusId'
+                 AND object_id = OBJECT_ID(N'dbo.UserHistory'))
+        DROP INDEX IX_UserHistory_UserStatusId ON dbo.UserHistory;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Doctors_PrimaryDept' AND object_id=OBJECT_ID(N'dbo.Doctors'))
-    DROP INDEX IX_Doctors_PrimaryDept ON dbo.Doctors;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserHistory_UpdatedBy'
+                 AND object_id = OBJECT_ID(N'dbo.UserHistory'))
+        DROP INDEX IX_UserHistory_UpdatedBy ON dbo.UserHistory;
+END;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorDepartments_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorDepartments'))
-    DROP INDEX IX_DoctorDepartments_Doctor ON dbo.DoctorDepartments;
+IF OBJECT_ID('dbo.HospitalUsers','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_HospitalUsers_HospitalID_UserID'
+                 AND object_id = OBJECT_ID(N'dbo.HospitalUsers'))
+        DROP INDEX IX_HospitalUsers_HospitalID_UserID ON dbo.HospitalUsers;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorDepartments_Dept' AND object_id=OBJECT_ID(N'dbo.DoctorDepartments'))
-    DROP INDEX IX_DoctorDepartments_Dept ON dbo.DoctorDepartments;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_HospitalUsers_UserID'
+                 AND object_id = OBJECT_ID(N'dbo.HospitalUsers'))
+        DROP INDEX IX_HospitalUsers_UserID ON dbo.HospitalUsers;
+END;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Specializations_Dept' AND object_id=OBJECT_ID(N'dbo.Specializations'))
-    DROP INDEX IX_Specializations_Dept ON dbo.Specializations;
+------------------------------------------------------------
+-- DEPARTMENTS / DOCTORS / MAPPINGS
+------------------------------------------------------------
+IF OBJECT_ID('dbo.Departments','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_Departments_CreatedByUserID'
+                 AND object_id = OBJECT_ID(N'dbo.Departments'))
+        DROP INDEX IX_Departments_CreatedByUserID ON dbo.Departments;
+END;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Specializations_Hosp' AND object_id=OBJECT_ID(N'dbo.Specializations'))
-    DROP INDEX IX_Specializations_Hosp ON dbo.Specializations;
+IF OBJECT_ID('dbo.Doctors','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_Doctors_HospitalID'
+                 AND object_id = OBJECT_ID(N'dbo.Doctors'))
+        DROP INDEX IX_Doctors_HospitalID ON dbo.Doctors;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorSpecializations_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorSpecializations'))
-    DROP INDEX IX_DoctorSpecializations_Doctor ON dbo.DoctorSpecializations;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_Doctors_PrimaryDepartmentID'
+                 AND object_id = OBJECT_ID(N'dbo.Doctors'))
+        DROP INDEX IX_Doctors_PrimaryDepartmentID ON dbo.Doctors;
+END;
 
-/* ============== HOSPITAL DEPT MAPPINGS =================== */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_HDM_Hospital' AND object_id=OBJECT_ID(N'dbo.HospitalDepartmentMappings'))
-    DROP INDEX IX_HDM_Hospital ON dbo.HospitalDepartmentMappings;
+IF OBJECT_ID('dbo.DoctorDepartments','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_DoctorDepartments_HospitalID_DepartmentID'
+                 AND object_id = OBJECT_ID(N'dbo.DoctorDepartments'))
+        DROP INDEX IX_DoctorDepartments_HospitalID_DepartmentID ON dbo.DoctorDepartments;
+END;
 
-/* ============== ROLES / PERMISSIONS ====================== */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Roles_Hospital' AND object_id=OBJECT_ID(N'dbo.Roles'))
-    DROP INDEX IX_Roles_Hospital ON dbo.Roles;
+IF OBJECT_ID('dbo.Specializations','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_Specializations_DepartmentID'
+                 AND object_id = OBJECT_ID(N'dbo.Specializations'))
+        DROP INDEX IX_Specializations_DepartmentID ON dbo.Specializations;
+END;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_RolePermissions_Role' AND object_id=OBJECT_ID(N'dbo.RolePermissions'))
-    DROP INDEX IX_RolePermissions_Role ON dbo.RolePermissions;
+IF OBJECT_ID('dbo.DoctorSpecializations','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_DoctorSpecializations_SpecializationID'
+                 AND object_id = OBJECT_ID(N'dbo.DoctorSpecializations'))
+        DROP INDEX IX_DoctorSpecializations_SpecializationID ON dbo.DoctorSpecializations;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_UserRoles_User' AND object_id=OBJECT_ID(N'dbo.UserRoles'))
-    DROP INDEX IX_UserRoles_User ON dbo.UserRoles;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_DoctorSpecializations_HospitalID_DoctorID'
+                 AND object_id = OBJECT_ID(N'dbo.DoctorSpecializations'))
+        DROP INDEX IX_DoctorSpecializations_HospitalID_DoctorID ON dbo.DoctorSpecializations;
+END;
 
-/* ============== DOCTOR SCHEDULING ======================== */
+IF OBJECT_ID('dbo.HospitalDepartmentMappings','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_HospDeptMap_DepartmentID'
+                 AND object_id = OBJECT_ID(N'dbo.HospitalDepartmentMappings'))
+        DROP INDEX IX_HospDeptMap_DepartmentID ON dbo.HospitalDepartmentMappings;
+END;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorShiftOverrides_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorShiftOverrides'))
-    DROP INDEX IX_DoctorShiftOverrides_Doctor ON dbo.DoctorShiftOverrides;
+------------------------------------------------------------
+-- ROLES / PERMISSIONS / USERROLES
+------------------------------------------------------------
+IF OBJECT_ID('dbo.Roles','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_Roles_HospitalID'
+                 AND object_id = OBJECT_ID(N'dbo.Roles'))
+        DROP INDEX IX_Roles_HospitalID ON dbo.Roles;
+END;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorTimeOffs_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorTimeOffs'))
-    DROP INDEX IX_DoctorTimeOffs_Doctor ON dbo.DoctorTimeOffs;
+IF OBJECT_ID('dbo.UserRoles','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserRoles_RoleID_HospitalID'
+                 AND object_id = OBJECT_ID(N'dbo.UserRoles'))
+        DROP INDEX IX_UserRoles_RoleID_HospitalID ON dbo.UserRoles;
+END;
 
-/* ============== PATIENT REG / STATUS ===================== */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_PatientRegistrations_Hospital' AND object_id=OBJECT_ID(N'dbo.PatientRegistrations'))
-    DROP INDEX IX_PatientRegistrations_Hospital ON dbo.PatientRegistrations;
+------------------------------------------------------------
+-- HOSPITAL TYPES / INVITATIONS
+------------------------------------------------------------
+IF OBJECT_ID('dbo.UserInvitations','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserInvitations_HospitalID'
+                 AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+        DROP INDEX IX_UserInvitations_HospitalID ON dbo.UserInvitations;
 
-/* ============== APPOINTMENTS / QUEUE / TOKENS / VITALS === */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Appointments_DoctorDate' AND object_id=OBJECT_ID(N'dbo.Appointments'))
-    DROP INDEX IX_Appointments_DoctorDate ON dbo.Appointments;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserInvitations_RoleID'
+                 AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+        DROP INDEX IX_UserInvitations_RoleID ON dbo.UserInvitations;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Appointments_HospitalDate' AND object_id=OBJECT_ID(N'dbo.Appointments'))
-    DROP INDEX IX_Appointments_HospitalDate ON dbo.Appointments;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserInvitations_RecipientMobile'
+                 AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+        DROP INDEX IX_UserInvitations_RecipientMobile ON dbo.UserInvitations;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_Appointments_Status' AND object_id=OBJECT_ID(N'dbo.Appointments'))
-    DROP INDEX IX_Appointments_Status ON dbo.Appointments;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserInvitations_RecipientEmail'
+                 AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+        DROP INDEX IX_UserInvitations_RecipientEmail ON dbo.UserInvitations;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DoctorQueues_Lookup' AND object_id=OBJECT_ID(N'dbo.DoctorQueues'))
-    DROP INDEX IX_DoctorQueues_Lookup ON dbo.DoctorQueues;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserInvitations_TokenHash'
+                 AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+        DROP INDEX IX_UserInvitations_TokenHash ON dbo.UserInvitations;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_AppointmentTokens_Lookup' AND object_id=OBJECT_ID(N'dbo.AppointmentTokens'))
-    DROP INDEX IX_AppointmentTokens_Lookup ON dbo.AppointmentTokens;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_UserInvitations_Status'
+                 AND object_id = OBJECT_ID(N'dbo.UserInvitations'))
+        DROP INDEX IX_UserInvitations_Status ON dbo.UserInvitations;
+END;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_AppointmentVitals_Appt' AND object_id=OBJECT_ID(N'dbo.AppointmentVitals'))
-    DROP INDEX IX_AppointmentVitals_Appt ON dbo.AppointmentVitals;
+------------------------------------------------------------
+-- DOCTOR SHIFTS / TIME OFF
+------------------------------------------------------------
+IF OBJECT_ID('dbo.DoctorShiftTemplates','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_DocShiftTpl_ShiftName'
+                 AND object_id = OBJECT_ID(N'dbo.DoctorShiftTemplates'))
+        DROP INDEX IX_DocShiftTpl_ShiftName ON dbo.DoctorShiftTemplates;
+END;
 
-/* ============== LOOKUPS ================================= */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupMaster_Type' AND object_id=OBJECT_ID(N'dbo.LookupMaster'))
-    DROP INDEX IX_LookupMaster_Type ON dbo.LookupMaster;
+IF OBJECT_ID('dbo.DoctorShiftOverrides','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_DocShiftOv_HospitalID_DoctorID'
+                 AND object_id = OBJECT_ID(N'dbo.DoctorShiftOverrides'))
+        DROP INDEX IX_DocShiftOv_HospitalID_DoctorID ON dbo.DoctorShiftOverrides;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupMaster_Active' AND object_id=OBJECT_ID(N'dbo.LookupMaster'))
-    DROP INDEX IX_LookupMaster_Active ON dbo.LookupMaster;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_DocShiftOv_DoctorID_OverrideDate'
+                 AND object_id = OBJECT_ID(N'dbo.DoctorShiftOverrides'))
+        DROP INDEX IX_DocShiftOv_DoctorID_OverrideDate ON dbo.DoctorShiftOverrides;
+END;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupPersonal_ScopeType' AND object_id=OBJECT_ID(N'dbo.LookupPersonal'))
-    DROP INDEX IX_LookupPersonal_ScopeType ON dbo.LookupPersonal;
+IF OBJECT_ID('dbo.DoctorTimeOffs','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_DocTimeOffs_HospitalID_DoctorID'
+                 AND object_id = OBJECT_ID(N'dbo.DoctorTimeOffs'))
+        DROP INDEX IX_DocTimeOffs_HospitalID_DoctorID ON dbo.DoctorTimeOffs;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_LookupPersonal_Active' AND object_id=OBJECT_ID(N'dbo.LookupPersonal'))
-    DROP INDEX IX_LookupPersonal_Active ON dbo.LookupPersonal;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_DocTimeOffs_DoctorID_From_To'
+                 AND object_id = OBJECT_ID(N'dbo.DoctorTimeOffs'))
+        DROP INDEX IX_DocTimeOffs_DoctorID_From_To ON dbo.DoctorTimeOffs;
+END;
 
-/* ============== DOCTOR PREFERRED MEDICINE ================ */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DPM_Doctor' AND object_id=OBJECT_ID(N'dbo.DoctorPreferredMedicine'))
-    DROP INDEX IX_DPM_Doctor ON dbo.DoctorPreferredMedicine;
+------------------------------------------------------------
+-- PATIENT REGISTRATIONS / STATUS MASTER
+------------------------------------------------------------
+IF OBJECT_ID('dbo.PatientRegistrations','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_PReg_HospitalID_PatientID'
+                 AND object_id = OBJECT_ID(N'dbo.PatientRegistrations'))
+        DROP INDEX IX_PReg_HospitalID_PatientID ON dbo.PatientRegistrations;
 
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_DPM_Generic_Active' AND object_id=OBJECT_ID(N'dbo.DoctorPreferredMedicine'))
-    DROP INDEX IX_DPM_Generic_Active ON dbo.DoctorPreferredMedicine;
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_PReg_HospitalID_Mobile'
+                 AND object_id = OBJECT_ID(N'dbo.PatientRegistrations'))
+        DROP INDEX IX_PReg_HospitalID_Mobile ON dbo.PatientRegistrations;
 
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_PReg_HospitalID_FullName'
+                 AND object_id = OBJECT_ID(N'dbo.PatientRegistrations'))
+        DROP INDEX IX_PReg_HospitalID_FullName ON dbo.PatientRegistrations;
+END;
 
-PRINT N'All recommended secondary indexes dropped (if existed).';
+------------------------------------------------------------
+-- APPOINTMENTS / QUEUES / TOKENS / VITALS
+------------------------------------------------------------
+IF OBJECT_ID('dbo.Appointments','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_Appointments_HospDocDate'
+                 AND object_id = OBJECT_ID(N'dbo.Appointments'))
+        DROP INDEX IX_Appointments_HospDocDate ON dbo.Appointments;
+
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_Appointments_HospPatientDate'
+                 AND object_id = OBJECT_ID(N'dbo.Appointments'))
+        DROP INDEX IX_Appointments_HospPatientDate ON dbo.Appointments;
+END;
+
+IF OBJECT_ID('dbo.AppointmentVitals','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_AppointmentVitals_ApptId'
+                 AND object_id = OBJECT_ID(N'dbo.AppointmentVitals'))
+        DROP INDEX IX_AppointmentVitals_ApptId ON dbo.AppointmentVitals;
+
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_AppointmentVitals_HospPatient'
+                 AND object_id = OBJECT_ID(N'dbo.AppointmentVitals'))
+        DROP INDEX IX_AppointmentVitals_HospPatient ON dbo.AppointmentVitals;
+END;
+
+------------------------------------------------------------
+-- LOOKUP TYPES / MASTER / PERSONAL
+------------------------------------------------------------
+IF OBJECT_ID('dbo.LookupMaster','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_LookupMaster_Type_IsActive_NameLower'
+                 AND object_id = OBJECT_ID(N'dbo.LookupMaster'))
+        DROP INDEX IX_LookupMaster_Type_IsActive_NameLower ON dbo.LookupMaster;
+
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_LookupMaster_Type_Code'
+                 AND object_id = OBJECT_ID(N'dbo.LookupMaster'))
+        DROP INDEX IX_LookupMaster_Type_Code ON dbo.LookupMaster;
+END;
+
+IF OBJECT_ID('dbo.LookupPersonal','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_LookupPersonal_HospDocType_NameLower'
+                 AND object_id = OBJECT_ID(N'dbo.LookupPersonal'))
+        DROP INDEX IX_LookupPersonal_HospDocType_NameLower ON dbo.LookupPersonal;
+
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_LookupPersonal_MasterLookupId'
+                 AND object_id = OBJECT_ID(N'dbo.LookupPersonal'))
+        DROP INDEX IX_LookupPersonal_MasterLookupId ON dbo.LookupPersonal;
+END;
+
+------------------------------------------------------------
+-- DOCTOR PREFERRED MEDICINE / SECTION PREFERENCES
+------------------------------------------------------------
+IF OBJECT_ID('dbo.DoctorPreferredMedicine','U') IS NOT NULL
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes 
+               WHERE name = N'IX_DPM_HospitalID_DoctorID_IsActive'
+                 AND object_id = OBJECT_ID(N'dbo.DoctorPreferredMedicine'))
+        DROP INDEX IX_DPM_HospitalID_DoctorID_IsActive ON dbo.DoctorPreferredMedicine;
+END;
+
+PRINT N'easyHMS index rollback completed.';

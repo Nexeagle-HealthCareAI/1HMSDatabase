@@ -277,4 +277,15 @@ WHEN NOT MATCHED THEN
 WHEN MATCHED AND (ISNULL(t.[Description],N'') <> s.[Description] OR t.IsActive = 0) THEN
   UPDATE SET [Description] = s.[Description], IsActive = 1, ModifiedAt = SYSUTCDATETIME();
 
+
+SET IDENTITY_INSERT dbo.UserStatus ON;
+
+INSERT INTO dbo.UserStatus (UserStatusId, StatusName)
+VALUES (1, 'Active'),
+       (2, 'Inactive'),
+       (3, 'Revoked');
+
+SET IDENTITY_INSERT dbo.UserStatus OFF;
+GO
+
 PRINT N'Global seed executed.';

@@ -23,7 +23,7 @@ BEGIN
         MobileNumber NVARCHAR(15) NOT NULL
             CONSTRAINT UQ_Users_Mobile UNIQUE,
         Email NVARCHAR(150) NULL,
-        IsActive BIT NOT NULL CONSTRAINT DF_Users_IsActive DEFAULT(1),
+        UserStatusId INT NOT NULL,
         CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_Users_CreatedAt DEFAULT SYSUTCDATETIME()
     );
 END
@@ -45,6 +45,7 @@ BEGIN
         LastLoginTime DATETIME2(3) NULL,
         OtpExpireAt DATETIME2(3) NULL,
         PasswordSetAt DATETIME2(3) NULL,
+		UserStatusId INT NOT NULL,
         CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_UserAuth_CreatedAt DEFAULT SYSUTCDATETIME(),
         CONSTRAINT FK_UserAuth_User FOREIGN KEY (UserID) REFERENCES dbo.Users(UserID)
     );
@@ -79,7 +80,7 @@ BEGIN
         EmergencyContactNumber NVARCHAR(20) NULL,
 
         ProfileCompletionPercent INT NOT NULL CONSTRAINT DF_UserProfiles_Completion DEFAULT(0),
-
+		UserStatusId INT NOT NULL,
         CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_UserProfiles_CreatedAt DEFAULT SYSUTCDATETIME(),
         UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_UserProfiles_UpdatedAt DEFAULT SYSUTCDATETIME(),
 
@@ -87,6 +88,16 @@ BEGIN
     );
 END
 GO
+
+IF OBJECT_ID('dbo.UserStatus', 'U') IS NULL
+BEGIN-- Create table
+CREATE TABLE dbo.UserStatus (
+    UserStatusId INT IDENTITY(1,1) NOT NULL
+        CONSTRAINT PK_UserStatus PRIMARY KEY,
+    StatusName   NVARCHAR(50) NOT NULL
+        CONSTRAINT UQ_UserStatus_StatusName UNIQUE
+);
+END
 
 /* =========================================================
    HOSPITALS / STATUS / USERS
@@ -125,6 +136,21 @@ BEGIN
     );
 END
 GO
+
+IF OBJECT_ID('dbo.UserHistory', 'U') IS  NULL
+BEGIN
+-- Create table
+CREATE TABLE dbo.UserHistory (
+    UserId        UNIQUEIDENTIFIER NOT NULL,
+    UserStatusId  INT              NOT NULL,
+    UpdatedBy     UNIQUEIDENTIFIER NOT NULL,
+    UpdatedDate   DATETIME2(3)     NOT NULL 
+        CONSTRAINT DF_UserHistory_UpdatedDate DEFAULT (SYSUTCDATETIME()),
+
+    CONSTRAINT FK_UserHistory_UserStatus
+        FOREIGN KEY (UserStatusId) REFERENCES dbo.UserStatus(UserStatusId)
+);
+END
 
 IF OBJECT_ID('dbo.HospitalProfileStatus','U') IS NULL
 BEGIN
@@ -185,6 +211,7 @@ BEGIN
         DoctorID UNIQUEIDENTIFIER NOT NULL
             CONSTRAINT PK_Doctors PRIMARY KEY
             CONSTRAINT DF_Doctors_DoctorID DEFAULT NEWID(),
+		HospitalID UNIQUEIDENTIFIER NOT NULL,
         UserID UNIQUEIDENTIFIER NOT NULL CONSTRAINT UQ_Doctors_User UNIQUE,
         LicenseNumber NVARCHAR(50) NOT NULL,
         Qualification NVARCHAR(150) NULL,

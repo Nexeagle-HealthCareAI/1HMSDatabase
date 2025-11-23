@@ -280,12 +280,19 @@ WHEN MATCHED AND (ISNULL(t.[Description],N'') <> s.[Description] OR t.IsActive =
 
 SET IDENTITY_INSERT dbo.UserStatus ON;
 
-INSERT INTO dbo.UserStatus (UserStatusId, StatusName)
-VALUES (1, 'Active'),
-       (2, 'Inactive'),
-       (3, 'Revoked');
+MERGE dbo.UserStatus AS t
+USING (VALUES
+    (1, N'Active'),
+    (2, N'Inactive'),
+    (3, N'Revoked')
+) AS s (UserStatusId, StatusName)
+ON t.UserStatusId = s.UserStatusId
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT (UserStatusId, StatusName)
+    VALUES (s.UserStatusId, s.StatusName)
+WHEN MATCHED AND t.StatusName <> s.StatusName THEN
+    UPDATE SET t.StatusName = s.StatusName;
 
 SET IDENTITY_INSERT dbo.UserStatus OFF;
-GO
 
 PRINT N'Global seed executed.';

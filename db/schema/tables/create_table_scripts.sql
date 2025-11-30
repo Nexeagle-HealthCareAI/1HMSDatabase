@@ -557,7 +557,7 @@ BEGIN
         TokenNo INT NOT NULL,
         IsManual BIT NOT NULL CONSTRAINT DF_ApptTok_Manual DEFAULT(0),
         CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_ApptTok_Created DEFAULT SYSUTCDATETIME(),
-        CONSTRAINT UQ_Token_DoctorDateNo UNIQUE (HospitalID, DoctorID, TokenDate, TokenNo),
+        CONSTRAINT UQ_Token_DoctorDateNo UNIQUE (HospitalID, DoctorID, TokenDate),
         CONSTRAINT FK_Tok_App FOREIGN KEY (ApptId) REFERENCES dbo.Appointments(ApptId),
         CONSTRAINT FK_Tok_H   FOREIGN KEY (HospitalID) REFERENCES dbo.Hospitals(HospitalID),
         CONSTRAINT FK_Tok_D   FOREIGN KEY (DoctorID) REFERENCES dbo.Doctors(DoctorID)

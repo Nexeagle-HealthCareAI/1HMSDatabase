@@ -1,4 +1,4 @@
-# azure-pipelines-db.yml (DEV → QA → PROD with IST time gate)
+# azure-pipelines-db.yml (DEV → QA → PROD with IST gate + manual approval)
 
 trigger:
   branches:
@@ -25,21 +25,20 @@ pool:
 parameters:
 - name: deployProd
   type: boolean
-  default: false            # set true at Run time to enable PROD
+  default: false          # set true at Run time to enable PROD
 
 - name: prodReleaseDateIst
   type: string
-  default: ''               # e.g. "2025-12-10 10:30:00" (IST). Leave blank to skip time gate.
+  default: ''             # e.g. "2025-12-10 10:30:00" (IST). Leave blank to skip time gate.
 
 - name: prodEnvironmentName
   type: string
-  default: 'prod'           # change if your Environment is named differently (e.g. 'PROD')
+  default: 'prod'         # Environment name in DevOps (with Approvals & Checks if you like)
 
 stages:
 # ================= DEV =================
 - stage: Dev
   displayName: "DB: deploy → DEV"
-  # Run for release-* and feature/* branches
   condition: >
     or(
       startsWith(variables['Build.SourceBranch'], 'refs/heads/release-'),
@@ -119,18 +118,17 @@ stages:
 - stage: QA
   displayName: "DB: deploy → QA"
   dependsOn: Dev
-  # Only run for release-* branches
   condition: >
     and(
       succeeded(),
       startsWith(variables['Build.SourceBranch'], 'refs/heads/release-')
     )
   variables:
-  - group: 'swa-secrets-qa'   # SqlServer, DatabaseName, SqlUser, SqlPassword (for QA)
+  - group: 'swa-secrets-qa'   # SqlServer, DatabaseName, SqlUser, SqlPassword (QA)
   jobs:
   - deployment: QaJob
     displayName: "Run DB scripts (QA)"
-    environment: QA    # (Optional) add approvals in Azure DevOps Environments
+    environment: QA
     strategy:
       runOnce:
         deploy:
@@ -210,7 +208,7 @@ stages:
       eq('${{ parameters.deployProd }}','true')
     )
   jobs:
-  # 1) Manual approval MUST be a server (agentless) job
+  # 1) Manual approval — agentless job
   - job: WaitForApproval
     displayName: "Manual approval (agentless)"
     pool: server
@@ -222,10 +220,10 @@ stages:
         notifyUsers: ''      # optional emails
         instructions: |
           Approve DB PROD deploy.
-          Release time (IST): ${{ parameters.prodReleaseDateIst }}
+          Planned release time (IST): ${{ parameters.prodReleaseDateIst }}
         onTimeout: 'reject'
 
-  # 2) Time gate runs on a normal agent AFTER approval
+  # 2) Time gate — runs on agent AFTER approval
   - job: TimeGate
     displayName: "Wait until PROD release time (IST)"
     dependsOn: WaitForApproval
@@ -257,3 +255,88 @@ stages:
         done
 
         echo "Reached release time (IST). Proceeding to PROD DB deploy."
+      displayName: "IST time gate"
+
+# ================= PROD =================
+- stage: Prod
+  displayName: "DB: deploy → PROD"
+  dependsOn: Prod_Gate
+  condition: >
+    and(
+      succeeded(),
+      startsWith(variables['Build.SourceBranch'], 'refs/heads/release-'),
+      eq('${{ parameters.deployProd }}','true')
+    )
+  variables:
+  - group: 'swa-secrets-prod'   # SqlServer, DatabaseName, SqlUser, SqlPassword (PROD)
+  jobs:
+  - deployment: ProdJob
+    displayName: "Run DB scripts (PROD)"
+    environment: ${{ parameters.prodEnvironmentName }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            clean: true
+
+          - bash: |
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              sudo apt-get update -y
+              sudo apt-get install -y curl gnupg apt-transport-https software-properties-common
+              . /etc/os-release
+              MS_LIST_URL="https://packages.microsoft.com/config/ubuntu/${VERSION_ID:-22.04}/prod.list"
+              curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg >/dev/null
+              curl -fsSL "$MS_LIST_URL" | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
+              sudo apt-get update -y
+              sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev
+              echo '##vso[task.prependpath]/opt/mssql-tools18/bin'
+              /opt/mssql-tools18/bin/sqlcmd -? >/dev/null
+            displayName: "Install sqlcmd (PROD)"
+
+          - bash: |
+              set -euo pipefail
+              export PATH="$PATH:/opt/mssql-tools18/bin"
+              export SQLCMDPASSWORD="$(SqlPassword)"
+              S="$(SqlServer)"; D="$(DatabaseName)"; U="$(SqlUser)"; PORT=1433
+              echo "Server: $S,$PORT"; echo "DB: $D"; echo "User: $U"
+              sqlcmd -S "$S,$PORT" -d master -U "$U" -l 15 -I -C -Q "SELECT 1" || true
+              tries=20; delay=5; n=1
+              while :; do
+                echo "Check DB state (attempt $n/$tries)..."
+                if sqlcmd -S "$S,$PORT" -d master -U "$U" -l 15 -I -C -h -1 -Q "SET NOCOUNT ON; SELECT state_desc FROM sys.databases WHERE name=N'$D';" | grep -qx ONLINE; then
+                  echo "DB ONLINE"; break
+                fi
+                if sqlcmd -S "$S,$PORT" -d "$D" -U "$U" -l 15 -I -C -Q "SELECT DB_NAME();"; then
+                  echo "Connected to $D"; break
+                fi
+                [ $n -ge $tries ] && { echo "DB not available after $tries attempts"; exit 1; }
+                sleep "$delay"; n=$((n+1)); delay=$(( delay < 30 ? delay*2 : 30 ))
+              done
+            displayName: "Wait for DB ONLINE (PROD)"
+
+          - bash: |
+              set -euo pipefail
+              export PATH="$PATH:/opt/mssql-tools18/bin"
+              export SQLCMDPASSWORD="$(SqlPassword)"
+              ROOT="$(Build.SourcesDirectory)"; S="$(SqlServer),1433"; D="$(DatabaseName)"; U="$(SqlUser)"
+              SQLCMD=(sqlcmd -S "$S" -d "$D" -U "$U" -b -l 60 -I -r 1 -m -1 -e -C)
+
+              run_dir() { d="$1"; label="$2";
+                [ -d "$d" ] || { echo "SKIP: $d"; return 0; }
+                echo "==> $label: $d"
+                find "$d" -maxdepth 1 -type f -name "*.sql" | sort | while read -r f; do
+                  echo "---- RUN: ${f#$ROOT/}"
+                  "${SQLCMD[@]}" -i "$f"
+                done
+              }
+
+              run_dir "$ROOT/db/schema"         "SCHEMA root"
+              run_dir "$ROOT/db/schema/tables"  "TABLES"
+              run_dir "$ROOT/db/schema/indexes" "INDEXES"
+              run_dir "$ROOT/db/schema/views"   "VIEWS"
+              run_dir "$ROOT/db/schema/procs"   "PROCS"
+              run_dir "$ROOT/db/data/seed"      "SEED"
+              echo "PROD deploy completed."
+            displayName: "Execute deploy (PROD)"

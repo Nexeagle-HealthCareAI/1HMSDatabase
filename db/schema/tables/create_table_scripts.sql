@@ -727,4 +727,59 @@ BEGIN
 END
 GO
 
+IF OBJECT_ID('dbo.PrescriptionSettings','U') IS NOT NULL
+  DROP TABLE dbo.PrescriptionSettings;
+GO
+
+CREATE TABLE dbo.PrescriptionSettings
+(
+    PrescriptionSettingId UNIQUEIDENTIFIER NOT NULL
+        CONSTRAINT PK_PrescriptionSettings PRIMARY KEY
+        CONSTRAINT DF_PrescSet_Id DEFAULT NEWID(),
+
+    HospitalId UNIQUEIDENTIFIER NOT NULL,
+    DoctorId   UNIQUEIDENTIFIER NOT NULL,
+
+    HeaderHeight       INT     NULL CONSTRAINT DF_PrescSet_HeaderHeight DEFAULT (20),   -- ~1.33in @72dpi
+    FooterHeight       INT     NULL CONSTRAINT DF_PrescSet_FooterHeight DEFAULT (20),
+    ContentLeftMargin  INT     NULL CONSTRAINT DF_PrescSet_LeftMargin   DEFAULT (5),
+    ContentRightMargin INT     NULL CONSTRAINT DF_PrescSet_RightMargin  DEFAULT (5),
+    OverFlowPage       BIT     NULL CONSTRAINT DF_PrescSet_Overflow     DEFAULT (0),
+
+    FontFamily NVARCHAR(100)  NULL,                          -- e.g., 'Inter', 'Roboto'
+    FontSize   INT            NULL CONSTRAINT DF_PrescSet_FontSize DEFAULT (11),
+    FontWeight NVARCHAR(50)   NULL,                          -- 'normal','bold','100'..'900'
+    TextColour NVARCHAR(50)   NULL,                          -- e.g., '#1F2937'
+    URI        NVARCHAR(2048) NULL,                          -- template/resource URL
+
+    CreatedByUserId UNIQUEIDENTIFIER NULL,                   -- who created last
+    CreatedAt DATETIME2(3) NOT NULL
+        CONSTRAINT DF_PrescriptionSettings_Created DEFAULT SYSUTCDATETIME(),
+    UpdatedAt DATETIME2(3) NOT NULL
+        CONSTRAINT DF_PrescriptionSettings_Updated DEFAULT SYSUTCDATETIME(),
+
+    RowVersion ROWVERSION NOT NULL,
+
+    -- Unique per hospital+doctor
+    CONSTRAINT UQ_PrescSet_H_D UNIQUE (HospitalId, DoctorId),
+
+    -- Basic value guards
+    CONSTRAINT CK_PrescSet_HeaderHeight_Pos  CHECK (HeaderHeight       IS NULL OR HeaderHeight       >= 0),
+    CONSTRAINT CK_PrescSet_FooterHeight_Pos  CHECK (FooterHeight       IS NULL OR FooterHeight       >= 0),
+    CONSTRAINT CK_PrescSet_LeftMargin_Pos    CHECK (ContentLeftMargin  IS NULL OR ContentLeftMargin  >= 0),
+    CONSTRAINT CK_PrescSet_RightMargin_Pos   CHECK (ContentRightMargin IS NULL OR ContentRightMargin >= 0),
+    CONSTRAINT CK_PrescSet_FontSize_Range    CHECK (FontSize           IS NULL OR (FontSize BETWEEN 8 AND 72)),
+    CONSTRAINT CK_PrescSet_FontWeight        CHECK (
+        FontWeight IS NULL OR
+        FontWeight IN (N'normal', N'bold', N'bolder', N'lighter',
+                       N'100',N'200',N'300',N'400',N'500',N'600',N'700',N'800',N'900')
+    ),
+    CONSTRAINT CK_PrescSet_TextColour_Hex CHECK (
+        TextColour IS NULL OR
+        TextColour LIKE N'#________' OR -- #RRGGBB (7 chars) or #RRGGBBAA (9 chars)
+        TextColour LIKE N'#______'
+    )
+);
+
+
 PRINT N'easyHMS schema deployment completed.';

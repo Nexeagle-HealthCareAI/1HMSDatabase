@@ -769,10 +769,6 @@ CREATE TABLE dbo.PrescriptionSettings
     CONSTRAINT CK_PrescSet_LeftMargin_Pos    CHECK (ContentLeftMargin  IS NULL OR ContentLeftMargin  >= 0),
     CONSTRAINT CK_PrescSet_RightMargin_Pos   CHECK (ContentRightMargin IS NULL OR ContentRightMargin >= 0),
     CONSTRAINT CK_PrescSet_FontSize_Range    CHECK (FontSize           IS NULL OR (FontSize BETWEEN 8 AND 72)),
-    CONSTRAINT CK_PrescSet_FontWeight        CHECK (
-        FontWeight IS NULL OR
-        FontWeight IN (N'normal', N'bold', N'bolder', N'lighter',
-                       N'100',N'200',N'300',N'400',N'500',N'600',N'700',N'800',N'900')
     ),
     CONSTRAINT CK_PrescSet_TextColour_Hex CHECK (
         TextColour IS NULL OR

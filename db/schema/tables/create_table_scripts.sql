@@ -610,7 +610,7 @@ BEGIN
         NameLower AS LOWER([Name]) PERSISTED,
         ShortDesc NVARCHAR(500) NULL,
         Synonyms NVARCHAR(MAX) NULL,
-        MetaJson NVARCHAR(MAX) NULL CONSTRAINT CK_LM_MetaJson CHECK (MetaJson IS NULL OR ISJSON(MetaJson)=1),
+        MetaJson NVARCHAR(MAX) NULL,
         IsActive BIT NOT NULL CONSTRAINT DF_LM_IsActive DEFAULT(1),
         IsPinned BIT NOT NULL CONSTRAINT DF_LM_IsPinned DEFAULT(0),
         UsageCount BIGINT NOT NULL CONSTRAINT DF_LM_Usage DEFAULT(0),
@@ -640,7 +640,7 @@ BEGIN
         [Name] NVARCHAR(250) NOT NULL,
         NameLower AS LOWER([Name]) PERSISTED,
         ShortDesc NVARCHAR(500) NULL,
-        MetaJson NVARCHAR(MAX) NULL CONSTRAINT CK_LP_MetaJson CHECK (MetaJson IS NULL OR ISJSON(MetaJson)=1),
+        MetaJson NVARCHAR(MAX) NULL,
 
         IsActive BIT NOT NULL CONSTRAINT DF_LP_IsActive DEFAULT(1),
         IsOverride BIT NOT NULL CONSTRAINT DF_LP_IsOverride DEFAULT(0),

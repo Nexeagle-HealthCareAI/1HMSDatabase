@@ -487,21 +487,7 @@ BEGIN
 END
 GO
 
-------------------------------------------------------------
--- DOCTOR PREFERRED MEDICINE / SECTION PREFERENCES
-------------------------------------------------------------
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'IX_DPM_Doctor_Active_MedName'
-      AND object_id = OBJECT_ID('dbo.DoctorPreferredMedicine')
-)
-BEGIN
-    CREATE NONCLUSTERED INDEX IX_DPM_Doctor_Active_MedName
-    ON dbo.DoctorPreferredMedicine (DoctorId, MedicineName)
-    INCLUDE (BrandName, GenericName, Manufacturer, DosageForm, Strength, UsageCount, Notes)
-    WHERE IsActive = 1;
-END
+
 
 -- DoctorSectionPreferences already has:
 --   PK(PreferenceId) + UNIQUE(HospitalId, DoctorId)

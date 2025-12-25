@@ -665,28 +665,22 @@ IF OBJECT_ID('dbo.DoctorPreferredMedicine','U') IS NULL
 BEGIN
   CREATE TABLE dbo.DoctorPreferredMedicine (
     PreferrredId   BIGINT NOT NULL IDENTITY(1,1) PRIMARY KEY,
-	HospitalID UNIQUEIDENTIFIER NOT NULL,
+	HospitalID     UNIQUEIDENTIFIER NOT NULL,
     DoctorId       UNIQUEIDENTIFIER NOT NULL,
+	MedicineName   NVARCHAR(200)   NOT NULL,
     BrandName      NVARCHAR(150) NULL,
-    GenericName    NVARCHAR(150) NOT NULL DEFAULT N'',
-    Form           NVARCHAR(50)  NULL,
-    StrengthValue  NVARCHAR(50)  NULL,
-    StrengthUnit   NVARCHAR(30)  NULL,
-    Route          NVARCHAR(50)  NULL,
-    Dose           NVARCHAR(50)  NULL,
-    Frequency      NVARCHAR(50)  NULL,
-    DurationValue  NVARCHAR(50)  NULL,
-    DurationUnit   NVARCHAR(30)  NULL,
-    Indication     NVARCHAR(250) NULL,
+    GenericName    NVARCHAR(150) NULL,
+	Manufacturer   NVARCHAR(200) NULL,
+    DosageForm     NVARCHAR(50)  NULL,
+    Strength       NVARCHAR(50)  NULL,
     Notes          NVARCHAR(1000) NULL,
-    MedicineId     NVARCHAR(50)  NULL,
     IsActive       BIT NOT NULL CONSTRAINT DF_DPM_IsActive DEFAULT (1),
     CreatedAt      DATETIME2(3) NOT NULL CONSTRAINT DF_DPM_CreatedAt DEFAULT SYSUTCDATETIME(),
     CreatedBy      NVARCHAR(100) NULL,
     UpdatedAt      DATETIME2(3)  NULL,
     UpdatedBy      NVARCHAR(100) NULL,
     RowVersion     ROWVERSION NOT NULL,
-
+	UsageCount     BIGINT NULL,
     CONSTRAINT FK_DPM_Doctor FOREIGN KEY (DoctorId) REFERENCES dbo.Doctors(DoctorID)
   );
 END

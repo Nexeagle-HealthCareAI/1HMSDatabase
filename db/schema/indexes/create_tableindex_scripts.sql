@@ -490,19 +490,18 @@ GO
 ------------------------------------------------------------
 -- DOCTOR PREFERRED MEDICINE / SECTION PREFERENCES
 ------------------------------------------------------------
-IF OBJECT_ID('dbo.DoctorPreferredMedicine','U') IS NOT NULL
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = 'IX_DPM_Doctor_Active_MedName'
+      AND object_id = OBJECT_ID('dbo.DoctorPreferredMedicine')
+)
 BEGIN
-    -- Common query: all active preferred meds for doctor in a hospital
-    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DPM_HospitalID_DoctorID_IsActive'
-                   AND object_id = OBJECT_ID(N'dbo.DoctorPreferredMedicine'))
-    BEGIN
-        CREATE NONCLUSTERED INDEX IX_DPM_HospitalID_DoctorID_IsActive
-        ON dbo.DoctorPreferredMedicine(HospitalID, DoctorId, IsActive)
-        INCLUDE (BrandName, GenericName, Form, StrengthValue, StrengthUnit,
-                 Route, Dose, Frequency, DurationValue, DurationUnit, Indication);
-    END;
+    CREATE NONCLUSTERED INDEX IX_DPM_Doctor_Active_MedName
+    ON dbo.DoctorPreferredMedicine (DoctorId, MedicineName)
+    INCLUDE (BrandName, GenericName, Manufacturer, DosageForm, Strength, UsageCount, Notes)
+    WHERE IsActive = 1;
 END
-GO
 
 -- DoctorSectionPreferences already has:
 --   PK(PreferenceId) + UNIQUE(HospitalId, DoctorId)

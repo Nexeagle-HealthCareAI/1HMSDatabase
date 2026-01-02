@@ -11,3 +11,15 @@ BEGIN
 
     ALTER TABLE dbo.DoctorPreferredMedicine DROP COLUMN UsageCount;
 END
+
+
+IF COL_LENGTH('dbo.PrescriptionSettings', 'ValidDuration') IS NOT NULL
+BEGIN
+    -- Drop default constraint (only if it exists)
+    IF OBJECT_ID('dbo.DF_PrescSet_ValidDuration', 'D') IS NOT NULL
+        ALTER TABLE dbo.PrescriptionSettings DROP CONSTRAINT DF_PrescSet_ValidDuration;
+
+    -- Drop the column
+    ALTER TABLE dbo.PrescriptionSettings DROP COLUMN ValidDuration;
+END
+GO

@@ -7,3 +7,12 @@ BEGIN
             CONSTRAINT DF_DPM_UsageCount DEFAULT (0);
     END
 END
+
+
+IF COL_LENGTH('dbo.PrescriptionSettings', 'ValidDuration') IS NULL
+BEGIN
+    ALTER TABLE dbo.PrescriptionSettings
+      ADD ValidDuration INT NOT NULL
+        CONSTRAINT DF_PrescSet_ValidDuration DEFAULT (15) WITH VALUES;
+END
+GO

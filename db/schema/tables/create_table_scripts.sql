@@ -673,7 +673,7 @@ BEGIN
 	Manufacturer   NVARCHAR(200) NULL,
     DosageForm     NVARCHAR(50)  NULL,
     Strength       NVARCHAR(50)  NULL,
-	UsageDescription          NVARCHAR(500) NULL,
+	Usage          NVARCHAR(500) NULL,
 	SideEffects    NVARCHAR(500) NULL,
 	Price          INT NULL,
     Notes          NVARCHAR(1000) NULL,

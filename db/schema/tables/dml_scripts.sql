@@ -16,3 +16,16 @@ BEGIN
         CONSTRAINT DF_PrescSet_ValidDuration DEFAULT (15) WITH VALUES;
 END
 GO
+
+IF EXISTS (
+    SELECT 1
+    FROM sys.key_constraints kc
+    WHERE kc.name = N'UQ_Token_DoctorDateNo'
+      AND kc.parent_object_id = OBJECT_ID(N'dbo.AppointmentTokens')
+)
+BEGIN
+    ALTER TABLE [dbo].[AppointmentTokens]
+        DROP CONSTRAINT [UQ_Token_DoctorDateNo];
+
+    PRINT 'Dropped constraint [UQ_Token_DoctorDateNo] from [dbo].[AppointmentTokens].';
+END

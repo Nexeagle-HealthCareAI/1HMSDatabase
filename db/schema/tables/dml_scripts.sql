@@ -29,3 +29,12 @@ BEGIN
 
     PRINT 'Dropped constraint [UQ_Token_DoctorDateNo] from [dbo].[AppointmentTokens].';
 END
+
+
+IF COL_LENGTH('dbo.Appointments', 'PdfUrl') IS NULL
+BEGIN
+    ALTER TABLE dbo.Appointments
+    ADD PdfUrl NVARCHAR(500) NULL;
+END
+GO
+

@@ -23,3 +23,10 @@ BEGIN
     ALTER TABLE dbo.PrescriptionSettings DROP COLUMN ValidDuration;
 END
 GO
+
+IF COL_LENGTH('dbo.Appointments', 'PdfUrl') IS NOT NULL
+BEGIN
+    ALTER TABLE dbo.Appointments
+    DROP COLUMN PdfUrl;
+END
+GO

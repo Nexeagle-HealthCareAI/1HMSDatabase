@@ -38,3 +38,9 @@ BEGIN
 END
 GO
 
+
+IF COL_LENGTH('dbo.Appointments', 'ValidUptoDate') IS NULL
+BEGIN
+    ALTER TABLE dbo.Appointments
+    ADD ValidUptoDate DATE NULL;
+END

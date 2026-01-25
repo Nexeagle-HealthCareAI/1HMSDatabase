@@ -30,3 +30,9 @@ BEGIN
     DROP COLUMN PdfUrl;
 END
 GO
+
+IF COL_LENGTH('dbo.Appointments', 'ValidUptoDate') IS NOT NULL
+BEGIN
+    ALTER TABLE dbo.Appointments
+    DROP COLUMN ValidUptoDate;
+END

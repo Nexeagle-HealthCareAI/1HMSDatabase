@@ -1,5 +1,3 @@
-# azure-pipelines-db.yml (DEV → PROD with IST gate + manual approval)
-
 trigger:
   branches:
     include:

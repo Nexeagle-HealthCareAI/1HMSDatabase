@@ -13,7 +13,7 @@ IF COL_LENGTH('dbo.PrescriptionSettings', 'ValidDuration') IS NULL
 BEGIN
     ALTER TABLE dbo.PrescriptionSettings
       ADD ValidDuration INT NOT NULL
-        CONSTRAINT DF_PrescSet_ValidDuration DEFAULT (15) WITH VALUES;
+        CONSTRAINT DF_PrescSet_ValidDuration DEFAULT (0) WITH VALUES;
 END
 GO
 

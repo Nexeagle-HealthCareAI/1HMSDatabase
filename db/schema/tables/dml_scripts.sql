@@ -44,3 +44,9 @@ BEGIN
     ALTER TABLE dbo.Appointments
     ADD ValidUptoDate DATE NULL;
 END
+
+IF COL_LENGTH('dbo.PrescriptionMedicine', 'DisplayOrder') IS NULL
+BEGIN
+    ALTER TABLE dbo.PrescriptionMedicine
+    ADD DisplayOrder INT NULL;
+END

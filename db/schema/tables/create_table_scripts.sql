@@ -724,10 +724,8 @@ BEGIN
 END
 GO
 
-IF OBJECT_ID('dbo.PrescriptionSettings','U') IS NOT NULL
-  DROP TABLE dbo.PrescriptionSettings;
-GO
-
+IF OBJECT_ID('dbo.PrescriptionSettings','U') IS  NULL
+BEGIN
 CREATE TABLE dbo.PrescriptionSettings
 (
     PrescriptionSettingId UNIQUEIDENTIFIER NOT NULL
@@ -772,6 +770,6 @@ CREATE TABLE dbo.PrescriptionSettings
         TextColour LIKE N'#______'
     )
 );
-
+END
 
 PRINT N'easyHMS schema deployment completed.';

@@ -42,3 +42,8 @@ BEGIN
     ALTER TABLE dbo.PrescriptionMedicine
     DROP COLUMN DisplayOrder;
 END
+IF COL_LENGTH('dbo.Appointments', 'EncounterId') IS NOT NULL
+BEGIN
+    ALTER TABLE dbo.Appointments
+    DROP COLUMN EncounterId;
+END

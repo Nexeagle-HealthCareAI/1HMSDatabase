@@ -50,3 +50,9 @@ BEGIN
     ALTER TABLE dbo.PrescriptionMedicine
     ADD DisplayOrder INT NULL;
 END
+
+IF COL_LENGTH('dbo.Appointments', 'EncounterId') IS NULL
+BEGIN
+    ALTER TABLE dbo.Appointments
+    ADD EncounterId UNIQUEIDENTIFIER NULL;
+END

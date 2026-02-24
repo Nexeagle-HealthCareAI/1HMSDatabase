@@ -56,3 +56,15 @@ BEGIN
     ALTER TABLE dbo.Appointments
     ADD EncounterId UNIQUEIDENTIFIER NULL;
 END
+
+IF EXISTS (
+    SELECT 1
+    FROM sys.key_constraints
+    WHERE name = 'UQ_Roles'
+      AND parent_object_id = OBJECT_ID('dbo.Roles')
+)
+BEGIN
+    ALTER TABLE [dbo].[Roles]
+    DROP CONSTRAINT [UQ_Roles];
+END
+GO

@@ -1,8 +1,3 @@
-/* ============================================================
-   ROLLBACK SCRIPT
-   Drops billing/encounter/master tables created in this batch
-   Safe to run multiple times
-   ============================================================ */
 
 SET NOCOUNT ON;
 GO

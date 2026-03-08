@@ -108,11 +108,6 @@ BEGIN
     -- BedCode uniqueness
     CONSTRAINT UX_BM_Code UNIQUE (HospitalId, BedCode),
 
-    -- Checks
-    CONSTRAINT CK_BM_WardType CHECK (WardType IN ('GENERAL','ICU','NICU','PRIVATE','SEMI_PRIVATE','OTHER')),
-    CONSTRAINT CK_BM_Status CHECK (StatusCode IN ('AVAILABLE','OCCUPIED','CLEANING','RESERVED','BLOCKED')),
-    CONSTRAINT CK_BM_Gender CHECK (GenderRestriction IS NULL OR GenderRestriction IN ('MALE','FEMALE','ANY')),
-    CONSTRAINT CK_BM_RoomType CHECK (RoomType IS NULL OR RoomType IN ('GENERAL','PRIVATE','SEMI_PRIVATE','ICU','NICU','OTHER')),
     CONSTRAINT CK_BM_Capacity CHECK (CapacityInRoom IS NULL OR CapacityInRoom > 0),
     CONSTRAINT CK_BM_WardRoomRate CHECK (WardRoomDailyRate >= 0),
     CONSTRAINT CK_BM_BedOverrideRate CHECK (BedDailyRateOverride IS NULL OR BedDailyRateOverride >= 0)
@@ -429,6 +424,3 @@ BEGIN
     CONSTRAINT PK_BillingAuditLog PRIMARY KEY CLUSTERED (BillingAuditId)
   );
 END
-
-
-

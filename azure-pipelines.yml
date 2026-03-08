@@ -19,19 +19,14 @@ pr:
 pool:
   vmImage: ubuntu-latest
 
-# ---------------- Parameters for PROD control ----------------
 parameters:
 - name: deployProd
   type: boolean
-  default: false          # set true at Run time to enable PROD
-
-- name: prodReleaseDateIst
-  type: string
-  default: ''             # e.g. "2025-12-10 10:30:00" (IST). Leave blank to skip time gate.
+  default: false
 
 - name: prodEnvironmentName
   type: string
-  default: 'prod'         # Environment name in DevOps (with Approvals & Checks if you like)
+  default: 'prod'
 
 stages:
 # ================= DEV =================
@@ -43,7 +38,7 @@ stages:
       startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')
     )
   variables:
-  - group: 'swa-secrets-dev'   # SqlServer, DatabaseName, SqlUser, SqlPassword
+  - group: 'swa-secrets-dev'
   jobs:
   - job: DevJob
     displayName: "Run DB scripts (DEV)"
@@ -112,9 +107,9 @@ stages:
         echo "DEV deploy completed."
       displayName: "Execute deploy (DEV)"
 
-# ================= PROD Gate (manual + IST time) =================
-- stage: Prod_Gate
-  displayName: "DB: PROD gate (manual + date gate IST)"
+# ================= PROD =================
+- stage: Prod
+  displayName: "DB: deploy → PROD"
   dependsOn: Dev
   condition: >
     and(
@@ -122,68 +117,8 @@ stages:
       startsWith(variables['Build.SourceBranch'], 'refs/heads/release-'),
       eq('${{ parameters.deployProd }}','true')
     )
-  jobs:
-  # 1) Manual approval — agentless job
-  - job: WaitForApproval
-    displayName: "Manual approval (agentless)"
-    pool: server
-    timeoutInMinutes: 4320   # up to 3 days
-    steps:
-    - task: ManualValidation@0
-      displayName: 'Approve PROD DB deployment'
-      inputs:
-        notifyUsers: ''      # optional emails
-        instructions: |
-          Approve DB PROD deploy.
-          Planned release time (IST): ${{ parameters.prodReleaseDateIst }}
-        onTimeout: 'reject'
-
-  # 2) Time gate — runs on agent AFTER approval
-  - job: TimeGate
-    displayName: "Wait until PROD release time (IST)"
-    dependsOn: WaitForApproval
-    steps:
-    - bash: |
-        set -euo pipefail
-        REL_IST='${{ parameters.prodReleaseDateIst }}'
-
-        if [ -z "$REL_IST" ]; then
-          echo "No prodReleaseDateIst provided; continuing without time gate."
-          exit 0
-        fi
-
-        target_epoch=$(TZ=Asia/Kolkata date -d "$REL_IST" +%s 2>/dev/null || true)
-        if [ -z "$target_epoch" ]; then
-          echo "Invalid prodReleaseDateIst. Use 'YYYY-MM-DD HH:MM:SS' (IST)."
-          exit 1
-        fi
-
-        echo "Target release (IST): $REL_IST"
-        echo "Current (IST): $(TZ=Asia/Kolkata date +'%Y-%m-%d %H:%M:%S %Z')"
-
-        now_epoch=$(date +%s)
-        while [ "$now_epoch" -lt "$target_epoch" ]; do
-          rem=$(( target_epoch - now_epoch ))
-          printf 'Waiting %s seconds until %s IST...\n' "$rem" "$REL_IST"
-          sleep 15
-          now_epoch=$(date +%s)
-        done
-
-        echo "Reached release time (IST). Proceeding to PROD DB deploy."
-      displayName: "IST time gate"
-
-# ================= PROD =================
-- stage: Prod
-  displayName: "DB: deploy → PROD"
-  dependsOn: Prod_Gate
-  condition: >
-    and(
-      succeeded(),
-      startsWith(variables['Build.SourceBranch'], 'refs/heads/release-'),
-      eq('${{ parameters.deployProd }}','true')
-    )
   variables:
-  - group: 'swa-secrets-prod'   # SqlServer, DatabaseName, SqlUser, SqlPassword (PROD)
+  - group: 'swa-secrets-prod'
   jobs:
   - deployment: ProdJob
     displayName: "Run DB scripts (PROD)"

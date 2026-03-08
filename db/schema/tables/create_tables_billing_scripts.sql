@@ -1,328 +1,434 @@
-/* =========================================================
-   FIXED CREATE SCRIPT (SQL Server)
-   - Removed trailing commas before );
-   - Added missing END; blocks
-   - Kept your design exactly, only syntax fixes
-   - (Optional improvements NOT added: defaults/unique/checks)
-   ========================================================= */
-
-SET NOCOUNT ON;
-
-IF OBJECT_ID('dbo.BillingChargeCatalog', 'U') IS NULL
+IF OBJECT_ID('dbo.ChargeMaster','U') IS NULL
 BEGIN
-  CREATE TABLE dbo.BillingChargeCatalog
+  CREATE TABLE dbo.ChargeMaster
   (
-      ChargeItemId              UNIQUEIDENTIFIER NOT NULL
-          CONSTRAINT DF_BCC_Id DEFAULT NEWSEQUENTIALID(),
+    ChargeId            UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_CM_Id DEFAULT NEWSEQUENTIALID(),
 
-      HospitalId                UNIQUEIDENTIFIER NOT NULL,
+    HospitalId          UNIQUEIDENTIFIER NOT NULL,
 
-      DisplayName               NVARCHAR(200)    NOT NULL,  -- displayName
+    -- Human readable code (optional but helpful)
+    ChargeCode          NVARCHAR(50)     NOT NULL,   -- e.g., CONS001, BED_GW, LAB_CBC, RAD_XR_CHEST
 
-      VisitType                 NVARCHAR(20)     NOT NULL,  -- visitType enum
+    DisplayName         NVARCHAR(200)    NOT NULL,   -- what users see on UI & invoice
 
-      DefaultRate               DECIMAL(18,2)    NOT NULL
-          CONSTRAINT DF_BCC_DefaultRate DEFAULT (0),        -- defaultRate
+    -- Category grouping
+    CategoryCode        NVARCHAR(30)     NOT NULL,   -- CONSULT / BED / LAB / RAD / PROCEDURE / SERVICE / CONSUMABLE / OTHER
+    SubCategoryCode     NVARCHAR(50)     NULL,       -- optional: Pathology, Radiology, ICU, OT, etc.
 
-      DefaultDiscountPercent    DECIMAL(5,2)     NULL,      -- defaultDiscountPercent (0-100)
+    -- Where it applies
+    AppliesTo           NVARCHAR(20)     NOT NULL,   -- OPD / IPD / LAB / RAD / PHARMACY / ANY
 
-      DefaultQty                DECIMAL(10,2)    NOT NULL
-          CONSTRAINT DF_BCC_DefaultQty DEFAULT (1),         -- defaultQty
+    -- Pricing
+    DefaultRate         DECIMAL(18,2)    NOT NULL CONSTRAINT DF_CM_Rate DEFAULT (0),
+    DefaultQty          DECIMAL(10,2)    NOT NULL CONSTRAINT DF_CM_Qty DEFAULT (1),
 
-      UpdatedAt                 DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_BCC_UpdatedAt DEFAULT (SYSUTCDATETIME()),
-      UpdatedBy                 NVARCHAR(100)    NULL,
+    -- Discount cap for this charge (optional; if null use BillingPolicy)
+    MaxDiscountPercent  DECIMAL(5,2)     NULL,
 
-      CONSTRAINT PK_BillingChargeCatalog PRIMARY KEY CLUSTERED (ChargeItemId),
+    IsActive            BIT              NOT NULL CONSTRAINT DF_CM_Active DEFAULT (1),
+    SortOrder           INT              NOT NULL CONSTRAINT DF_CM_Sort DEFAULT (0),
 
-      CONSTRAINT CK_BCC_VisitType CHECK (VisitType IN
-          ('OPD','LAB','PHARMACY','IPD','ER','OTHER')),
+    Notes               NVARCHAR(300)    NULL,
 
-      CONSTRAINT CK_BCC_DefaultRate CHECK (DefaultRate >= 0),
+    CreatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_CM_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy           NVARCHAR(100)    NULL,
+    UpdatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_CM_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy           NVARCHAR(100)    NULL,
 
-      CONSTRAINT CK_BCC_DefaultQty CHECK (DefaultQty > 0)
+    CONSTRAINT PK_ChargeMaster PRIMARY KEY CLUSTERED (ChargeId),
+
+    CONSTRAINT UX_CM_Code UNIQUE (HospitalId, ChargeCode),
+
+    CONSTRAINT CK_CM_Rate CHECK (DefaultRate >= 0),
+    CONSTRAINT CK_CM_Qty CHECK (DefaultQty > 0),
+    CONSTRAINT CK_CM_Discount CHECK (MaxDiscountPercent IS NULL OR (MaxDiscountPercent >= 0 AND MaxDiscountPercent <= 100)),
   );
-END;
+END
 GO
 
-
-IF OBJECT_ID('dbo.InvoicePrintSettings', 'U') IS NULL
+IF OBJECT_ID('dbo.BedMaster','U') IS NULL
 BEGIN
-  CREATE TABLE dbo.InvoicePrintSettings
+  CREATE TABLE dbo.BedMaster
   (
-      InvoicePrintId        UNIQUEIDENTIFIER NOT NULL,
-      HospitalId            UNIQUEIDENTIFIER NOT NULL,
+    BedId              UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_BM_Id DEFAULT NEWSEQUENTIALID(),
 
-      HeaderHeight          INT              NULL,
-      FooterHeight          INT              NULL,
-      ContentLeftMargin     INT              NULL,
-      ContentRightMargin    INT              NULL,
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
 
-      OverFlowPage          BIT              NULL,
+    -- Grouping
+    WardCode           NVARCHAR(30)     NOT NULL,   -- ICU, GW, NICU, PRI
+    WardName           NVARCHAR(100)    NOT NULL,
+    WardType           NVARCHAR(20)     NOT NULL,   -- GENERAL/ICU/NICU/PRIVATE/SEMI_PRIVATE/OTHER
+    FloorNo            NVARCHAR(20)     NULL,
 
-      FontFamily            NVARCHAR(100)    NULL,
-      FontSize              INT              NULL,
-      FontWeight            NVARCHAR(50)     NULL,
-      TextColour            NVARCHAR(50)     NULL,
+    RoomCode           NVARCHAR(30)     NULL,       -- R101 (NULL for open wards)
+    RoomType           NVARCHAR(20)     NULL,       -- PRIVATE/SEMI_PRIVATE/GENERAL/ICU etc.
+    CapacityInRoom     INT              NULL,       -- optional
 
-      URI                   NVARCHAR(2048)   NULL, -- template / header image / html url etc.
+    -- Rate set at Ward+Room level (same for beds in same WardCode+RoomCode)
+    WardRoomDailyRate  DECIMAL(18,2)    NOT NULL
+      CONSTRAINT DF_BM_WardRoomRate DEFAULT (0),
 
-      CreatedByUserId       UNIQUEIDENTIFIER NULL,
+    -- Optional override at bed level
+    BedDailyRateOverride DECIMAL(18,2)  NULL,
 
-      CreatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_IPS_CreatedAt DEFAULT SYSUTCDATETIME(),
-      UpdatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_IPS_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    -- Bed identity
+    BedCode            NVARCHAR(30)     NOT NULL,   -- unique per hospital (ICU-12)
+    BedName            NVARCHAR(100)    NULL,
 
-      CONSTRAINT PK_InvoicePrintSettings PRIMARY KEY CLUSTERED (InvoicePrintId),
+    -- Occupancy
+    StatusCode         NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_BM_Status DEFAULT ('AVAILABLE'),
+      -- AVAILABLE/OCCUPIED/CLEANING/RESERVED/BLOCKED
 
-      CONSTRAINT CK_IPS_HeaderHeight CHECK (HeaderHeight IS NULL OR HeaderHeight >= 0),
-      CONSTRAINT CK_IPS_FooterHeight CHECK (FooterHeight IS NULL OR FooterHeight >= 0),
-      CONSTRAINT CK_IPS_LeftMargin   CHECK (ContentLeftMargin IS NULL OR ContentLeftMargin >= 0),
-      CONSTRAINT CK_IPS_RightMargin  CHECK (ContentRightMargin IS NULL OR ContentRightMargin >= 0),
-      CONSTRAINT CK_IPS_FontSize     CHECK (FontSize IS NULL OR FontSize >= 0)
+    GenderRestriction  NVARCHAR(10)     NULL,       -- MALE/FEMALE/ANY
+
+    IsActive           BIT              NOT NULL
+      CONSTRAINT DF_BM_Active DEFAULT (1),
+
+    SortOrder          INT              NOT NULL
+      CONSTRAINT DF_BM_Sort DEFAULT (0),
+
+    LastStatusAt       DATETIME2(3)     NOT NULL
+      CONSTRAINT DF_BM_LastStatus DEFAULT SYSUTCDATETIME(),
+
+    CreatedAt          DATETIME2(3)     NOT NULL
+      CONSTRAINT DF_BM_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy          NVARCHAR(100)    NULL,
+
+    UpdatedAt          DATETIME2(3)     NOT NULL
+      CONSTRAINT DF_BM_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy          NVARCHAR(100)    NULL,
+
+    RowVersion         ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_BedMaster PRIMARY KEY CLUSTERED (BedId),
+
+    -- BedCode uniqueness
+    CONSTRAINT UX_BM_Code UNIQUE (HospitalId, BedCode),
+
+    -- Checks
+    CONSTRAINT CK_BM_WardType CHECK (WardType IN ('GENERAL','ICU','NICU','PRIVATE','SEMI_PRIVATE','OTHER')),
+    CONSTRAINT CK_BM_Status CHECK (StatusCode IN ('AVAILABLE','OCCUPIED','CLEANING','RESERVED','BLOCKED')),
+    CONSTRAINT CK_BM_Gender CHECK (GenderRestriction IS NULL OR GenderRestriction IN ('MALE','FEMALE','ANY')),
+    CONSTRAINT CK_BM_RoomType CHECK (RoomType IS NULL OR RoomType IN ('GENERAL','PRIVATE','SEMI_PRIVATE','ICU','NICU','OTHER')),
+    CONSTRAINT CK_BM_Capacity CHECK (CapacityInRoom IS NULL OR CapacityInRoom > 0),
+    CONSTRAINT CK_BM_WardRoomRate CHECK (WardRoomDailyRate >= 0),
+    CONSTRAINT CK_BM_BedOverrideRate CHECK (BedDailyRateOverride IS NULL OR BedDailyRateOverride >= 0)
   );
-END;
+END
 GO
 
-
-IF OBJECT_ID('dbo.Encounter', 'U') IS NULL
+-- Fast search index
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_CM_Search' AND object_id=OBJECT_ID('dbo.ChargeMaster'))
 BEGIN
-  CREATE TABLE dbo.Encounter
-  (
-      EncounterId        UNIQUEIDENTIFIER NOT NULL
-          CONSTRAINT DF_Encounter_Id DEFAULT NEWSEQUENTIALID(),
-
-      HospitalId         UNIQUEIDENTIFIER NOT NULL,
-      PatientId          NVARCHAR(20)     NOT NULL,
-
-      -- OPD / IPD / ER / LAB / PHARMACY / OTHER
-      EncounterTypeCode  NVARCHAR(20)     NOT NULL,
-
-      -- Optional origin tracking (recommended)
-      -- e.g. OPD: SourceType='APPOINTMENT', SourceId=ApptId
-      SourceType         NVARCHAR(30)     NULL,
-      SourceId           UNIQUEIDENTIFIER NULL,
-
-      PrimaryDoctorId    UNIQUEIDENTIFIER NULL,
-
-      -- OPEN / CLOSED / CANCELLED (visit lifecycle)
-      StatusCode         NVARCHAR(20)     NOT NULL
-          CONSTRAINT DF_Encounter_Status DEFAULT 'OPEN',
-
-      CreatedAt          DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_Encounter_CreatedAt DEFAULT SYSUTCDATETIME(),
-      CreatedBy          NVARCHAR(100)    NULL,
-
-      UpdatedAt          DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_Encounter_UpdatedAt DEFAULT SYSUTCDATETIME(),
-      UpdatedBy          NVARCHAR(100)    NULL,
-
-      RowVersion         ROWVERSION       NOT NULL,
-
-      CONSTRAINT PK_Encounter PRIMARY KEY CLUSTERED (EncounterId)
-  );
-END;
+  CREATE INDEX IX_CM_Search
+  ON dbo.ChargeMaster(HospitalId, IsActive, CategoryCode, AppliesTo, DisplayName)
+  INCLUDE (ChargeCode, DefaultRate, DefaultQty, SortOrder);
+END
 GO
 
+IF OBJECT_ID('dbo.Encounter','U') IS NULL
+BEGIN
+CREATE TABLE dbo.Encounter
+(
+    EncounterId        UNIQUEIDENTIFIER NOT NULL
+        DEFAULT NEWSEQUENTIALID(),
 
-IF OBJECT_ID('dbo.BillingInvoice', 'U') IS NULL
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
+    PatientId          NVARCHAR(20)     NOT NULL,
+
+    EncounterTypeCode  NVARCHAR(20)     NOT NULL,  -- OPD/IPD/ER/LAB/PHARMACY
+
+    SourceType         NVARCHAR(30)     NULL,
+    SourceId           UNIQUEIDENTIFIER NULL,
+
+    PrimaryDoctorId    UNIQUEIDENTIFIER NULL,
+
+    StatusCode         NVARCHAR(20)     NOT NULL DEFAULT 'OPEN',
+
+    CreatedAt          DATETIME2(3)     NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy          NVARCHAR(100)    NULL,
+
+    UpdatedAt          DATETIME2(3)     NOT NULL DEFAULT SYSUTCDATETIME(),
+    UpdatedBy          NVARCHAR(100)    NULL,
+
+    RowVersion         ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_Encounter PRIMARY KEY CLUSTERED (EncounterId)
+);
+END
+
+IF OBJECT_ID('dbo.BillingChargeEventLedger','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.BillingChargeEventLedger
+  (
+    ChargeEventId      UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_BCE_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
+    PatientId          NVARCHAR(20)     NOT NULL,     -- keep for now; later replace/add PatientUid UNIQUEIDENTIFIER
+    EncounterId        UNIQUEIDENTIFIER NULL,
+
+    SourceModule       NVARCHAR(30)     NOT NULL,     -- MANUAL/OPD/IPD/LAB_PATH/LAB_RAD/PHARMACY_IPD/PHARMACY_COUNTER
+    SourceRefId        NVARCHAR(100)    NULL,         -- idempotency key from module
+    CategoryCode       NVARCHAR(30)     NOT NULL,     -- CONSULT/LAB/RAD/PHARMACY/BED/PROCEDURE/CONSUMABLE/OTHER
+
+    DisplayName        NVARCHAR(300)    NOT NULL,
+    Qty                DECIMAL(10,2)    NOT NULL CONSTRAINT DF_BCE_Qty DEFAULT (1),
+    UnitPrice          DECIMAL(18,2)    NOT NULL CONSTRAINT DF_BCE_UnitPrice DEFAULT (0),
+
+    GrossAmount        AS (Qty * UnitPrice) PERSISTED,
+    DiscountAmount     DECIMAL(18,2)    NULL,
+    NetAmount          DECIMAL(18,2)    NOT NULL,
+
+    StatusCode         NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_BCE_Status DEFAULT ('DRAFT'),     -- DRAFT/POSTED/INVOICED/VOID
+
+    ServiceDate        DATETIME2(3)     NOT NULL
+      CONSTRAINT DF_BCE_ServiceDate DEFAULT SYSUTCDATETIME(),
+
+    PostedAt           DATETIME2(3)     NULL,
+    PostedBy           NVARCHAR(100)    NULL,
+
+    VoidedAt           DATETIME2(3)     NULL,
+    VoidedBy           NVARCHAR(100)    NULL,
+    VoidReason         NVARCHAR(300)    NULL,
+
+    MetaJson           NVARCHAR(MAX)    NULL,
+
+    CreatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_BCE_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy          NVARCHAR(100)    NULL,
+
+    UpdatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_BCE_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy          NVARCHAR(100)    NULL,
+
+    CONSTRAINT PK_BillingChargeEvent PRIMARY KEY CLUSTERED (ChargeEventId),
+
+    CONSTRAINT CK_BCE_UnitPrice CHECK (UnitPrice >= 0),
+    CONSTRAINT CK_BCE_Discount CHECK (DiscountAmount IS NULL OR DiscountAmount >= 0)
+  );
+END
+
+
+IF OBJECT_ID('dbo.BillingInvoice','U') IS NULL
 BEGIN
   CREATE TABLE dbo.BillingInvoice
   (
-      InvoiceId        UNIQUEIDENTIFIER NOT NULL
-          CONSTRAINT DF_BI_Id DEFAULT NEWSEQUENTIALID(),
+    InvoiceId       UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_INV_Id DEFAULT NEWSEQUENTIALID(),
 
-      HospitalId       UNIQUEIDENTIFIER NOT NULL,
-      PatientId        NVARCHAR(20)     NOT NULL,
-      EncounterId      UNIQUEIDENTIFIER NOT NULL,
+    HospitalId      UNIQUEIDENTIFIER NOT NULL,
+    PatientId       NVARCHAR(20)     NOT NULL,
+    EncounterId     UNIQUEIDENTIFIER NULL,
 
-      InvoiceNo        NVARCHAR(30)     NOT NULL, -- human readable unique
-      InvoiceDate      DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_BI_InvoiceDate DEFAULT SYSUTCDATETIME(),
+    InvoiceNo       NVARCHAR(30)     NOT NULL,
+    InvoiceDate     DATETIME2(3)     NOT NULL CONSTRAINT DF_INV_Date DEFAULT SYSUTCDATETIME(),
 
-      -- DRAFT / OPEN / FINALIZED / CANCELLED
-      StatusCode       NVARCHAR(20)     NOT NULL
-          CONSTRAINT DF_BI_Status DEFAULT 'DRAFT',
+    StatusCode      NVARCHAR(20)     NOT NULL CONSTRAINT DF_INV_Status DEFAULT ('DRAFT'), -- DRAFT/FINALIZED/CANCELLED
+    FinalizedAt     DATETIME2(3)     NULL,
+    FinalizedBy     NVARCHAR(100)    NULL,
 
-      FinalizedAt      DATETIME2(3)     NULL,
-      FinalizedBy      NVARCHAR(100)    NULL,
+    CancelledAt     DATETIME2(3)     NULL,
+    CancelledBy     NVARCHAR(100)    NULL,
+    CancelReason    NVARCHAR(300)    NULL,
 
-      CancelledAt      DATETIME2(3)     NULL,
-      CancelledBy      NVARCHAR(100)    NULL,
-      CancelReason     NVARCHAR(300)    NULL,
+    GrossAmount     DECIMAL(18,2)    NULL,
+    DiscountAmount  DECIMAL(18,2)    NULL,
+    NetAmount       DECIMAL(18,2)    NULL,
 
-      -- Optional stored totals (you can compute too)
-      GrossAmount      DECIMAL(18,2)    NULL,
-      DiscountAmount   DECIMAL(18,2)    NULL,
-      NetAmount        DECIMAL(18,2)    NULL,
+    CreatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_INV_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy       NVARCHAR(100)    NULL,
+    UpdatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_INV_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy       NVARCHAR(100)    NULL,
 
-      CreatedAt        DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_BI_CreatedAt DEFAULT SYSUTCDATETIME(),
-      CreatedBy        NVARCHAR(100)    NULL,
+    RowVersion      ROWVERSION       NOT NULL,
 
-      UpdatedAt        DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_BI_UpdatedAt DEFAULT SYSUTCDATETIME(),
-      UpdatedBy        NVARCHAR(100)    NULL,
-
-      CONSTRAINT PK_BillingInvoice PRIMARY KEY CLUSTERED (InvoiceId),
-
-      CONSTRAINT FK_BI_Encounter FOREIGN KEY (EncounterId)
-        REFERENCES dbo.Encounter(EncounterId),
-
-      CONSTRAINT CK_BI_Totals CHECK (
-        (GrossAmount IS NULL OR GrossAmount >= 0) AND
-        (DiscountAmount IS NULL OR DiscountAmount >= 0) AND
-        (NetAmount IS NULL OR NetAmount >= 0)
-      )
+    CONSTRAINT PK_BillingInvoice PRIMARY KEY CLUSTERED (InvoiceId)
   );
-END;
-GO
+END
 
 
-IF OBJECT_ID('dbo.BillingInvoiceLine', 'U') IS NULL
+IF OBJECT_ID('dbo.BillingInvoiceChargeEvent','U') IS NULL
 BEGIN
-  CREATE TABLE dbo.BillingInvoiceLine
+  CREATE TABLE dbo.BillingInvoiceChargeEvent
   (
-      LineId           UNIQUEIDENTIFIER NOT NULL
-          CONSTRAINT DF_BIL_Id DEFAULT NEWSEQUENTIALID(),
+    InvoiceId      UNIQUEIDENTIFIER NOT NULL,
+    ChargeEventId  UNIQUEIDENTIFIER NOT NULL,
 
-      InvoiceId        UNIQUEIDENTIFIER NOT NULL,
+    CONSTRAINT PK_BICE PRIMARY KEY CLUSTERED (InvoiceId, ChargeEventId),
 
-      -- denormalized for fast filters
-      HospitalId       UNIQUEIDENTIFIER NOT NULL,
-      PatientId        NVARCHAR(20)     NOT NULL,
-      EncounterId      UNIQUEIDENTIFIER NOT NULL,
+    CONSTRAINT FK_BICE_Invoice FOREIGN KEY (InvoiceId)
+      REFERENCES dbo.BillingInvoice(InvoiceId),
 
-      ServiceDate      DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_BIL_ServiceDate DEFAULT SYSUTCDATETIME(),
-
-      -- OPD / LAB / PHARMACY / IPD / ER
-      VisitTypeCode    NVARCHAR(20)     NOT NULL,
-
-      -- CHARGE / ADJUSTMENT (ADJUSTMENT can be negative net)
-      EntryType        NVARCHAR(20)     NOT NULL
-          CONSTRAINT DF_BIL_EntryType DEFAULT 'CHARGE',
-
-      Particulars      NVARCHAR(300)    NOT NULL,
-
-      Qty              DECIMAL(10,2)    NOT NULL
-          CONSTRAINT DF_BIL_Qty DEFAULT (1),
-
-      Rate             DECIMAL(18,2)    NOT NULL
-          CONSTRAINT DF_BIL_Rate DEFAULT (0),
-
-      Amount           AS (Qty * Rate) PERSISTED,
-
-      DiscountPercent  DECIMAL(5,2)     NULL,
-      DiscountAmount   DECIMAL(18,2)    NULL,
-
-      NetAmount        DECIMAL(18,2)    NOT NULL,
-
-      -- Traceability / anti-duplicate when importing from Lab/Pharmacy/Catalog
-      SourceType       NVARCHAR(30)     NULL,            -- LAB_ORDER_ITEM, PHARMACY_SALE_ITEM, CATALOG_ITEM, MANUAL
-      SourceId         UNIQUEIDENTIFIER NULL,
-
-      CreatedAt        DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_BIL_CreatedAt DEFAULT SYSUTCDATETIME(),
-      CreatedBy        NVARCHAR(100)    NULL,
-
-      CONSTRAINT PK_BillingInvoiceLine PRIMARY KEY CLUSTERED (LineId),
-
-      CONSTRAINT FK_BIL_Invoice FOREIGN KEY (InvoiceId)
-        REFERENCES dbo.BillingInvoice(InvoiceId),
-
-      CONSTRAINT FK_BIL_Encounter FOREIGN KEY (EncounterId)
-        REFERENCES dbo.Encounter(EncounterId),
-
-      CONSTRAINT CK_BIL_Qty CHECK (Qty > 0),
-      CONSTRAINT CK_BIL_Rate CHECK (Rate >= 0),
-
-      CONSTRAINT CK_BIL_DiscountPercent CHECK
-        (DiscountPercent IS NULL OR (DiscountPercent >= 0 AND DiscountPercent <= 100)),
-
-      CONSTRAINT CK_BIL_DiscountAmount CHECK
-        (DiscountAmount IS NULL OR DiscountAmount >= 0)
-      -- Note: NetAmount can be negative for ADJUSTMENT lines.
+    CONSTRAINT FK_BICE_Event FOREIGN KEY (ChargeEventId)
+      REFERENCES dbo.BillingChargeEvent(ChargeEventId)
   );
-END;
-GO
+END
 
 
-IF OBJECT_ID('dbo.BillingReceipt', 'U') IS NULL
+IF OBJECT_ID('dbo.BillingPayment','U') IS NULL
 BEGIN
-  CREATE TABLE dbo.BillingReceipt
+  CREATE TABLE dbo.BillingPayment
   (
-      ReceiptId           UNIQUEIDENTIFIER NOT NULL
-          CONSTRAINT DF_BR_Id DEFAULT NEWSEQUENTIALID(),
+    PaymentId      UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PAY_Id DEFAULT NEWSEQUENTIALID(),
 
-      ReceiptNo           NVARCHAR(30)     NOT NULL,  -- human readable unique
-      HospitalId          UNIQUEIDENTIFIER NOT NULL,
-      PatientId           NVARCHAR(20)     NOT NULL,
+    HospitalId     UNIQUEIDENTIFIER NOT NULL,
+    PatientId      NVARCHAR(20)     NOT NULL,
 
-      -- PAYMENT / ADVANCE / REFUND
-      ReceiptType         NVARCHAR(20)     NOT NULL,
+    ReceiptNo      NVARCHAR(30)     NOT NULL,
+    PaymentType    NVARCHAR(20)     NOT NULL,  -- PAYMENT/ADVANCE/REFUND
+    PaymentMode    NVARCHAR(30)     NOT NULL,  -- CASH/UPI/CARD/BANK/INSURANCE
+    Amount         DECIMAL(18,2)    NOT NULL,
 
-      PaidAtDate          DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_BR_PaidAtDate DEFAULT SYSUTCDATETIME(),
+    PaidAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PAY_PaidAt DEFAULT SYSUTCDATETIME(),
 
-      PaymentMode         NVARCHAR(30)     NOT NULL,  -- CASH/UPI/CARD/BANK/INSURANCE
+    ReferencePaymentId UNIQUEIDENTIFIER NULL,  -- for refunds
 
-      Amount              DECIMAL(18,2)    NOT NULL,  -- always positive
+    CreatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_PAY_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy      NVARCHAR(100)    NULL,
 
-      -- For REFUND referencing original receipt (optional but recommended)
-      ReferenceReceiptId  UNIQUEIDENTIFIER NULL,
+    UpdatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_PAY_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy      NVARCHAR(100)    NULL,
 
-      CreatedAt           DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_BR_CreatedAt DEFAULT SYSUTCDATETIME(),
-      CreatedBy           NVARCHAR(100)    NULL,
+    CONSTRAINT PK_BillingPayment PRIMARY KEY CLUSTERED (PaymentId),
 
-      UpdatedAt           DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_BR_UpdatedAt DEFAULT SYSUTCDATETIME(),
-      UpdatedBy           NVARCHAR(100)    NULL,
+    CONSTRAINT UX_PAY_Receipt UNIQUE (HospitalId, ReceiptNo),
 
-      CONSTRAINT PK_BillingReceipt PRIMARY KEY CLUSTERED (ReceiptId),
+    CONSTRAINT FK_PAY_Reference FOREIGN KEY (ReferencePaymentId)
+      REFERENCES dbo.BillingPayment(PaymentId),
 
-      CONSTRAINT UX_BR_ReceiptNo UNIQUE (HospitalId, ReceiptNo),
-
-      CONSTRAINT FK_BR_ReferenceReceipt FOREIGN KEY (ReferenceReceiptId)
-        REFERENCES dbo.BillingReceipt(ReceiptId),
-
-      CONSTRAINT CK_BR_ReceiptType CHECK (ReceiptType IN ('PAYMENT','ADVANCE','REFUND')),
-
-      CONSTRAINT CK_BR_Amount CHECK (Amount > 0)
+    CONSTRAINT CK_PAY_Type CHECK (PaymentType IN ('PAYMENT','ADVANCE','REFUND')),
+    CONSTRAINT CK_PAY_Amount CHECK (Amount > 0)
   );
-END;
-GO
+END
 
 
-IF OBJECT_ID('dbo.BillingReceiptAllocation', 'U') IS NULL
+IF OBJECT_ID('dbo.BillingPaymentAllocation','U') IS NULL
 BEGIN
-  CREATE TABLE dbo.BillingReceiptAllocation
+  CREATE TABLE dbo.BillingPaymentAllocation
   (
-      AllocationId     UNIQUEIDENTIFIER NOT NULL
-          CONSTRAINT DF_BRA_Id DEFAULT NEWSEQUENTIALID(),
+    AllocationId   UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PAYAL_Id DEFAULT NEWSEQUENTIALID(),
 
-      ReceiptId        UNIQUEIDENTIFIER NOT NULL,
-      InvoiceId        UNIQUEIDENTIFIER NOT NULL,
+    PaymentId      UNIQUEIDENTIFIER NOT NULL,
+    InvoiceId      UNIQUEIDENTIFIER NOT NULL,
+    AllocatedAmount DECIMAL(18,2)   NOT NULL,
 
-      -- optional but useful for quick filtering (can also derive from InvoiceId)
-      EncounterId      UNIQUEIDENTIFIER NULL,
+    CreatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_PAYAL_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy      NVARCHAR(100)    NULL,
 
-      AllocatedAmount  DECIMAL(18,2)    NOT NULL, -- always positive
+    CONSTRAINT PK_BillingPaymentAllocation PRIMARY KEY CLUSTERED (AllocationId),
 
-      CreatedAt        DATETIME2(3)     NOT NULL
-          CONSTRAINT DF_BRA_CreatedAt DEFAULT SYSUTCDATETIME(),
-      CreatedBy        NVARCHAR(100)    NULL,
+    CONSTRAINT FK_PAYAL_Payment FOREIGN KEY (PaymentId)
+      REFERENCES dbo.BillingPayment(PaymentId),
 
-      CONSTRAINT PK_BillingReceiptAllocation PRIMARY KEY CLUSTERED (AllocationId),
+    CONSTRAINT FK_PAYAL_Invoice FOREIGN KEY (InvoiceId)
+      REFERENCES dbo.BillingInvoice(InvoiceId),
 
-      CONSTRAINT FK_BRA_Receipt FOREIGN KEY (ReceiptId)
-        REFERENCES dbo.BillingReceipt(ReceiptId),
-
-      CONSTRAINT FK_BRA_Invoice FOREIGN KEY (InvoiceId)
-        REFERENCES dbo.BillingInvoice(InvoiceId),
-
-      CONSTRAINT FK_BRA_Encounter FOREIGN KEY (EncounterId)
-        REFERENCES dbo.Encounter(EncounterId)
+    CONSTRAINT CK_PAYAL_Amt CHECK (AllocatedAmount > 0)
   );
-END;
+END
 GO
+
+
+IF OBJECT_ID('dbo.NumberSeries','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.NumberSeries
+  (
+    SeriesId        UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_NS_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId      UNIQUEIDENTIFIER NOT NULL,
+    SeriesCode      NVARCHAR(30)     NOT NULL,  -- INV, RCPT, ENC, LABACC, RADSTUDY
+
+    Prefix          NVARCHAR(30)     NOT NULL,  -- e.g., INV, RCPT
+    YearFormat      NVARCHAR(10)     NOT NULL   CONSTRAINT DF_NS_YearFmt DEFAULT 'YYYY', -- YYYY / YY
+    Separator       NVARCHAR(5)      NOT NULL   CONSTRAINT DF_NS_Sep DEFAULT '-',
+
+    CurrentValue    BIGINT           NOT NULL   CONSTRAINT DF_NS_Current DEFAULT (0),
+
+    PadLength       INT              NOT NULL   CONSTRAINT DF_NS_Pad DEFAULT (6),
+
+    IsActive        BIT              NOT NULL   CONSTRAINT DF_NS_Active DEFAULT (1),
+
+    UpdatedAt       DATETIME2(3)     NOT NULL   CONSTRAINT DF_NS_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy       NVARCHAR(100)    NULL,
+
+    RowVersion      ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_NumberSeries PRIMARY KEY CLUSTERED (SeriesId),
+    CONSTRAINT UX_NumberSeries UNIQUE (HospitalId, SeriesCode),
+    CONSTRAINT CK_NS_Pad CHECK (PadLength BETWEEN 3 AND 12),
+    CONSTRAINT CK_NS_Current CHECK (CurrentValue >= 0)
+  );
+END
+GO
+
+IF OBJECT_ID('dbo.BillingPolicy','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.BillingPolicy
+  (
+    BillingPolicyId          UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_BP_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId               UNIQUEIDENTIFIER NOT NULL,
+
+    -- Core rule: charges must be finalized before invoicing (recommended ON)
+    RequirePostBeforeInvoice BIT NOT NULL
+      CONSTRAINT DF_BP_PostBeforeInv DEFAULT (1),
+
+    -- Discount: simple cap (no approval flow in v1)
+    MaxAutoDiscountPercent   DECIMAL(5,2) NOT NULL
+      CONSTRAINT DF_BP_MaxDisc DEFAULT (10),
+
+    -- Integration triggers (v1)
+    LabPathTrigger           NVARCHAR(20) NULL, -- ORDERED/VERIFIED/RELEASED
+    LabRadTrigger            NVARCHAR(20) NULL, -- ORDERED/VERIFIED/RELEASED
+    PharmacyIpdTrigger       NVARCHAR(20) NULL, -- ORDERED/ISSUED
+    OpdConsultTrigger        NVARCHAR(20) NULL, -- BOOKED/CHECKED_IN/COMPLETED
+    IpdBedChargeMode         NVARCHAR(20) NULL, -- DAILY_AUTO/MANUAL
+
+    CreatedAt                DATETIME2(3) NOT NULL
+      CONSTRAINT DF_BP_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy                NVARCHAR(100) NULL,
+
+    UpdatedAt                DATETIME2(3) NOT NULL
+      CONSTRAINT DF_BP_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy                NVARCHAR(100) NULL
+
+  );
+END
+GO
+
+
+
+IF OBJECT_ID('dbo.BillingAuditLog','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.BillingAuditLog
+  (
+    BillingAuditId   UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_BAL_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId       UNIQUEIDENTIFIER NOT NULL,
+    PatientId        NVARCHAR(20)     NULL,
+
+    EntityType       NVARCHAR(30)     NOT NULL, -- CHARGEEVENT/PAYMENT/INVOICE
+    EntityId         UNIQUEIDENTIFIER NOT NULL,
+
+    ActionCode       NVARCHAR(30)     NOT NULL, -- CREATE/POST/VOID/PAY/FINALIZE/CANCEL/ALLOCATE
+    ActionAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_BAL_At DEFAULT SYSUTCDATETIME(),
+    ActionBy         NVARCHAR(100)    NULL,
+
+    Summary          NVARCHAR(300)    NULL,
+    BeforeJson       NVARCHAR(MAX)    NULL,
+    AfterJson        NVARCHAR(MAX)    NULL,
+
+    CONSTRAINT PK_BillingAuditLog PRIMARY KEY CLUSTERED (BillingAuditId)
+  );
+END
+
+
+

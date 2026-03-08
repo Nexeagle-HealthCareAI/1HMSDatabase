@@ -155,9 +155,9 @@ CREATE TABLE dbo.Encounter
 );
 END
 
-IF OBJECT_ID('dbo.BillingChargeEventLedger','U') IS NULL
+IF OBJECT_ID('dbo.BillingChargeEvent','U') IS NULL
 BEGIN
-  CREATE TABLE dbo.BillingChargeEventLedger
+  CREATE TABLE dbo.BillingChargeEvent
   (
     ChargeEventId      UNIQUEIDENTIFIER NOT NULL
       CONSTRAINT DF_BCE_Id DEFAULT NEWSEQUENTIALID(),
@@ -424,3 +424,6 @@ BEGIN
     CONSTRAINT PK_BillingAuditLog PRIMARY KEY CLUSTERED (BillingAuditId)
   );
 END
+
+
+

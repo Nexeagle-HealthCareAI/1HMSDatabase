@@ -1,91 +1,101 @@
-/* =========================================================
-   ROLLBACK SCRIPT (Drop objects created in your snippet)
-   - Drops FKs explicitly where possible
-   - Drops tables in dependency-safe order
-   - Safe to run multiple times (IF OBJECT_ID checks)
-   ========================================================= */
+/* ============================================================
+   ROLLBACK SCRIPT
+   Drops billing/encounter/master tables created in this batch
+   Safe to run multiple times
+   ============================================================ */
 
 SET NOCOUNT ON;
+GO
 
-BEGIN TRY
-    BEGIN TRAN;
+/* ------------------------------------------------------------
+   1) Drop nonclustered indexes created separately
+   ------------------------------------------------------------ */
+IF EXISTS
+(
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = N'IX_CM_Search'
+      AND object_id = OBJECT_ID(N'dbo.ChargeMaster')
+)
+BEGIN
+    DROP INDEX IX_CM_Search ON dbo.ChargeMaster;
+END
+GO
 
-    /* ---------------------------
-       1) Drop FOREIGN KEYS first
-       --------------------------- */
+/* ------------------------------------------------------------
+   2) Drop child tables first (reverse FK dependency order)
+   ------------------------------------------------------------ */
 
-    -- BillingReceiptAllocation -> Receipt / Invoice / Encounter
-    IF OBJECT_ID('dbo.BillingReceiptAllocation', 'U') IS NOT NULL
-    BEGIN
-        IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BRA_Receipt' AND parent_object_id = OBJECT_ID('dbo.BillingReceiptAllocation'))
-            ALTER TABLE dbo.BillingReceiptAllocation DROP CONSTRAINT FK_BRA_Receipt;
+IF OBJECT_ID(N'dbo.BillingPaymentAllocation', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.BillingPaymentAllocation;
+END
+GO
 
-        IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BRA_Invoice' AND parent_object_id = OBJECT_ID('dbo.BillingReceiptAllocation'))
-            ALTER TABLE dbo.BillingReceiptAllocation DROP CONSTRAINT FK_BRA_Invoice;
+IF OBJECT_ID(N'dbo.BillingInvoiceChargeEvent', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.BillingInvoiceChargeEvent;
+END
+GO
 
-        IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BRA_Encounter' AND parent_object_id = OBJECT_ID('dbo.BillingReceiptAllocation'))
-            ALTER TABLE dbo.BillingReceiptAllocation DROP CONSTRAINT FK_BRA_Encounter;
-    END
+IF OBJECT_ID(N'dbo.BillingAuditLog', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.BillingAuditLog;
+END
+GO
 
-    -- BillingReceipt self reference
-    IF OBJECT_ID('dbo.BillingReceipt', 'U') IS NOT NULL
-    BEGIN
-        IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BR_ReferenceReceipt' AND parent_object_id = OBJECT_ID('dbo.BillingReceipt'))
-            ALTER TABLE dbo.BillingReceipt DROP CONSTRAINT FK_BR_ReferenceReceipt;
-    END
+/* ------------------------------------------------------------
+   3) Drop parent / self-referencing transactional tables
+   ------------------------------------------------------------ */
 
-    -- BillingInvoiceLine -> BillingInvoice / Encounter
-    IF OBJECT_ID('dbo.BillingInvoiceLine', 'U') IS NOT NULL
-    BEGIN
-        IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BIL_Invoice' AND parent_object_id = OBJECT_ID('dbo.BillingInvoiceLine'))
-            ALTER TABLE dbo.BillingInvoiceLine DROP CONSTRAINT FK_BIL_Invoice;
+IF OBJECT_ID(N'dbo.BillingPayment', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.BillingPayment;
+END
+GO
 
-        IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BIL_Encounter' AND parent_object_id = OBJECT_ID('dbo.BillingInvoiceLine'))
-            ALTER TABLE dbo.BillingInvoiceLine DROP CONSTRAINT FK_BIL_Encounter;
-    END
+IF OBJECT_ID(N'dbo.BillingInvoice', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.BillingInvoice;
+END
+GO
 
-    -- BillingInvoice -> Encounter
-    IF OBJECT_ID('dbo.BillingInvoice', 'U') IS NOT NULL
-    BEGIN
-        IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BI_Encounter' AND parent_object_id = OBJECT_ID('dbo.BillingInvoice'))
-            ALTER TABLE dbo.BillingInvoice DROP CONSTRAINT FK_BI_Encounter;
-    END
+IF OBJECT_ID(N'dbo.BillingChargeEvent', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.BillingChargeEvent;
+END
+GO
 
+/* ------------------------------------------------------------
+   4) Drop configuration / lookup / support tables
+   ------------------------------------------------------------ */
 
-    /* ---------------------------
-       2) Drop TABLES (children -> parents)
-       --------------------------- */
+IF OBJECT_ID(N'dbo.BillingPolicy', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.BillingPolicy;
+END
+GO
 
-    IF OBJECT_ID('dbo.BillingReceiptAllocation', 'U') IS NOT NULL
-        DROP TABLE dbo.BillingReceiptAllocation;
+IF OBJECT_ID(N'dbo.NumberSeries', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.NumberSeries;
+END
+GO
 
-    IF OBJECT_ID('dbo.BillingReceipt', 'U') IS NOT NULL
-        DROP TABLE dbo.BillingReceipt;
+IF OBJECT_ID(N'dbo.Encounter', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.Encounter;
+END
+GO
 
-    IF OBJECT_ID('dbo.BillingInvoiceLine', 'U') IS NOT NULL
-        DROP TABLE dbo.BillingInvoiceLine;
+IF OBJECT_ID(N'dbo.BedMaster', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.BedMaster;
+END
+GO
 
-    IF OBJECT_ID('dbo.BillingInvoice', 'U') IS NOT NULL
-        DROP TABLE dbo.BillingInvoice;
-
-    IF OBJECT_ID('dbo.Encounter', 'U') IS NOT NULL
-        DROP TABLE dbo.Encounter;
-
-    IF OBJECT_ID('dbo.InvoicePrintSettings', 'U') IS NOT NULL
-        DROP TABLE dbo.InvoicePrintSettings;
-
-    IF OBJECT_ID('dbo.BillingChargeCatalog', 'U') IS NOT NULL
-        DROP TABLE dbo.BillingChargeCatalog;
-
-
-    COMMIT TRAN;
-END TRY
-BEGIN CATCH
-    IF @@TRANCOUNT > 0 ROLLBACK TRAN;
-
-    DECLARE @ErrMsg NVARCHAR(4000) = ERROR_MESSAGE();
-    DECLARE @ErrNum INT = ERROR_NUMBER();
-    DECLARE @ErrLine INT = ERROR_LINE();
-
-    RAISERROR('Rollback failed. Error %d at line %d: %s', 16, 1, @ErrNum, @ErrLine, @ErrMsg);
-END CATCH;
+IF OBJECT_ID(N'dbo.ChargeMaster', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.ChargeMaster;
+END
+GO

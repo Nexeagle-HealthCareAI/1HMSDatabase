@@ -38,8 +38,6 @@ BEGIN
 
     CONSTRAINT PK_ChargeMaster PRIMARY KEY CLUSTERED (ChargeId),
 
-    CONSTRAINT UX_CM_Code UNIQUE (HospitalId, ChargeCode),
-
     CONSTRAINT CK_CM_Rate CHECK (DefaultRate >= 0),
     CONSTRAINT CK_CM_Qty CHECK (DefaultQty > 0),
     CONSTRAINT CK_CM_Discount CHECK (MaxDiscountPercent IS NULL OR (MaxDiscountPercent >= 0 AND MaxDiscountPercent <= 100)),

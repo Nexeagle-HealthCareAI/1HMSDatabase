@@ -281,6 +281,7 @@ BEGIN
     ReceiptNo      NVARCHAR(30)     NOT NULL,
     PaymentType    NVARCHAR(20)     NOT NULL,  -- PAYMENT/ADVANCE/REFUND
     PaymentMode    NVARCHAR(30)     NOT NULL,  -- CASH/UPI/CARD/BANK/INSURANCE
+    PaymentDescription NVARCHAR(100) NULL,
     Amount         DECIMAL(18,2)    NOT NULL,
 
     PaidAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PAY_PaidAt DEFAULT SYSUTCDATETIME(),

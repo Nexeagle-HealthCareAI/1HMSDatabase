@@ -140,6 +140,10 @@ CREATE TABLE dbo.Encounter
     PrimaryDoctorId    UNIQUEIDENTIFIER NULL,
 
     StatusCode         NVARCHAR(20)     NOT NULL DEFAULT 'OPEN',
+    
+    IsReopened      BIT NULL,
+
+	  ReopenedReason  NVARCHAR(100)    NULL,
 
     CreatedAt          DATETIME2(3)     NOT NULL DEFAULT SYSUTCDATETIME(),
     CreatedBy          NVARCHAR(100)    NULL,
@@ -223,6 +227,9 @@ BEGIN
     FinalizedAt     DATETIME2(3)     NULL,
     FinalizedBy     NVARCHAR(100)    NULL,
 
+    IsReopened      BIT NULL,
+	  ReopenedReason  NVARCHAR(100)    NULL,
+
     CancelledAt     DATETIME2(3)     NULL,
     CancelledBy     NVARCHAR(100)    NULL,
     CancelReason    NVARCHAR(300)    NULL,
@@ -270,7 +277,7 @@ BEGIN
 
     HospitalId     UNIQUEIDENTIFIER NOT NULL,
     PatientId      NVARCHAR(20)     NOT NULL,
-
+    EncounterId    UNIQUEIDENTIFIER NOT NULL
     ReceiptNo      NVARCHAR(30)     NOT NULL,
     PaymentType    NVARCHAR(20)     NOT NULL,  -- PAYMENT/ADVANCE/REFUND
     PaymentMode    NVARCHAR(30)     NOT NULL,  -- CASH/UPI/CARD/BANK/INSURANCE
@@ -305,7 +312,7 @@ BEGIN
   (
     AllocationId   UNIQUEIDENTIFIER NOT NULL
       CONSTRAINT DF_PAYAL_Id DEFAULT NEWSEQUENTIALID(),
-
+    EncounterId     UNIQUEIDENTIFIER NOT NULL,
     PaymentId      UNIQUEIDENTIFIER NOT NULL,
     InvoiceId      UNIQUEIDENTIFIER NOT NULL,
     AllocatedAmount DECIMAL(18,2)   NOT NULL,

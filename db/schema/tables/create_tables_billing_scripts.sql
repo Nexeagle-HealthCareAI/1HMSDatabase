@@ -360,10 +360,7 @@ BEGIN
     UpdatedBy       NVARCHAR(100)    NULL,
 
     RowVersion      ROWVERSION       NOT NULL,
-
-    CONSTRAINT PK_NumberSeries PRIMARY KEY CLUSTERED (SeriesId),
-    CONSTRAINT UX_NumberSeries UNIQUE (HospitalId, SeriesCode),
-    CONSTRAINT CK_NS_Pad CHECK (PadLength BETWEEN 3 AND 12),
+    
     CONSTRAINT CK_NS_Current CHECK (CurrentValue >= 0)
   );
 END

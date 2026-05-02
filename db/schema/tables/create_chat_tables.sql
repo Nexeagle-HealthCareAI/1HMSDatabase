@@ -27,6 +27,21 @@ BEGIN
 END
 GO
 
+-- Safely add columns if the table already exists but is missing them
+IF COL_LENGTH('dbo.SupportSessions', 'GuestName') IS NULL
+BEGIN
+    ALTER TABLE dbo.SupportSessions ADD GuestName NVARCHAR(100) NULL;
+    PRINT N'Added GuestName column to SupportSessions.';
+END
+GO
+
+IF COL_LENGTH('dbo.SupportSessions', 'GuestEmail') IS NULL
+BEGIN
+    ALTER TABLE dbo.SupportSessions ADD GuestEmail NVARCHAR(150) NULL;
+    PRINT N'Added GuestEmail column to SupportSessions.';
+END
+GO
+
 IF OBJECT_ID('dbo.SupportMessages', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.SupportMessages (

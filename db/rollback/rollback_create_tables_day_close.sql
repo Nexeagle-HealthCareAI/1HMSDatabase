@@ -1,0 +1,5 @@
+IF OBJECT_ID('dbo.DayClose','U') IS NOT NULL
+BEGIN
+  DROP TABLE dbo.DayClose;
+END
+GO

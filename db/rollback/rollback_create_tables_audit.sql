@@ -1,0 +1,5 @@
+IF OBJECT_ID('dbo.AuditLog','U') IS NOT NULL
+BEGIN
+  DROP TABLE dbo.AuditLog;
+END
+GO

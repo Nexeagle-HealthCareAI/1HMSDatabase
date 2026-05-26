@@ -1,0 +1,5 @@
+IF OBJECT_ID('dbo.Alert','U') IS NOT NULL
+BEGIN
+  DROP TABLE dbo.Alert;
+END
+GO

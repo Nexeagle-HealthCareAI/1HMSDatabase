@@ -70,8 +70,8 @@ BEGIN
 
     CONSTRAINT PK_ConsentRecord PRIMARY KEY CLUSTERED (ConsentRecordId),
 
-    CONSTRAINT FK_CR_Admission FOREIGN KEY (AdmissionId)
-      REFERENCES dbo.Admission(AdmissionId),
+    -- FK_CR_Admission deferred to create_tables_zz_foreign_keys.sql
+    -- (dbo.Admission lives in create_tables_ipd_scripts.sql which deploys later)
 
     CONSTRAINT FK_CR_Template FOREIGN KEY (ConsentTemplateId)
       REFERENCES dbo.ConsentTemplate(ConsentTemplateId)

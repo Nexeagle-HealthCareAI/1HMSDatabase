@@ -31,8 +31,7 @@ BEGIN
     RowVersion         ROWVERSION       NOT NULL,
 
     CONSTRAINT PK_FluidEntry PRIMARY KEY CLUSTERED (FluidEntryId),
-    CONSTRAINT FK_FE_Admission FOREIGN KEY (AdmissionId)
-      REFERENCES dbo.Admission(AdmissionId),
+    -- FK_FE_Admission deferred to create_tables_zz_foreign_keys.sql
 
     CONSTRAINT CK_FE_Direction CHECK (Direction IN ('IN','OUT')),
     CONSTRAINT CK_FE_Volume CHECK (VolumeMl > 0 AND VolumeMl <= 20000)
@@ -88,8 +87,7 @@ BEGIN
     RowVersion         ROWVERSION       NOT NULL,
 
     CONSTRAINT PK_GlucoseReading PRIMARY KEY CLUSTERED (GlucoseReadingId),
-    CONSTRAINT FK_GR_Admission FOREIGN KEY (AdmissionId)
-      REFERENCES dbo.Admission(AdmissionId),
+    -- FK_GR_Admission deferred to create_tables_zz_foreign_keys.sql
 
     CONSTRAINT CK_GR_Unit CHECK (Unit IN (N'mg/dL', N'mmol/L')),
     CONSTRAINT CK_GR_Value CHECK (Value > 0),

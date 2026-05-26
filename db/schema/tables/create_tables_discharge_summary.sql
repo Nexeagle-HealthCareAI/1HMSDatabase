@@ -40,8 +40,7 @@ BEGIN
     CONSTRAINT PK_DischargeSummary PRIMARY KEY CLUSTERED (DischargeSummaryId),
     CONSTRAINT UX_DS_Admission UNIQUE (HospitalId, AdmissionId),
 
-    CONSTRAINT FK_DS_Admission FOREIGN KEY (AdmissionId)
-      REFERENCES dbo.Admission(AdmissionId),
+    -- FK_DS_Admission deferred to create_tables_zz_foreign_keys.sql
 
     CONSTRAINT CK_DS_Condition CHECK (
       ConditionAtDischarge IS NULL OR

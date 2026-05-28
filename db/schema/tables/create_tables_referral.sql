@@ -173,3 +173,27 @@ BEGIN
       REFERENCES dbo.Referrer(ReferrerId);
 END
 GO
+
+-- OPD booking captures the referrer on the Appointment (no Encounter exists yet);
+-- billing copies ReferredByReferrerId onto the Encounter when one is created.
+IF COL_LENGTH('dbo.Appointments','ReferredByReferrerId') IS NULL
+BEGIN
+  ALTER TABLE dbo.Appointments
+    ADD ReferredByReferrerId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+IF COL_LENGTH('dbo.Appointments','ReferrerRelation') IS NULL
+BEGIN
+  ALTER TABLE dbo.Appointments
+    ADD ReferrerRelation NVARCHAR(10) NULL;   -- C/O, S/O, D/O, W/O … referrer's relation to patient
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name='FK_Appointments_Referrer' AND parent_object_id=OBJECT_ID('dbo.Appointments'))
+BEGIN
+  ALTER TABLE dbo.Appointments
+    ADD CONSTRAINT FK_Appointments_Referrer FOREIGN KEY (ReferredByReferrerId)
+      REFERENCES dbo.Referrer(ReferrerId);
+END
+GO

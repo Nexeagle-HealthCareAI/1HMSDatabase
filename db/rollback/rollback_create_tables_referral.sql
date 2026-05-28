@@ -1,5 +1,23 @@
 -- Rollback for create_tables_referral.sql
--- Drop in dependency order: Encounter FK/column → ReferralIncentive → Referrer.
+-- Drop in dependency order: Appointments/Encounter FK/columns → ReferralIncentive → Referrer.
+
+IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name='FK_Appointments_Referrer' AND parent_object_id=OBJECT_ID('dbo.Appointments'))
+BEGIN
+  ALTER TABLE dbo.Appointments DROP CONSTRAINT FK_Appointments_Referrer;
+END
+GO
+
+IF COL_LENGTH('dbo.Appointments','ReferredByReferrerId') IS NOT NULL
+BEGIN
+  ALTER TABLE dbo.Appointments DROP COLUMN ReferredByReferrerId;
+END
+GO
+
+IF COL_LENGTH('dbo.Appointments','ReferrerRelation') IS NOT NULL
+BEGIN
+  ALTER TABLE dbo.Appointments DROP COLUMN ReferrerRelation;
+END
+GO
 
 IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name='FK_ENC_Referrer' AND parent_object_id=OBJECT_ID('dbo.Encounter'))
 BEGIN

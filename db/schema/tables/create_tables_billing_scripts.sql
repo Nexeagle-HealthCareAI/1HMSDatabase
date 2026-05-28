@@ -26,6 +26,10 @@ BEGIN
     -- Discount cap for this charge (optional; if null use BillingPolicy)
     MaxDiscountPercent  DECIMAL(5,2)     NULL,
 
+    -- Default incentive (flat INR per unit) earned when this service is billed.
+    -- NULL/0 = no incentive. Copied onto the bill line, where it can be edited per bill.
+    IncentiveAmount     DECIMAL(18,2)    NULL,
+
     IsActive            BIT              NOT NULL CONSTRAINT DF_CM_Active DEFAULT (1),
     SortOrder           INT              NOT NULL CONSTRAINT DF_CM_Sort DEFAULT (0),
 
@@ -41,7 +45,22 @@ BEGIN
     CONSTRAINT CK_CM_Rate CHECK (DefaultRate >= 0),
     CONSTRAINT CK_CM_Qty CHECK (DefaultQty > 0),
     CONSTRAINT CK_CM_Discount CHECK (MaxDiscountPercent IS NULL OR (MaxDiscountPercent >= 0 AND MaxDiscountPercent <= 100)),
+    CONSTRAINT CK_CM_Incentive CHECK (IncentiveAmount IS NULL OR IncentiveAmount >= 0),
   );
+END
+GO
+
+-- Existing DBs: add IncentiveAmount to ChargeMaster if not already present (idempotent).
+IF COL_LENGTH('dbo.ChargeMaster','IncentiveAmount') IS NULL
+BEGIN
+  ALTER TABLE dbo.ChargeMaster ADD IncentiveAmount DECIMAL(18,2) NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name='CK_CM_Incentive' AND parent_object_id=OBJECT_ID('dbo.ChargeMaster'))
+BEGIN
+  ALTER TABLE dbo.ChargeMaster
+    ADD CONSTRAINT CK_CM_Incentive CHECK (IncentiveAmount IS NULL OR IncentiveAmount >= 0);
 END
 GO
 

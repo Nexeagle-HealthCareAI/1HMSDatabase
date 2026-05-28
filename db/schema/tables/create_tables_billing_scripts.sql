@@ -90,6 +90,10 @@ BEGIN
     -- Optional override at bed level
     BedDailyRateOverride DECIMAL(18,2)  NULL,
 
+    -- Default incentive (flat INR per day) earned for this bed/ward; null/0 = none.
+    -- Copied onto the bill line, where it can be edited per bill.
+    IncentiveAmount    DECIMAL(18,2)    NULL,
+
     -- Bed identity
     BedCode            NVARCHAR(30)     NOT NULL,   -- unique per hospital (ICU-12)
     BedName            NVARCHAR(100)    NULL,
@@ -127,8 +131,23 @@ BEGIN
 
     CONSTRAINT CK_BM_Capacity CHECK (CapacityInRoom IS NULL OR CapacityInRoom > 0),
     CONSTRAINT CK_BM_WardRoomRate CHECK (WardRoomDailyRate >= 0),
-    CONSTRAINT CK_BM_BedOverrideRate CHECK (BedDailyRateOverride IS NULL OR BedDailyRateOverride >= 0)
+    CONSTRAINT CK_BM_BedOverrideRate CHECK (BedDailyRateOverride IS NULL OR BedDailyRateOverride >= 0),
+    CONSTRAINT CK_BM_Incentive CHECK (IncentiveAmount IS NULL OR IncentiveAmount >= 0)
   );
+END
+GO
+
+-- Existing DBs: add IncentiveAmount to BedMaster if not already present (idempotent).
+IF COL_LENGTH('dbo.BedMaster','IncentiveAmount') IS NULL
+BEGIN
+  ALTER TABLE dbo.BedMaster ADD IncentiveAmount DECIMAL(18,2) NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name='CK_BM_Incentive' AND parent_object_id=OBJECT_ID('dbo.BedMaster'))
+BEGIN
+  ALTER TABLE dbo.BedMaster
+    ADD CONSTRAINT CK_BM_Incentive CHECK (IncentiveAmount IS NULL OR IncentiveAmount >= 0);
 END
 GO
 
@@ -199,6 +218,9 @@ BEGIN
     DiscountAmount     DECIMAL(18,2)    NULL,
     NetAmount          DECIMAL(18,2)    NOT NULL,
 
+    -- Incentive for this line: seeded from ChargeMaster/BedMaster, editable per bill; null/0 = none.
+    IncentiveAmount    DECIMAL(18,2)    NULL,
+
     StatusCode         NVARCHAR(20)     NOT NULL
       CONSTRAINT DF_BCE_Status DEFAULT ('DRAFT'),     -- DRAFT/POSTED/INVOICED/VOID
 
@@ -223,9 +245,25 @@ BEGIN
     CONSTRAINT PK_BillingChargeEvent PRIMARY KEY CLUSTERED (ChargeEventId),
 
     CONSTRAINT CK_BCE_UnitPrice CHECK (UnitPrice >= 0),
-    CONSTRAINT CK_BCE_Discount CHECK (DiscountAmount IS NULL OR DiscountAmount >= 0)
+    CONSTRAINT CK_BCE_Discount CHECK (DiscountAmount IS NULL OR DiscountAmount >= 0),
+    CONSTRAINT CK_BCE_Incentive CHECK (IncentiveAmount IS NULL OR IncentiveAmount >= 0)
   );
 END
+GO
+
+-- Existing DBs: add IncentiveAmount to BillingChargeEvent if not already present (idempotent).
+IF COL_LENGTH('dbo.BillingChargeEvent','IncentiveAmount') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingChargeEvent ADD IncentiveAmount DECIMAL(18,2) NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name='CK_BCE_Incentive' AND parent_object_id=OBJECT_ID('dbo.BillingChargeEvent'))
+BEGIN
+  ALTER TABLE dbo.BillingChargeEvent
+    ADD CONSTRAINT CK_BCE_Incentive CHECK (IncentiveAmount IS NULL OR IncentiveAmount >= 0);
+END
+GO
 
 
 IF OBJECT_ID('dbo.BillingInvoice','U') IS NULL

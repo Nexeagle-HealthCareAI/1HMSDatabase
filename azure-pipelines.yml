@@ -98,9 +98,10 @@ stages:
           done
         }
 
-        run_dir "$ROOT/db/schema"         "SCHEMA root"
-        run_dir "$ROOT/db/schema/tables"  "TABLES"
-        run_dir "$ROOT/db/schema/indexes" "INDEXES"
+        run_dir "$ROOT/db/schema"            "SCHEMA root"
+        run_dir "$ROOT/db/schema/tables"     "TABLES"
+        run_dir "$ROOT/db/schema/migrations" "MIGRATIONS"
+        run_dir "$ROOT/db/schema/indexes"    "INDEXES"
         run_dir "$ROOT/db/schema/views"   "VIEWS"
         run_dir "$ROOT/db/schema/procs"   "PROCS"
         run_dir "$ROOT/db/data/seed"      "SEED"
@@ -182,11 +183,12 @@ stages:
                 done
               }
 
-              run_dir "$ROOT/db/schema"         "SCHEMA root"
-              run_dir "$ROOT/db/schema/tables"  "TABLES"
-              run_dir "$ROOT/db/schema/indexes" "INDEXES"
-              run_dir "$ROOT/db/schema/views"   "VIEWS"
-              run_dir "$ROOT/db/schema/procs"   "PROCS"
-              run_dir "$ROOT/db/data/seed"      "SEED"
+              run_dir "$ROOT/db/schema"            "SCHEMA root"
+              run_dir "$ROOT/db/schema/tables"     "TABLES"
+              run_dir "$ROOT/db/schema/migrations" "MIGRATIONS"
+              run_dir "$ROOT/db/schema/indexes"    "INDEXES"
+              run_dir "$ROOT/db/schema/views"      "VIEWS"
+              run_dir "$ROOT/db/schema/procs"      "PROCS"
+              run_dir "$ROOT/db/data/seed"         "SEED"
               echo "PROD deploy completed."
             displayName: "Execute deploy (PROD)"

@@ -1,5 +1,16 @@
 # Database deploy tooling
 
+Two ways to deploy, pick whichever you like:
+
+1. **`deploy_all.sql`** — one consolidated, idempotent SQL file. Open it in SSMS /
+   Azure Data Studio (connect to the easyHMS database first) and Execute (F5), or run
+   `sqlcmd -S <server> -d <db> -U <user> -i deploy_all.sql`. No tooling, just SQL.
+   It bundles every script in the canonical order (tables → migrations → indexes → seed)
+   and is safe to re-run. **Regenerate it** after changing any `.sql` with
+   `tools/build_deploy_all.ps1` (see below).
+2. **`deploy.ps1`** — a runner that executes the individual scripts and additionally
+   tracks applied migrations in `dbo.SchemaMigrations` (apply-once + drift detection).
+
 `deploy.ps1` applies the SQL scripts in this repo to a target SQL Server / Azure SQL
 database, in the same order as [`azure-pipelines.yml`](../azure-pipelines.yml).
 

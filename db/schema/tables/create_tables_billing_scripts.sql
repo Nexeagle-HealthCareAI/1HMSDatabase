@@ -432,14 +432,6 @@ BEGIN
 
     HospitalId               UNIQUEIDENTIFIER NOT NULL,
 
-    -- Core rule: charges must be finalized before invoicing (recommended ON)
-    RequirePostBeforeInvoice BIT NOT NULL
-      CONSTRAINT DF_BP_PostBeforeInv DEFAULT (1),
-
-    -- Discount: simple cap (no approval flow in v1)
-    MaxAutoDiscountPercent   DECIMAL(5,2) NOT NULL
-      CONSTRAINT DF_BP_MaxDisc DEFAULT (10),
-
     -- Integration triggers (v1)
     LabPathTrigger           NVARCHAR(20) NULL, -- ORDERED/VERIFIED/RELEASED
     LabRadTrigger            NVARCHAR(20) NULL, -- ORDERED/VERIFIED/RELEASED

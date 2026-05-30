@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-05-30 11:10
+-- Generated: 2026-05-30 11:27  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -1708,14 +1708,6 @@ BEGIN
       CONSTRAINT DF_BP_Id DEFAULT NEWSEQUENTIALID(),
 
     HospitalId               UNIQUEIDENTIFIER NOT NULL,
-
-    -- Core rule: charges must be finalized before invoicing (recommended ON)
-    RequirePostBeforeInvoice BIT NOT NULL
-      CONSTRAINT DF_BP_PostBeforeInv DEFAULT (1),
-
-    -- Discount: simple cap (no approval flow in v1)
-    MaxAutoDiscountPercent   DECIMAL(5,2) NOT NULL
-      CONSTRAINT DF_BP_MaxDisc DEFAULT (10),
 
     -- Integration triggers (v1)
     LabPathTrigger           NVARCHAR(20) NULL, -- ORDERED/VERIFIED/RELEASED
@@ -4067,6 +4059,47 @@ GO
 -- #####################################################################
 -- ##  SECTION: MIGRATIONS (column ALTERs)
 -- #####################################################################
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_billingpolicy_drop_finalize_and_discount.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Drop deprecated BillingPolicy columns:
+--   * RequirePostBeforeInvoice  - was never enforced anywhere (dead config).
+--   * MaxAutoDiscountPercent     - hospital-wide discount cap removed; the cap is now
+--                                  per-charge (ChargeMaster.MaxDiscountPercent), with a
+--                                  no-cap (100%) fallback when a charge has none.
+-- Idempotent: guarded by COL_LENGTH. Each column's DEFAULT constraint is found by
+-- dynamic lookup (names can differ per database) and dropped before the column.
+
+-- â”€â”€â”€ RequirePostBeforeInvoice â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+IF COL_LENGTH('dbo.BillingPolicy', 'RequirePostBeforeInvoice') IS NOT NULL
+BEGIN
+    DECLARE @df_post sysname;
+    SELECT @df_post = dc.name
+      FROM sys.default_constraints dc
+      JOIN sys.columns c ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id
+     WHERE dc.parent_object_id = OBJECT_ID('dbo.BillingPolicy') AND c.name = 'RequirePostBeforeInvoice';
+    IF @df_post IS NOT NULL EXEC('ALTER TABLE dbo.BillingPolicy DROP CONSTRAINT ' + @df_post);
+    ALTER TABLE dbo.BillingPolicy DROP COLUMN RequirePostBeforeInvoice;
+END
+GO
+
+-- â”€â”€â”€ MaxAutoDiscountPercent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+IF COL_LENGTH('dbo.BillingPolicy', 'MaxAutoDiscountPercent') IS NOT NULL
+BEGIN
+    DECLARE @df_disc sysname;
+    SELECT @df_disc = dc.name
+      FROM sys.default_constraints dc
+      JOIN sys.columns c ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id
+     WHERE dc.parent_object_id = OBJECT_ID('dbo.BillingPolicy') AND c.name = 'MaxAutoDiscountPercent';
+    IF @df_disc IS NOT NULL EXEC('ALTER TABLE dbo.BillingPolicy DROP CONSTRAINT ' + @df_disc);
+    ALTER TABLE dbo.BillingPolicy DROP COLUMN MaxAutoDiscountPercent;
+END
+GO
+
+GO
 
 -- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_medication_order_inventory_link.sql

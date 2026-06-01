@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-06-01 17:14  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-06-01 18:20  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -4258,6 +4258,38 @@ BEGIN
   ON dbo.MedicationOrder(InventoryItemId)
   WHERE InventoryItemId IS NOT NULL;
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_patientregistrations_extra_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Additional patient demographics captured at appointment booking (all optional / nullable):
+-- blood group, address block/locality, alternate mobile, email, and emergency contact details.
+-- Idempotent: each column is only added if it doesn't already exist.
+IF COL_LENGTH('dbo.PatientRegistrations', 'BloodGroup') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD BloodGroup NVARCHAR(10) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'Block') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD Block NVARCHAR(200) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'AlternateMobile') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD AlternateMobile NVARCHAR(20) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'Email') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD Email NVARCHAR(256) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'EmergencyContactName') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD EmergencyContactName NVARCHAR(200) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'EmergencyContactRelation') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD EmergencyContactRelation NVARCHAR(100) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'EmergencyContactPhone') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD EmergencyContactPhone NVARCHAR(20) NULL;
 GO
 
 GO

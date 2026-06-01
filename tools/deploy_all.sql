@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-06-01 15:14  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-06-01 17:14  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -4359,6 +4359,42 @@ IF COL_LENGTH('dbo.BillingInvoice', 'BuyerGstin') IS NULL
 GO
 IF COL_LENGTH('dbo.BillingInvoice', 'PlaceOfSupplyStateCode') IS NULL
   ALTER TABLE dbo.BillingInvoice ADD PlaceOfSupplyStateCode NVARCHAR(2) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/normalize_numberseries_defaults.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Some hospitals' NumberSeries rows were saved with junk values (e.g. prefix 'string',
+-- a multi-char separator, an unrecognised year format, or an oversized pad length) â€” producing
+-- invoice numbers like "stringstrinstrin0000000011". This normalises any such row back to clean
+-- defaults (INV / RCPT / ADM / IB Â· YYYY Â· '-' Â· pad 6) while PRESERVING CurrentValue so the
+-- running sequence is not disturbed. Idempotent: only rewrites fields that are actually invalid.
+UPDATE dbo.NumberSeries
+SET
+    YearFormat = CASE WHEN YearFormat IN ('YYYY', 'YY', 'YYYYMM', 'OFF') THEN YearFormat ELSE 'YYYY' END,
+    Separator  = CASE WHEN Separator IS NULL OR LEN(Separator) > 1 THEN '-' ELSE Separator END,
+    PadLength  = CASE WHEN PadLength BETWEEN 1 AND 10 THEN PadLength ELSE 6 END,
+    Prefix     = CASE
+                    WHEN Prefix IS NULL OR Prefix = '' OR Prefix LIKE 'string%' OR LEN(Prefix) > 12
+                    THEN CASE SeriesCode
+                            WHEN 'RCPT' THEN 'RCPT'
+                            WHEN 'ADM'  THEN 'ADM'
+                            WHEN 'IB'   THEN 'IB'
+                            ELSE 'INV'
+                         END
+                    ELSE Prefix
+                 END
+WHERE SeriesCode IN ('INV', 'RCPT', 'ADM', 'IB')
+  AND (
+        YearFormat NOT IN ('YYYY', 'YY', 'YYYYMM', 'OFF')
+     OR Separator IS NULL OR LEN(Separator) > 1
+     OR PadLength NOT BETWEEN 1 AND 10
+     OR Prefix IS NULL OR Prefix = '' OR Prefix LIKE 'string%' OR LEN(Prefix) > 12
+  );
 GO
 
 GO

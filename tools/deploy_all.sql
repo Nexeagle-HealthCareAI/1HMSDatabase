@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-06-01 13:47  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-06-01 15:14  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -1767,7 +1767,7 @@ BEGIN
       CONSTRAINT DF_ADB_Id DEFAULT NEWSEQUENTIALID(),
 
     HospitalId           UNIQUEIDENTIFIER NOT NULL,
-    AdmissionId          UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId          UNIQUEIDENTIFIER NULL,
     EncounterId          UNIQUEIDENTIFIER NOT NULL,
     PatientId            NVARCHAR(20)     NULL,
 
@@ -4162,6 +4162,28 @@ GO
 -- #####################################################################
 -- ##  SECTION: MIGRATIONS (column ALTERs)
 -- #####################################################################
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_admissiondaybill_admissionid_nullable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Day-wise billing was reworked from admission-anchored to VISIT-anchored (no admission required).
+-- AdmissionDayBill.AdmissionId is now optional. This makes the column nullable on already-deployed
+-- databases (the CREATE TABLE script only helps fresh deploys). Idempotent â€” only alters when the
+-- column currently exists and is NOT NULL.
+IF EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('dbo.AdmissionDayBill')
+      AND name = 'AdmissionId'
+      AND is_nullable = 0
+)
+BEGIN
+    ALTER TABLE dbo.AdmissionDayBill ALTER COLUMN AdmissionId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
 
 -- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_billingpolicy_drop_finalize_and_discount.sql

@@ -490,7 +490,7 @@ BEGIN
       CONSTRAINT DF_ADB_Id DEFAULT NEWSEQUENTIALID(),
 
     HospitalId           UNIQUEIDENTIFIER NOT NULL,
-    AdmissionId          UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId          UNIQUEIDENTIFIER NULL,
     EncounterId          UNIQUEIDENTIFIER NOT NULL,
     PatientId            NVARCHAR(20)     NULL,
 

@@ -477,6 +477,109 @@ BEGIN
     CONSTRAINT PK_BillingAuditLog PRIMARY KEY CLUSTERED (BillingAuditId)
   );
 END
+GO
+
+-- ── Admission day-wise interim billing ─────────────────────────────────────
+-- One locked, numbered interim bill per admission "billing day" (admission-anchored
+-- 24h window). Closing a day snapshots that day's charges into AdmissionDayBillLine.
+IF OBJECT_ID('dbo.AdmissionDayBill','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AdmissionDayBill
+  (
+    AdmissionDayBillId   UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_ADB_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId           UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId          UNIQUEIDENTIFIER NOT NULL,
+    EncounterId          UNIQUEIDENTIFIER NOT NULL,
+    PatientId            NVARCHAR(20)     NULL,
+
+    DayNumber            INT              NOT NULL,
+    FromUtc              DATETIME2(3)     NOT NULL,
+    ToUtc                DATETIME2(3)     NOT NULL,
+
+    InterimBillNo        NVARCHAR(30)     NOT NULL,
+
+    LineCount            INT              NOT NULL CONSTRAINT DF_ADB_LineCount DEFAULT 0,
+    GrossAmount          DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADB_Gross DEFAULT 0,
+    DiscountAmount       DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADB_Disc DEFAULT 0,
+    TaxAmount            DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADB_Tax DEFAULT 0,
+    NetAmount            DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADB_Net DEFAULT 0,
+    CumulativeNetAmount  DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADB_Cum DEFAULT 0,
+    AdvanceReceived      DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADB_Adv DEFAULT 0,
+    BalanceDue           DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADB_Bal DEFAULT 0,
+
+    StatusCode           NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_ADB_Status DEFAULT ('CLOSED'),   -- CLOSED / REOPENED
+
+    ClosedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_ADB_ClosedAt DEFAULT SYSUTCDATETIME(),
+    ClosedBy             NVARCHAR(100)    NULL,
+
+    ReopenedAt           DATETIME2(3)     NULL,
+    ReopenedBy           NVARCHAR(100)    NULL,
+    ReopenReason         NVARCHAR(500)    NULL,
+
+    CreatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_ADB_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy            NVARCHAR(100)    NULL,
+    UpdatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_ADB_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy            NVARCHAR(100)    NULL,
+
+    RowVersion           ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_AdmissionDayBill PRIMARY KEY CLUSTERED (AdmissionDayBillId),
+    CONSTRAINT UX_ADB_BillNo UNIQUE (HospitalId, InterimBillNo)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ADB_AdmissionDay' AND object_id=OBJECT_ID('dbo.AdmissionDayBill'))
+BEGIN
+  CREATE INDEX IX_ADB_AdmissionDay
+  ON dbo.AdmissionDayBill(HospitalId, AdmissionId, DayNumber, StatusCode);
+END
+GO
+
+IF OBJECT_ID('dbo.AdmissionDayBillLine','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AdmissionDayBillLine
+  (
+    AdmissionDayBillLineId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_ADBL_Id DEFAULT NEWSEQUENTIALID(),
+
+    AdmissionDayBillId   UNIQUEIDENTIFIER NOT NULL,
+    HospitalId           UNIQUEIDENTIFIER NOT NULL,
+    ChargeEventId        UNIQUEIDENTIFIER NOT NULL,
+
+    CategoryCode         NVARCHAR(30)     NULL,
+    DisplayName          NVARCHAR(300)    NULL,
+    ServiceDate          DATETIME2(3)     NOT NULL,
+
+    Qty                  DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADBL_Qty DEFAULT 0,
+    UnitPrice            DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADBL_Unit DEFAULT 0,
+    GrossAmount          DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADBL_Gross DEFAULT 0,
+    DiscountAmount       DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADBL_Disc DEFAULT 0,
+    TaxAmount            DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADBL_Tax DEFAULT 0,
+    NetAmount            DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ADBL_Net DEFAULT 0,
+
+    CreatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_ADBL_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_AdmissionDayBillLine PRIMARY KEY CLUSTERED (AdmissionDayBillLineId),
+    CONSTRAINT FK_ADBL_Bill FOREIGN KEY (AdmissionDayBillId)
+      REFERENCES dbo.AdmissionDayBill(AdmissionDayBillId) ON DELETE CASCADE
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ADBL_Bill' AND object_id=OBJECT_ID('dbo.AdmissionDayBillLine'))
+BEGIN
+  CREATE INDEX IX_ADBL_Bill ON dbo.AdmissionDayBillLine(AdmissionDayBillId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ADBL_Charge' AND object_id=OBJECT_ID('dbo.AdmissionDayBillLine'))
+BEGIN
+  CREATE INDEX IX_ADBL_Charge ON dbo.AdmissionDayBillLine(HospitalId, ChargeEventId);
+END
 
 
 

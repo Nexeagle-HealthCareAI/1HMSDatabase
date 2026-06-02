@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-06-01 18:20  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-06-02 10:37  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -2768,10 +2768,15 @@ BEGIN
 
     HospitalId           UNIQUEIDENTIFIER NOT NULL,
     PatientId            NVARCHAR(20)     NOT NULL,
-    EncounterId          UNIQUEIDENTIFIER NOT NULL,
+    EncounterId          UNIQUEIDENTIFIER NULL,
     PrimaryDoctorId      UNIQUEIDENTIFIER NULL,
 
     AdmissionNo          NVARCHAR(30)     NOT NULL,
+
+    AdmissionType        NVARCHAR(20)     NULL,   -- EMERGENCY / ELECTIVE / DAYCARE / LAMA
+    ReferralSource       NVARCHAR(20)     NULL,   -- SELF / DOCTOR / HOSPITAL
+    ReferralName         NVARCHAR(200)    NULL,
+    ReferredByReferrerId UNIQUEIDENTIFIER NULL,
 
     AdmittedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_ADM_AdmittedAt DEFAULT SYSUTCDATETIME(),
     AdmittedBy           NVARCHAR(100)    NULL,
@@ -4164,6 +4169,37 @@ GO
 -- #####################################################################
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_admission_type_referral.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Admission: add admission-type + referral capture, and relax EncounterId to nullable
+-- (a standalone admission doesn't require a billing encounter). Idempotent.
+IF OBJECT_ID('dbo.Admission', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Admission', 'AdmissionType') IS NULL
+        ALTER TABLE dbo.Admission ADD AdmissionType NVARCHAR(20) NULL;
+
+    IF COL_LENGTH('dbo.Admission', 'ReferralSource') IS NULL
+        ALTER TABLE dbo.Admission ADD ReferralSource NVARCHAR(20) NULL;
+
+    IF COL_LENGTH('dbo.Admission', 'ReferralName') IS NULL
+        ALTER TABLE dbo.Admission ADD ReferralName NVARCHAR(200) NULL;
+
+    IF COL_LENGTH('dbo.Admission', 'ReferredByReferrerId') IS NULL
+        ALTER TABLE dbo.Admission ADD ReferredByReferrerId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+IF OBJECT_ID('dbo.Admission', 'U') IS NOT NULL
+   AND EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.Admission') AND name = 'EncounterId' AND is_nullable = 0)
+    ALTER TABLE dbo.Admission ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_admissiondaybill_admissionid_nullable.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4263,6 +4299,43 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_patientregistrations_admission_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Admission-module patient demographics, government IDs and granular address (all nullable).
+-- Idempotent: each column is only added if it doesn't already exist.
+IF COL_LENGTH('dbo.PatientRegistrations', 'DateOfBirth') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD DateOfBirth DATE NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'Religion') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD Religion NVARCHAR(50) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'Nationality') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD Nationality NVARCHAR(50) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'AadhaarNumber') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD AadhaarNumber NVARCHAR(20) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'PanNumber') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD PanNumber NVARCHAR(20) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'AbhaId') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD AbhaId NVARCHAR(50) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'FlatHouse') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD FlatHouse NVARCHAR(200) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'Street') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD Street NVARCHAR(200) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'District') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD District NVARCHAR(100) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_patientregistrations_extra_fields.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4290,6 +4363,31 @@ IF COL_LENGTH('dbo.PatientRegistrations', 'EmergencyContactRelation') IS NULL
 GO
 IF COL_LENGTH('dbo.PatientRegistrations', 'EmergencyContactPhone') IS NULL
     ALTER TABLE dbo.PatientRegistrations ADD EmergencyContactPhone NVARCHAR(20) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_patientregistrations_merge_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Duplicate-merge audit columns on PatientRegistrations (all nullable).
+-- When MergedIntoPatientId is set, the row was merged into the canonical UHID; it is hidden
+-- from pickers but kept so old printed UHIDs still resolve.
+-- Idempotent: each column is only added if it doesn't already exist.
+IF COL_LENGTH('dbo.PatientRegistrations', 'MergedIntoPatientId') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD MergedIntoPatientId NVARCHAR(50) NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'MergedAt') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD MergedAt DATETIME2 NULL;
+GO
+IF COL_LENGTH('dbo.PatientRegistrations', 'MergedBy') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD MergedBy NVARCHAR(200) NULL;
+GO
+-- Speeds up "exclude merged" filtering and canonical look-ups.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PatientRegistrations_MergedIntoPatientId' AND object_id = OBJECT_ID('dbo.PatientRegistrations'))
+    CREATE INDEX IX_PatientRegistrations_MergedIntoPatientId ON dbo.PatientRegistrations(MergedIntoPatientId);
 GO
 
 GO

@@ -7,10 +7,15 @@ BEGIN
 
     HospitalId           UNIQUEIDENTIFIER NOT NULL,
     PatientId            NVARCHAR(20)     NOT NULL,
-    EncounterId          UNIQUEIDENTIFIER NOT NULL,
+    EncounterId          UNIQUEIDENTIFIER NULL,
     PrimaryDoctorId      UNIQUEIDENTIFIER NULL,
 
     AdmissionNo          NVARCHAR(30)     NOT NULL,
+
+    AdmissionType        NVARCHAR(20)     NULL,   -- EMERGENCY / ELECTIVE / DAYCARE / LAMA
+    ReferralSource       NVARCHAR(20)     NULL,   -- SELF / DOCTOR / HOSPITAL
+    ReferralName         NVARCHAR(200)    NULL,
+    ReferredByReferrerId UNIQUEIDENTIFIER NULL,
 
     AdmittedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_ADM_AdmittedAt DEFAULT SYSUTCDATETIME(),
     AdmittedBy           NVARCHAR(100)    NULL,

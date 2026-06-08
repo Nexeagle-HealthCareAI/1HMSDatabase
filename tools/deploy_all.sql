@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-06-02 10:37  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-06-08 12:08  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -4336,6 +4336,20 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_patientregistrations_allergies.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Patient allergies (free text, e.g. "Penicillin, Sulpha drugs"). Optional / nullable.
+-- Surfaced on the patient profile + as an allergy banner on the prescription pad for safety.
+-- Idempotent: only added if it doesn't already exist.
+IF COL_LENGTH('dbo.PatientRegistrations', 'Allergies') IS NULL
+    ALTER TABLE dbo.PatientRegistrations ADD Allergies NVARCHAR(1000) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_patientregistrations_extra_fields.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4489,6 +4503,74 @@ IF COL_LENGTH('dbo.BillingInvoice', 'BuyerGstin') IS NULL
 GO
 IF COL_LENGTH('dbo.BillingInvoice', 'PlaceOfSupplyStateCode') IS NULL
   ALTER TABLE dbo.BillingInvoice ADD PlaceOfSupplyStateCode NVARCHAR(2) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_doctor_prescription_field_configs.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Per-doctor (global) prescription field layout: rename / reorder / show-hide built-in fields and
+-- add custom fields. One row per doctor; ConfigJson holds the ordered field list as JSON.
+-- Idempotent: creates the table and its unique DoctorId index only if absent.
+IF OBJECT_ID('dbo.DoctorPrescriptionFieldConfigs', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DoctorPrescriptionFieldConfigs (
+        ConfigId      UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT PK_DoctorPrescriptionFieldConfigs PRIMARY KEY
+            CONSTRAINT DF_DoctorPrescriptionFieldConfigs_ConfigId DEFAULT NEWID(),
+        DoctorId      UNIQUEIDENTIFIER NOT NULL,
+        ConfigJson    NVARCHAR(MAX) NULL,
+        CreatedAtUtc  DATETIME2(3) NOT NULL CONSTRAINT DF_DoctorPrescriptionFieldConfigs_CreatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedAtUtc  DATETIME2(3) NOT NULL CONSTRAINT DF_DoctorPrescriptionFieldConfigs_UpdatedAt DEFAULT SYSUTCDATETIME()
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorPrescriptionFieldConfigs_DoctorId' AND object_id = OBJECT_ID('dbo.DoctorPrescriptionFieldConfigs'))
+    CREATE UNIQUE INDEX UX_DoctorPrescriptionFieldConfigs_DoctorId ON dbo.DoctorPrescriptionFieldConfigs(DoctorId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_hospitalchains_and_chainid.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Multi-hospital chaining: a chain groups inter-connected hospitals under one owner.
+-- Idempotent: creates the HospitalChains table and adds Hospitals.ChainId only if absent.
+
+IF OBJECT_ID('dbo.HospitalChains', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HospitalChains (
+        ChainId     UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT PK_HospitalChains PRIMARY KEY
+            CONSTRAINT DF_HospitalChains_ChainId DEFAULT NEWID(),
+        Name        NVARCHAR(150) NOT NULL,
+        OwnerUserId UNIQUEIDENTIFIER NOT NULL,
+        CreatedAt   DATETIME2(3) NOT NULL CONSTRAINT DF_HospitalChains_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy   NVARCHAR(200) NULL,
+        CONSTRAINT FK_HospitalChains_Owner FOREIGN KEY (OwnerUserId) REFERENCES dbo.Users(UserID)
+    );
+END
+GO
+
+IF COL_LENGTH('dbo.Hospitals', 'ChainId') IS NULL
+    ALTER TABLE dbo.Hospitals ADD ChainId UNIQUEIDENTIFIER NULL;
+GO
+
+IF OBJECT_ID('FK_Hospitals_HospitalChains', 'F') IS NULL
+   AND COL_LENGTH('dbo.Hospitals', 'ChainId') IS NOT NULL
+    ALTER TABLE dbo.Hospitals
+        ADD CONSTRAINT FK_Hospitals_HospitalChains
+        FOREIGN KEY (ChainId) REFERENCES dbo.HospitalChains(ChainId);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Hospitals_ChainId' AND object_id = OBJECT_ID('dbo.Hospitals'))
+    CREATE INDEX IX_Hospitals_ChainId ON dbo.Hospitals(ChainId) WHERE ChainId IS NOT NULL;
 GO
 
 GO

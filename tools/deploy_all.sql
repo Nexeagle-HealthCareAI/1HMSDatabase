@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-06-08 12:08  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-06-08 17:14  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -4402,6 +4402,20 @@ GO
 -- Speeds up "exclude merged" filtering and canonical look-ups.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PatientRegistrations_MergedIntoPatientId' AND object_id = OBJECT_ID('dbo.PatientRegistrations'))
     CREATE INDEX IX_PatientRegistrations_MergedIntoPatientId ON dbo.PatientRegistrations(MergedIntoPatientId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_prescription_systemic_examination.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Second examination field. The existing Examination column is now "General Examination";
+-- SystemicExamination holds the "Systemic Examination" findings. Optional / nullable.
+-- Idempotent: only added if it doesn't already exist.
+IF COL_LENGTH('dbo.Prescription', 'SystemicExamination') IS NULL
+    ALTER TABLE dbo.Prescription ADD SystemicExamination NVARCHAR(MAX) NULL;
 GO
 
 GO

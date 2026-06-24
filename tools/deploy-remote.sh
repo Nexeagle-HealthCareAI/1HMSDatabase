@@ -81,9 +81,51 @@ run_migrations() {
   done
 }
 
+# --- tables with explicit ordering --------------------------------------------
+# create_table_scripts.sql contains the core tables (Appointments, etc.) that
+# all other table scripts reference via FK.  Running alphabetically would put
+# create_chat_tables / create_prescription_tables before it → FK errors.
+# Order: core first → extended (sorted) → zz_foreign_keys last → DML scripts
+run_tables_folder() {
+  local dir="$DEPLOY_DIR/schema/tables"
+  [ -d "$dir" ] || { echo "SKIP (missing): TABLES"; return 0; }
+  echo "==> TABLES"
+
+  # 1. Core tables — everything else depends on these
+  for core in create_table_scripts.sql create_table_nightjob.sql; do
+    local f="$dir/$core"
+    [ -f "$f" ] || continue
+    echo "  RUN (core): $core"; sql_file "$f"
+  done
+
+  # 2. Extended tables — sorted, skip core files and deferred files
+  for f in $(ls "$dir"/*.sql 2>/dev/null | sort); do
+    local base; base="$(basename "$f")"
+    case "$base" in
+      create_table_scripts.sql|create_table_nightjob.sql|\
+      create_tables_zz_foreign_keys.sql|\
+      dml_scripts.sql|dml_nightJob_scripts.sql) continue ;;
+    esac
+    echo "  RUN: ${f#$DEPLOY_DIR/}"; sql_file "$f"
+  done
+
+  # 3. Foreign keys — must be after ALL tables exist
+  local fk="$dir/create_tables_zz_foreign_keys.sql"
+  if [ -f "$fk" ]; then
+    echo "  RUN (fk-last): create_tables_zz_foreign_keys.sql"; sql_file "$fk"
+  fi
+
+  # 4. DML embedded with schema
+  for dml in dml_scripts.sql dml_nightJob_scripts.sql; do
+    local f="$dir/$dml"
+    [ -f "$f" ] || continue
+    echo "  RUN (dml): $dml"; sql_file "$f"
+  done
+}
+
 # --- pipeline order ------------------------------------------------------------
-run_folder    "$DEPLOY_DIR/schema"         "SCHEMA root"
-run_folder    "$DEPLOY_DIR/schema/tables"  "TABLES"
+run_folder       "$DEPLOY_DIR/schema"         "SCHEMA root"
+run_tables_folder
 run_migrations
 run_folder    "$DEPLOY_DIR/schema/indexes" "INDEXES"
 run_folder    "$DEPLOY_DIR/schema/views"   "VIEWS"

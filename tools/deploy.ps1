@@ -28,7 +28,7 @@
   exactly which migrations a given database has received.
 
 .PARAMETER Server
-  SQL host, e.g. easyhmserver.database.windows.net  (port 1433 is appended automatically).
+  SQL host, e.g. localhost  (port 1433 is appended automatically).
 
 .PARAMETER Database
   Target database name, e.g. easyHMSDatabase.
@@ -49,7 +49,7 @@
 
 .EXAMPLE
   $env:SQLCMDPASSWORD = '...'
-  ./tools/deploy.ps1 -Server easyhmserver.database.windows.net -Database easyHMSDatabase -User easyHMSAdmin
+  ./tools/deploy.ps1 -Server localhost -Database EasyHMSDatabase -User sa
 
 .EXAMPLE
   ./tools/deploy.ps1 -Server localhost -Database easyHMSDatabase -MigrationsOnly -WhatIf

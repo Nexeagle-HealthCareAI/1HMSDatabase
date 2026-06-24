@@ -1,5 +1,5 @@
 /* =========================================================
-   easyHMS – Azure SQL Deployment Script (Dev/QA)
+   easyHMS – Database Deployment Script (Dev/QA)
    Safe to re-run; creates objects if missing.
    ========================================================= */
 SET NOCOUNT ON;

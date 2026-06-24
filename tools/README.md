@@ -11,8 +11,8 @@ Two ways to deploy, pick whichever you like:
 2. **`deploy.ps1`** — a runner that executes the individual scripts and additionally
    tracks applied migrations in `dbo.SchemaMigrations` (apply-once + drift detection).
 
-`deploy.ps1` applies the SQL scripts in this repo to a target SQL Server / Azure SQL
-database, in the same order as [`azure-pipelines.yml`](../azure-pipelines.yml).
+`deploy.ps1` applies the SQL scripts in this repo to a target SQL Server
+database, in the same order as [`.github/workflows/deploy-db.yml`](../.github/workflows/deploy-db.yml).
 
 ## Folder model
 
@@ -56,11 +56,11 @@ Set the password via environment variable so it stays out of your shell history:
 ```powershell
 $env:SQLCMDPASSWORD = '<password>'
 
-# Full deploy (Azure SQL)
-./tools/deploy.ps1 -Server easyhmserver.database.windows.net -Database easyHMSDatabase -User easyHMSAdmin
+# Full deploy
+./tools/deploy.ps1 -Server localhost -Database EasyHMSDatabase -User sa
 
 # Only apply new migrations (skip the idempotent re-runs)
-./tools/deploy.ps1 -Server easyhmserver.database.windows.net -Database easyHMSDatabase -User easyHMSAdmin -MigrationsOnly
+./tools/deploy.ps1 -Server localhost -Database EasyHMSDatabase -User sa -MigrationsOnly
 
 # Dry run — print what would execute, change nothing
 ./tools/deploy.ps1 -Server localhost -Database easyHMSDatabase -WhatIf

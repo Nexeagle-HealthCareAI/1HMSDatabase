@@ -1,0 +1,124 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# EASYHMS DATABASE — Schema & Seed Pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# SQL Server runs as a Docker container (default name: "sqlserver") on each VM.
+# This workflow copies the db/ scripts + tools/deploy-remote.sh to the VM and runs
+# the apply script, which talks to SQL via `docker exec`.
+#
+# APPLY ORDER (see tools/deploy-remote.sh):
+#   tables → migrations(apply-once, tracked) → indexes → views → procs → seed
+#   tables/indexes/views/procs/seed are idempotent and RE-RUN every deploy;
+#   only migrations are recorded in dbo.__MigrationHistory and skipped if applied.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# REQUIRED SECRETS
+#   DEV_SSH_HOST 151.185.45.77 | DEV_SSH_USER root | DEV_SSH_PASSWORD | DEV_SA_PASSWORD
+#   PROD_DB_SSH_HOST 151.185.45.68 | PROD_DB_SSH_USER root | PROD_SSH_KEY_B64 | PROD_SA_PASSWORD
+# OPTIONAL repo VARIABLE:
+#   SQL_CONTAINER_NAME   default "sqlserver"
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: EasyHMS DB — Schema & Seed
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - 'db/**/*.sql'
+      - 'tools/deploy-remote.sh'
+      - '.github/workflows/deploy-db.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: easyhms-db-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REMOTE_BASE: /opt/easyhms/dbdeploy
+
+jobs:
+# ═══════════════════════════════════════════════════════════════════════════════
+  deploy-dev:
+    name: "Deploy Schema → Dev"
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    environment: development
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sshpass
+        run: sudo apt-get update -y && sudo apt-get install -y sshpass
+
+      - name: Copy scripts to Dev VM
+        env:
+          SSHPASS: ${{ secrets.DEV_SSH_PASSWORD }}
+        run: |
+          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              ${{ secrets.DEV_SSH_USER }}@${{ secrets.DEV_SSH_HOST }} \
+              "rm -rf ${{ env.REMOTE_BASE }} && mkdir -p ${{ env.REMOTE_BASE }}"
+          sshpass -e scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              db tools \
+              ${{ secrets.DEV_SSH_USER }}@${{ secrets.DEV_SSH_HOST }}:${{ env.REMOTE_BASE }}/
+
+      - name: Apply schema & seed on Dev VM
+        env:
+          SSHPASS: ${{ secrets.DEV_SSH_PASSWORD }}
+          SA_PASSWORD: ${{ secrets.DEV_SA_PASSWORD }}
+          SQL_CONTAINER: ${{ vars.SQL_CONTAINER_NAME || 'sqlserver' }}
+        run: |
+          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              ${{ secrets.DEV_SSH_USER }}@${{ secrets.DEV_SSH_HOST }} \
+              "SA_PASSWORD='$SA_PASSWORD' SQL_CONTAINER='$SQL_CONTAINER' DB_NAME=EasyHMSDatabase \
+               bash ${{ env.REMOTE_BASE }}/tools/deploy-remote.sh"
+
+      - name: Write summary
+        if: always()
+        run: |
+          echo "## 🗄️ EasyHMS DB — Dev" >> $GITHUB_STEP_SUMMARY
+          [ "${{ job.status }}" = "success" ] \
+            && echo "**Status:** ✅ Done" >> $GITHUB_STEP_SUMMARY \
+            || echo "**Status:** ❌ Failed" >> $GITHUB_STEP_SUMMARY
+
+# ═══════════════════════════════════════════════════════════════════════════════
+  deploy-prod:
+    name: "Deploy Schema → Prod"
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare SSH key
+        run: |
+          echo "${{ secrets.PROD_SSH_KEY_B64 }}" | base64 -d > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Copy scripts to Prod DB VM
+        run: |
+          ssh -i /tmp/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              ${{ secrets.PROD_DB_SSH_USER }}@${{ secrets.PROD_DB_SSH_HOST }} \
+              "rm -rf ${{ env.REMOTE_BASE }} && mkdir -p ${{ env.REMOTE_BASE }}"
+          scp -r -i /tmp/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              db tools \
+              ${{ secrets.PROD_DB_SSH_USER }}@${{ secrets.PROD_DB_SSH_HOST }}:${{ env.REMOTE_BASE }}/
+
+      - name: Apply schema & seed on Prod DB VM
+        env:
+          SA_PASSWORD: ${{ secrets.PROD_SA_PASSWORD }}
+          SQL_CONTAINER: ${{ vars.SQL_CONTAINER_NAME || 'sqlserver' }}
+        run: |
+          ssh -i /tmp/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              ${{ secrets.PROD_DB_SSH_USER }}@${{ secrets.PROD_DB_SSH_HOST }} \
+              "SA_PASSWORD='$SA_PASSWORD' SQL_CONTAINER='$SQL_CONTAINER' DB_NAME=EasyHMSDatabase \
+               bash ${{ env.REMOTE_BASE }}/tools/deploy-remote.sh"
+
+      - name: Write summary
+        if: always()
+        run: |
+          echo "## 🗄️ EasyHMS DB — Prod" >> $GITHUB_STEP_SUMMARY
+          [ "${{ job.status }}" = "success" ] \
+            && echo "**Status:** ✅ Done" >> $GITHUB_STEP_SUMMARY \
+            || echo "**Status:** ❌ Failed" >> $GITHUB_STEP_SUMMARY
+          echo "| DB VM | \`${{ secrets.PROD_DB_SSH_HOST }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY

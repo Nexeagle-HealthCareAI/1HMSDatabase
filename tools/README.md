@@ -2,8 +2,8 @@
 
 Two ways to deploy, pick whichever you like:
 
-1. **`deploy_all.sql`** — one consolidated, idempotent SQL file. Open it in SSMS /
-   Azure Data Studio (connect to the easyHMS database first) and Execute (F5), or run
+1. **`deploy_all.sql`** — one consolidated, idempotent SQL file. Open it in SSMS
+   (connect to the easyHMS database first) and Execute (F5), or run
    `sqlcmd -S <server> -d <db> -U <user> -i deploy_all.sql`. No tooling, just SQL.
    It bundles every script in the canonical order (tables → migrations → indexes → seed)
    and is safe to re-run. **Regenerate it** after changing any `.sql` with

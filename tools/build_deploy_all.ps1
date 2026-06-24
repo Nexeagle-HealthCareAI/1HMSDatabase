@@ -6,8 +6,8 @@
 
 .DESCRIPTION
   Run this whenever you add or change a .sql file under db/. The output is a single
-  file you can run in SSMS / Azure Data Studio (F5) or via sqlcmd -i, against the
-  easyHMS database. Order matches azure-pipelines.yml:
+  file you can run in SSMS (F5) or via sqlcmd -i, against the
+  easyHMS database. Order matches .github/workflows/deploy-db.yml:
     tables -> migrations -> indexes -> seed
 
 .EXAMPLE
@@ -37,7 +37,7 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine('-- targets your CURRENT database). All statements are idempotent and')
 [void]$sb.AppendLine('-- safe to re-run. Order: tables -> migrations -> indexes -> seed.')
 [void]$sb.AppendLine('--')
-[void]$sb.AppendLine('-- SSMS / Azure Data Studio : just open and Execute (F5).')
+[void]$sb.AppendLine('-- SSMS : just open and Execute (F5).')
 [void]$sb.AppendLine('-- sqlcmd                   : sqlcmd -S <server> -d <db> -U <user> -i deploy_all.sql')
 [void]$sb.AppendLine('-- =====================================================================')
 [void]$sb.AppendLine('SET QUOTED_IDENTIFIER ON;')

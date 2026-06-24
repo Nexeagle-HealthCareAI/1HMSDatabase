@@ -13,8 +13,8 @@
 -- create_tables_zz_foreign_keys.sql). Every statement is idempotent and
 -- safe to re-run. For a full database deploy use tools/deploy_all.sql instead.
 --
--- Connect to the easyHMS database first, then Execute (F5) in SSMS /
--- Azure Data Studio, or:  sqlcmd -S <server> -d <db> -U <user> -i deploy_alerts.sql
+-- Connect to the easyHMS database first, then Execute (F5) in SSMS,
+-- or:  sqlcmd -S <server> -d <db> -U <user> -i deploy_alerts.sql
 -- =====================================================================
 SET QUOTED_IDENTIFIER ON;
 GO

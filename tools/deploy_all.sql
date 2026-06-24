@@ -1,11 +1,11 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-06-24 17:50  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-06-24 18:16  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
 --
--- SSMS / Azure Data Studio : just open and Execute (F5).
+-- SSMS : just open and Execute (F5).
 -- sqlcmd                   : sqlcmd -S <server> -d <db> -U <user> -i deploy_all.sql
 -- =====================================================================
 SET QUOTED_IDENTIFIER ON;

@@ -2,7 +2,7 @@
 <#
 .SYNOPSIS
   Deploys the easyHMS database schema, migrations and seed scripts to a target
-  SQL Server / Azure SQL database. Mirrors the execution order in azure-pipelines.yml.
+  SQL Server database. Mirrors the execution order in .github/workflows/deploy-db.yml.
 
 .DESCRIPTION
   Folder order (matches the CI pipeline):
@@ -28,7 +28,7 @@
   exactly which migrations a given database has received.
 
 .PARAMETER Server
-  SQL host, e.g. easyhmserver.database.windows.net  (port 1433 is appended automatically).
+  SQL host, e.g. localhost  (port 1433 is appended automatically).
 
 .PARAMETER Database
   Target database name, e.g. easyHMSDatabase.
@@ -49,7 +49,7 @@
 
 .EXAMPLE
   $env:SQLCMDPASSWORD = '...'
-  ./tools/deploy.ps1 -Server easyhmserver.database.windows.net -Database easyHMSDatabase -User easyHMSAdmin
+  ./tools/deploy.ps1 -Server localhost -Database EasyHMSDatabase -User sa
 
 .EXAMPLE
   ./tools/deploy.ps1 -Server localhost -Database easyHMSDatabase -MigrationsOnly -WhatIf
@@ -77,7 +77,7 @@ $root = Split-Path -Parent $PSScriptRoot
 
 # --- build the common sqlcmd argument list ---------------------------------
 # -b  : exit with error code on SQL error
-# -N -C : encrypt connection + trust server cert (Azure SQL requires encryption)
+# -N -C : encrypt connection + trust server cert (when the server enforces encryption)
 # -I  : QUOTED_IDENTIFIER ON   -r 1 : errors to stderr   -m -1 : show all messages
 $server1433 = "$Server,1433"
 $baseArgs = @('-S', $server1433, '-d', $Database, '-b', '-l', '60', '-I', '-r', '1', '-m', '-1', '-N', '-C')

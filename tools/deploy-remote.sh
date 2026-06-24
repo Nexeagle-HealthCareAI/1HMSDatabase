@@ -3,7 +3,7 @@
 # EasyHMS DB — remote apply script (runs ON the VM, talks to the SQL Server
 # Docker container via `docker exec`).
 #
-# Execution order MATCHES tools/deploy.ps1 and the original Azure pipeline:
+# Execution order MATCHES tools/deploy.ps1 and .github/workflows/deploy-db.yml:
 #     db/schema            (root, usually empty)   — idempotent, re-run
 #     db/schema/tables                             — idempotent, re-run
 #     db/schema/migrations  <-- apply-once, tracked in dbo.__MigrationHistory

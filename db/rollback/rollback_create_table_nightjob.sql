@@ -18,3 +18,9 @@ BEGIN
 
     DROP TABLE dbo.JobSettings;
 END
+GO
+
+IF OBJECT_ID('dbo.NightJobRuns', 'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.NightJobRuns;
+END

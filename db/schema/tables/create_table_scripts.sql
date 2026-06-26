@@ -126,6 +126,9 @@ BEGIN
         TimeZone NVARCHAR(100) NULL,
         RegistrationNumber NVARCHAR(100) NOT NULL,
 
+        GSTIN NVARCHAR(50) NULL,
+        PAN NVARCHAR(50) NULL,
+        NABH_NABL NVARCHAR(100) NULL,
         IsActive BIT NOT NULL CONSTRAINT DF_Hospitals_IsActive DEFAULT(1),
 
         CreatedByUserID UNIQUEIDENTIFIER NOT NULL,

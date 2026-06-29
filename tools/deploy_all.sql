@@ -4423,6 +4423,17 @@ GO
 -- Idempotent: each column is only added if it doesn't already exist.
 IF COL_LENGTH('dbo.PatientRegistrations', 'MergedIntoPatientId') IS NULL
     ALTER TABLE dbo.PatientRegistrations ADD MergedIntoPatientId NVARCHAR(50) NULL;
+
+-- FILE: db/schema/migrations/alter_patientregistrations_ageunit.sql
+IF COL_LENGTH('dbo.PatientRegistrations', 'AgeUnit') IS NULL
+BEGIN
+    ALTER TABLE dbo.PatientRegistrations ADD AgeUnit NVARCHAR(10) NULL DEFAULT 'Y';
+END
+
+IF COL_LENGTH('dbo.PatientRegistrations', 'AgeYears') IS NOT NULL
+BEGIN
+    EXEC sp_rename 'dbo.PatientRegistrations.AgeYears', 'Age', 'COLUMN';
+END
 GO
 IF COL_LENGTH('dbo.PatientRegistrations', 'MergedAt') IS NULL
     ALTER TABLE dbo.PatientRegistrations ADD MergedAt DATETIME2 NULL;

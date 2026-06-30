@@ -114,7 +114,8 @@ DECLARE @now datetime2(3) = SYSUTCDATETIME();
     (N'AdminDoctor', N'Full access including admin and doctor board'),
     (N'Receptionist',N'Limited access to appointment related features'),
     (N'Nurse',       N'Can view and manage scheduling'),
-    (N'Doctor',      N'Access limited to doctor board only')
+    (N'Doctor',      N'Access limited to doctor board only'),
+    (N'Accountant',  N'Access to billing and financial features')
   ) s(RoleName,[Description])
 )
 MERGE dbo.Roles AS t
@@ -130,7 +131,7 @@ WHEN MATCHED THEN
 INSERT INTO @Roles(RoleName, RoleID)
 SELECT RoleName, RoleID
 FROM dbo.Roles
-WHERE HospitalID IS NULL AND RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor');
+WHERE HospitalID IS NULL AND RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor',N'Accountant');
 
 -- Ensure required permissions exist (already merged above)
 

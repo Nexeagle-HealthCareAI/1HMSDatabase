@@ -226,3 +226,101 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ASH_Admission' AND object_id=OBJECT_ID('dbo.AdmissionStatusHistory'))
   CREATE INDEX IX_ASH_Admission ON dbo.AdmissionStatusHistory(AdmissionId, ChangedAt DESC);
 GO
+
+-- ============================================================================
+-- IPD Phase 3: CPOE — clinical orders. One generic header+line schema covers
+-- every order type (OrderType discriminator); Phase 3 only exercises MEDICATION.
+-- Charge-on-event: a chargeable line gets its own BillingChargeEvent posted at
+-- order time (ChargeEventId back-fill), reusing the existing charge-posting
+-- engine rather than a parallel one.
+-- ============================================================================
+
+IF OBJECT_ID('dbo.ClinicalOrder','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.ClinicalOrder
+  (
+    OrderId           UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_CO_Id DEFAULT NEWSEQUENTIALID(),
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId       UNIQUEIDENTIFIER NOT NULL,
+    EncounterId       UNIQUEIDENTIFIER NULL,      -- null when the admission has IPD billing disabled
+    PatientId         NVARCHAR(50)     NOT NULL,
+
+    OrderType         NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_CO_Type DEFAULT ('MEDICATION'),      -- MEDICATION / LAB / RADIOLOGY / PROCEDURE (later)
+    StatusCode        NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_CO_Status DEFAULT ('ACTIVE'),        -- ACTIVE / DISCONTINUED / COMPLETED
+
+    OrderedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_CO_OrderedAt DEFAULT SYSUTCDATETIME(),
+    OrderedBy         NVARCHAR(100)    NULL,
+    OrderedByDoctorId UNIQUEIDENTIFIER NULL,
+
+    Notes             NVARCHAR(1000)   NULL,
+
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_CO_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy         NVARCHAR(100)    NULL,
+    UpdatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_CO_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy         NVARCHAR(100)    NULL,
+    RowVersion        ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_ClinicalOrder PRIMARY KEY CLUSTERED (OrderId),
+    CONSTRAINT FK_CO_Admission FOREIGN KEY (AdmissionId)
+      REFERENCES dbo.Admission(AdmissionId),
+    CONSTRAINT FK_CO_Encounter FOREIGN KEY (EncounterId)
+      REFERENCES dbo.Encounter(EncounterId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_CO_Admission' AND object_id=OBJECT_ID('dbo.ClinicalOrder'))
+  CREATE INDEX IX_CO_Admission ON dbo.ClinicalOrder(AdmissionId, OrderedAt DESC);
+GO
+
+IF OBJECT_ID('dbo.ClinicalOrderLine','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.ClinicalOrderLine
+  (
+    OrderLineId    UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_COL_Id DEFAULT NEWSEQUENTIALID(),
+    OrderId        UNIQUEIDENTIFIER NOT NULL,
+    HospitalId     UNIQUEIDENTIFIER NOT NULL,
+
+    ChargeId       UNIQUEIDENTIFIER NULL,        -- ChargeMaster item this line bills against, if any
+    DisplayOrder   INT              NOT NULL CONSTRAINT DF_COL_DisplayOrder DEFAULT (0),
+
+    -- Medication-specific detail; null/unused for other future OrderTypes.
+    DrugName       NVARCHAR(200)    NULL,
+    SaltName       NVARCHAR(200)    NULL,
+    Dose           NVARCHAR(50)     NULL,        -- "500 mg"
+    Route          NVARCHAR(30)     NULL,        -- IV / PO / IM / SC
+    Frequency      NVARCHAR(50)     NULL,        -- "BD" / "TDS" / "STAT"
+    DurationDays   INT              NULL,
+    Instructions   NVARCHAR(500)    NULL,
+
+    Qty            DECIMAL(10,2)    NOT NULL CONSTRAINT DF_COL_Qty DEFAULT (1),
+
+    StatusCode     NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_COL_Status DEFAULT ('ACTIVE'),        -- ACTIVE / DISCONTINUED
+
+    -- The charge posted for this line at order time, if it was chargeable. Voided (not deleted)
+    -- when the line is discontinued after a charge already went through.
+    ChargeEventId  UNIQUEIDENTIFIER NULL,
+
+    CreatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_COL_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy      NVARCHAR(100)    NULL,
+    UpdatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_COL_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy      NVARCHAR(100)    NULL,
+
+    CONSTRAINT PK_ClinicalOrderLine PRIMARY KEY CLUSTERED (OrderLineId),
+    CONSTRAINT FK_COL_Order FOREIGN KEY (OrderId)
+      REFERENCES dbo.ClinicalOrder(OrderId),
+    CONSTRAINT FK_COL_Charge FOREIGN KEY (ChargeId)
+      REFERENCES dbo.ChargeMaster(ChargeId),
+    CONSTRAINT FK_COL_ChargeEvent FOREIGN KEY (ChargeEventId)
+      REFERENCES dbo.BillingChargeEvent(ChargeEventId),
+    CONSTRAINT CK_COL_Qty CHECK (Qty > 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_COL_Order' AND object_id=OBJECT_ID('dbo.ClinicalOrderLine'))
+  CREATE INDEX IX_COL_Order ON dbo.ClinicalOrderLine(OrderId, DisplayOrder);
+GO

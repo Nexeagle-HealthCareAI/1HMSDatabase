@@ -125,3 +125,104 @@ BEGIN
   ON dbo.BedAssignment(AdmissionId, AssignedAt DESC);
 END
 GO
+
+-- ============================================================================
+-- IPD Phase 1: payer branch, offline-idempotency, IPD-billing link, coverage,
+-- and the admission status-transition log. All guarded so re-running is safe
+-- and existing databases pick up the new columns/tables.
+-- ============================================================================
+
+IF COL_LENGTH('dbo.Admission','PayerType') IS NULL
+  ALTER TABLE dbo.Admission ADD PayerType NVARCHAR(20) NOT NULL
+    CONSTRAINT DF_ADM_PayerType DEFAULT ('CASH');   -- CASH / TPA / SCHEME
+GO
+
+IF COL_LENGTH('dbo.Admission','DepositExpected') IS NULL
+  ALTER TABLE dbo.Admission ADD DepositExpected DECIMAL(18,2) NULL;
+GO
+
+IF COL_LENGTH('dbo.Admission','EnableIpdBilling') IS NULL
+  ALTER TABLE dbo.Admission ADD EnableIpdBilling BIT NOT NULL
+    CONSTRAINT DF_ADM_EnableBilling DEFAULT (1);
+GO
+
+-- Offline resync idempotency: the client stamps a request id; a re-sent admit
+-- returns the existing admission instead of creating a duplicate.
+IF COL_LENGTH('dbo.Admission','ClientRequestId') IS NULL
+  ALTER TABLE dbo.Admission ADD ClientRequestId UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_ADM_ClientRequest' AND object_id=OBJECT_ID('dbo.Admission'))
+  CREATE UNIQUE INDEX UX_ADM_ClientRequest
+  ON dbo.Admission(HospitalId, ClientRequestId)
+  WHERE ClientRequestId IS NOT NULL;
+GO
+
+-- AdmissionCoverage — payer/policy/scheme detail. Populated for TPA/SCHEME;
+-- gives pre-auth / enhancement (later phases) a home so it isn't a retrofit.
+IF OBJECT_ID('dbo.AdmissionCoverage','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AdmissionCoverage
+  (
+    CoverageId            UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ACOV_Id DEFAULT NEWSEQUENTIALID(),
+    HospitalId            UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId           UNIQUEIDENTIFIER NOT NULL,
+
+    PayerType             NVARCHAR(20)     NOT NULL,   -- CASH / TPA / SCHEME
+    PayerName             NVARCHAR(200)    NULL,       -- insurer / TPA / scheme name
+    PolicyOrBeneficiaryNo NVARCHAR(100)    NULL,
+    PreAuthNo             NVARCHAR(100)    NULL,
+    PackageCode           NVARCHAR(100)    NULL,       -- PM-JAY HBP package code
+    SanctionedAmount      DECIMAL(18,2)    NULL,
+    ValidFrom             DATETIME2(3)     NULL,
+    ValidTo               DATETIME2(3)     NULL,
+
+    StatusCode            NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_ACOV_Status DEFAULT ('PENDING'),  -- PENDING/APPROVED/QUERIED/REJECTED/ENHANCED
+    Notes                 NVARCHAR(1000)   NULL,
+
+    CreatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_ACOV_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy             NVARCHAR(100)    NULL,
+    UpdatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_ACOV_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy             NVARCHAR(100)    NULL,
+    RowVersion            ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_AdmissionCoverage PRIMARY KEY CLUSTERED (CoverageId),
+    CONSTRAINT FK_ACOV_Admission FOREIGN KEY (AdmissionId)
+      REFERENCES dbo.Admission(AdmissionId),
+    CONSTRAINT CK_ACOV_Sanctioned CHECK (SanctionedAmount IS NULL OR SanctionedAmount >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ACOV_Admission' AND object_id=OBJECT_ID('dbo.AdmissionCoverage'))
+  CREATE INDEX IX_ACOV_Admission ON dbo.AdmissionCoverage(AdmissionId);
+GO
+
+-- AdmissionStatusHistory — immutable transition log. Also the source for
+-- BOR / bed-turnaround / discharge-TAT KPIs (compute off this, not snapshots).
+IF OBJECT_ID('dbo.AdmissionStatusHistory','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AdmissionStatusHistory
+  (
+    HistoryId    UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ASH_Id DEFAULT NEWSEQUENTIALID(),
+    HospitalId   UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId  UNIQUEIDENTIFIER NOT NULL,
+
+    FromStatus   NVARCHAR(20)     NULL,
+    ToStatus     NVARCHAR(20)     NOT NULL,
+    ChangedAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_ASH_ChangedAt DEFAULT SYSUTCDATETIME(),
+    ChangedBy    NVARCHAR(100)    NULL,
+    Reason       NVARCHAR(500)    NULL,
+    MetaJson     NVARCHAR(MAX)    NULL,
+
+    CONSTRAINT PK_AdmissionStatusHistory PRIMARY KEY CLUSTERED (HistoryId),
+    CONSTRAINT FK_ASH_Admission FOREIGN KEY (AdmissionId)
+      REFERENCES dbo.Admission(AdmissionId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ASH_Admission' AND object_id=OBJECT_ID('dbo.AdmissionStatusHistory'))
+  CREATE INDEX IX_ASH_Admission ON dbo.AdmissionStatusHistory(AdmissionId, ChangedAt DESC);
+GO

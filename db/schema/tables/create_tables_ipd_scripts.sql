@@ -324,3 +324,22 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_COL_Order' AND object_id=OBJECT_ID('dbo.ClinicalOrderLine'))
   CREATE INDEX IX_COL_Order ON dbo.ClinicalOrderLine(OrderId, DisplayOrder);
 GO
+
+-- ============================================================================
+-- CPOE generalization: ClinicalOrderLine now backs every OrderType (Lab/Radiology/
+-- Procedure/Diet/Nursing), not just Medication. DrugName -> ItemName (generic label);
+-- Urgency/ScheduledAt are new (Lab/Radiology/Procedure detail). Guarded so this is safe
+-- to re-run whether or not a prior deploy already created the table with the old shape.
+-- ============================================================================
+
+IF COL_LENGTH('dbo.ClinicalOrderLine','ItemName') IS NULL AND COL_LENGTH('dbo.ClinicalOrderLine','DrugName') IS NOT NULL
+  EXEC sp_rename 'dbo.ClinicalOrderLine.DrugName', 'ItemName', 'COLUMN';
+GO
+
+IF COL_LENGTH('dbo.ClinicalOrderLine','Urgency') IS NULL
+  ALTER TABLE dbo.ClinicalOrderLine ADD Urgency NVARCHAR(20) NULL;   -- ROUTINE / URGENT / STAT
+GO
+
+IF COL_LENGTH('dbo.ClinicalOrderLine','ScheduledAt') IS NULL
+  ALTER TABLE dbo.ClinicalOrderLine ADD ScheduledAt DATETIME2(3) NULL;   -- when a Procedure/Surgery order is planned for
+GO

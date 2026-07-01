@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-06-24 18:16  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-01 21:52  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -491,6 +491,9 @@ BEGIN
         TimeZone NVARCHAR(100) NULL,
         RegistrationNumber NVARCHAR(100) NOT NULL,
 
+        GSTIN NVARCHAR(50) NULL,
+        PAN NVARCHAR(50) NULL,
+        NABH_NABL NVARCHAR(100) NULL,
         IsActive BIT NOT NULL CONSTRAINT DF_Hospitals_IsActive DEFAULT(1),
 
         CreatedByUserID UNIQUEIDENTIFIER NOT NULL,
@@ -829,7 +832,8 @@ BEGIN
         RegisteredBy UNIQUEIDENTIFIER NULL,
         FullName NVARCHAR(150) NOT NULL,
         Mobile NVARCHAR(20) NULL,
-        AgeYears SMALLINT NULL,
+        Age SMALLINT NULL,
+        AgeUnit NVARCHAR(10) NULL CONSTRAINT DF_PReg_AgeUnit DEFAULT 'Y',
         Sex NVARCHAR(20) NULL,
         AddressLine NVARCHAR(255) NULL,
         City NVARCHAR(100) NULL,
@@ -1138,6 +1142,29 @@ CREATE TABLE dbo.PrescriptionSettings
 END
 
 PRINT N'easyHMS schema deployment completed.';
+
+IF OBJECT_ID('dbo.InvoicePrintSettings', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.InvoicePrintSettings (
+        InvoicePrintId      UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_InvoicePrintSettings PRIMARY KEY,
+        HospitalId          UNIQUEIDENTIFIER NOT NULL,
+        HeaderHeight        INT NULL,
+        FooterHeight        INT NULL,
+        ContentLeftMargin   INT NULL,
+        ContentRightMargin  INT NULL,
+        OverFlowPage        BIT NULL,
+        FontFamily          NVARCHAR(100) NULL,
+        FontSize            INT NULL,
+        FontWeight          NVARCHAR(50) NULL,
+        TextColour          NVARCHAR(50) NULL,
+        URI                 NVARCHAR(1000) NULL,
+        CreatedByUserId     UNIQUEIDENTIFIER NULL,
+        CreatedAt           DATETIME2(3) NOT NULL CONSTRAINT DF_InvoicePrintSettings_CreatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedAt           DATETIME2(3) NOT NULL CONSTRAINT DF_InvoicePrintSettings_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT FK_InvoicePrintSettings_Hospital FOREIGN KEY (HospitalId) REFERENCES dbo.Hospitals(HospitalID) ON DELETE CASCADE
+    );
+END
+GO
 
 GO
 
@@ -2918,6 +2945,224 @@ BEGIN
 END
 GO
 
+-- ============================================================================
+-- IPD Phase 1: payer branch, offline-idempotency, IPD-billing link, coverage,
+-- and the admission status-transition log. All guarded so re-running is safe
+-- and existing databases pick up the new columns/tables.
+-- ============================================================================
+
+IF COL_LENGTH('dbo.Admission','PayerType') IS NULL
+  ALTER TABLE dbo.Admission ADD PayerType NVARCHAR(20) NOT NULL
+    CONSTRAINT DF_ADM_PayerType DEFAULT ('CASH');   -- CASH / TPA / SCHEME
+GO
+
+IF COL_LENGTH('dbo.Admission','DepositExpected') IS NULL
+  ALTER TABLE dbo.Admission ADD DepositExpected DECIMAL(18,2) NULL;
+GO
+
+IF COL_LENGTH('dbo.Admission','EnableIpdBilling') IS NULL
+  ALTER TABLE dbo.Admission ADD EnableIpdBilling BIT NOT NULL
+    CONSTRAINT DF_ADM_EnableBilling DEFAULT (1);
+GO
+
+-- Offline resync idempotency: the client stamps a request id; a re-sent admit
+-- returns the existing admission instead of creating a duplicate.
+IF COL_LENGTH('dbo.Admission','ClientRequestId') IS NULL
+  ALTER TABLE dbo.Admission ADD ClientRequestId UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_ADM_ClientRequest' AND object_id=OBJECT_ID('dbo.Admission'))
+  CREATE UNIQUE INDEX UX_ADM_ClientRequest
+  ON dbo.Admission(HospitalId, ClientRequestId)
+  WHERE ClientRequestId IS NOT NULL;
+GO
+
+-- AdmissionCoverage â€” payer/policy/scheme detail. Populated for TPA/SCHEME;
+-- gives pre-auth / enhancement (later phases) a home so it isn't a retrofit.
+IF OBJECT_ID('dbo.AdmissionCoverage','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AdmissionCoverage
+  (
+    CoverageId            UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ACOV_Id DEFAULT NEWSEQUENTIALID(),
+    HospitalId            UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId           UNIQUEIDENTIFIER NOT NULL,
+
+    PayerType             NVARCHAR(20)     NOT NULL,   -- CASH / TPA / SCHEME
+    PayerName             NVARCHAR(200)    NULL,       -- insurer / TPA / scheme name
+    PolicyOrBeneficiaryNo NVARCHAR(100)    NULL,
+    PreAuthNo             NVARCHAR(100)    NULL,
+    PackageCode           NVARCHAR(100)    NULL,       -- PM-JAY HBP package code
+    SanctionedAmount      DECIMAL(18,2)    NULL,
+    ValidFrom             DATETIME2(3)     NULL,
+    ValidTo               DATETIME2(3)     NULL,
+
+    StatusCode            NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_ACOV_Status DEFAULT ('PENDING'),  -- PENDING/APPROVED/QUERIED/REJECTED/ENHANCED
+    Notes                 NVARCHAR(1000)   NULL,
+
+    CreatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_ACOV_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy             NVARCHAR(100)    NULL,
+    UpdatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_ACOV_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy             NVARCHAR(100)    NULL,
+    RowVersion            ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_AdmissionCoverage PRIMARY KEY CLUSTERED (CoverageId),
+    CONSTRAINT FK_ACOV_Admission FOREIGN KEY (AdmissionId)
+      REFERENCES dbo.Admission(AdmissionId),
+    CONSTRAINT CK_ACOV_Sanctioned CHECK (SanctionedAmount IS NULL OR SanctionedAmount >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ACOV_Admission' AND object_id=OBJECT_ID('dbo.AdmissionCoverage'))
+  CREATE INDEX IX_ACOV_Admission ON dbo.AdmissionCoverage(AdmissionId);
+GO
+
+-- AdmissionStatusHistory â€” immutable transition log. Also the source for
+-- BOR / bed-turnaround / discharge-TAT KPIs (compute off this, not snapshots).
+IF OBJECT_ID('dbo.AdmissionStatusHistory','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AdmissionStatusHistory
+  (
+    HistoryId    UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ASH_Id DEFAULT NEWSEQUENTIALID(),
+    HospitalId   UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId  UNIQUEIDENTIFIER NOT NULL,
+
+    FromStatus   NVARCHAR(20)     NULL,
+    ToStatus     NVARCHAR(20)     NOT NULL,
+    ChangedAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_ASH_ChangedAt DEFAULT SYSUTCDATETIME(),
+    ChangedBy    NVARCHAR(100)    NULL,
+    Reason       NVARCHAR(500)    NULL,
+    MetaJson     NVARCHAR(MAX)    NULL,
+
+    CONSTRAINT PK_AdmissionStatusHistory PRIMARY KEY CLUSTERED (HistoryId),
+    CONSTRAINT FK_ASH_Admission FOREIGN KEY (AdmissionId)
+      REFERENCES dbo.Admission(AdmissionId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ASH_Admission' AND object_id=OBJECT_ID('dbo.AdmissionStatusHistory'))
+  CREATE INDEX IX_ASH_Admission ON dbo.AdmissionStatusHistory(AdmissionId, ChangedAt DESC);
+GO
+
+-- ============================================================================
+-- IPD Phase 3: CPOE â€” clinical orders. One generic header+line schema covers
+-- every order type (OrderType discriminator); Phase 3 only exercises MEDICATION.
+-- Charge-on-event: a chargeable line gets its own BillingChargeEvent posted at
+-- order time (ChargeEventId back-fill), reusing the existing charge-posting
+-- engine rather than a parallel one.
+-- ============================================================================
+
+IF OBJECT_ID('dbo.ClinicalOrder','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.ClinicalOrder
+  (
+    OrderId           UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_CO_Id DEFAULT NEWSEQUENTIALID(),
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId       UNIQUEIDENTIFIER NOT NULL,
+    EncounterId       UNIQUEIDENTIFIER NULL,      -- null when the admission has IPD billing disabled
+    PatientId         NVARCHAR(50)     NOT NULL,
+
+    OrderType         NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_CO_Type DEFAULT ('MEDICATION'),      -- MEDICATION / LAB / RADIOLOGY / PROCEDURE (later)
+    StatusCode        NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_CO_Status DEFAULT ('ACTIVE'),        -- ACTIVE / DISCONTINUED / COMPLETED
+
+    OrderedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_CO_OrderedAt DEFAULT SYSUTCDATETIME(),
+    OrderedBy         NVARCHAR(100)    NULL,
+    OrderedByDoctorId UNIQUEIDENTIFIER NULL,
+
+    Notes             NVARCHAR(1000)   NULL,
+
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_CO_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy         NVARCHAR(100)    NULL,
+    UpdatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_CO_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy         NVARCHAR(100)    NULL,
+    RowVersion        ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_ClinicalOrder PRIMARY KEY CLUSTERED (OrderId),
+    CONSTRAINT FK_CO_Admission FOREIGN KEY (AdmissionId)
+      REFERENCES dbo.Admission(AdmissionId),
+    CONSTRAINT FK_CO_Encounter FOREIGN KEY (EncounterId)
+      REFERENCES dbo.Encounter(EncounterId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_CO_Admission' AND object_id=OBJECT_ID('dbo.ClinicalOrder'))
+  CREATE INDEX IX_CO_Admission ON dbo.ClinicalOrder(AdmissionId, OrderedAt DESC);
+GO
+
+IF OBJECT_ID('dbo.ClinicalOrderLine','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.ClinicalOrderLine
+  (
+    OrderLineId    UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_COL_Id DEFAULT NEWSEQUENTIALID(),
+    OrderId        UNIQUEIDENTIFIER NOT NULL,
+    HospitalId     UNIQUEIDENTIFIER NOT NULL,
+
+    ChargeId       UNIQUEIDENTIFIER NULL,        -- ChargeMaster item this line bills against, if any
+    DisplayOrder   INT              NOT NULL CONSTRAINT DF_COL_DisplayOrder DEFAULT (0),
+
+    -- Medication-specific detail; null/unused for other future OrderTypes.
+    DrugName       NVARCHAR(200)    NULL,
+    SaltName       NVARCHAR(200)    NULL,
+    Dose           NVARCHAR(50)     NULL,        -- "500 mg"
+    Route          NVARCHAR(30)     NULL,        -- IV / PO / IM / SC
+    Frequency      NVARCHAR(50)     NULL,        -- "BD" / "TDS" / "STAT"
+    DurationDays   INT              NULL,
+    Instructions   NVARCHAR(500)    NULL,
+
+    Qty            DECIMAL(10,2)    NOT NULL CONSTRAINT DF_COL_Qty DEFAULT (1),
+
+    StatusCode     NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_COL_Status DEFAULT ('ACTIVE'),        -- ACTIVE / DISCONTINUED
+
+    -- The charge posted for this line at order time, if it was chargeable. Voided (not deleted)
+    -- when the line is discontinued after a charge already went through.
+    ChargeEventId  UNIQUEIDENTIFIER NULL,
+
+    CreatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_COL_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy      NVARCHAR(100)    NULL,
+    UpdatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_COL_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy      NVARCHAR(100)    NULL,
+
+    CONSTRAINT PK_ClinicalOrderLine PRIMARY KEY CLUSTERED (OrderLineId),
+    CONSTRAINT FK_COL_Order FOREIGN KEY (OrderId)
+      REFERENCES dbo.ClinicalOrder(OrderId),
+    CONSTRAINT FK_COL_Charge FOREIGN KEY (ChargeId)
+      REFERENCES dbo.ChargeMaster(ChargeId),
+    CONSTRAINT FK_COL_ChargeEvent FOREIGN KEY (ChargeEventId)
+      REFERENCES dbo.BillingChargeEvent(ChargeEventId),
+    CONSTRAINT CK_COL_Qty CHECK (Qty > 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_COL_Order' AND object_id=OBJECT_ID('dbo.ClinicalOrderLine'))
+  CREATE INDEX IX_COL_Order ON dbo.ClinicalOrderLine(OrderId, DisplayOrder);
+GO
+
+-- ============================================================================
+-- CPOE generalization: ClinicalOrderLine now backs every OrderType (Lab/Radiology/
+-- Procedure/Diet/Nursing), not just Medication. DrugName -> ItemName (generic label);
+-- Urgency/ScheduledAt are new (Lab/Radiology/Procedure detail). Guarded so this is safe
+-- to re-run whether or not a prior deploy already created the table with the old shape.
+-- ============================================================================
+
+IF COL_LENGTH('dbo.ClinicalOrderLine','ItemName') IS NULL AND COL_LENGTH('dbo.ClinicalOrderLine','DrugName') IS NOT NULL
+  EXEC sp_rename 'dbo.ClinicalOrderLine.DrugName', 'ItemName', 'COLUMN';
+GO
+
+IF COL_LENGTH('dbo.ClinicalOrderLine','Urgency') IS NULL
+  ALTER TABLE dbo.ClinicalOrderLine ADD Urgency NVARCHAR(20) NULL;   -- ROUTINE / URGENT / STAT
+GO
+
+IF COL_LENGTH('dbo.ClinicalOrderLine','ScheduledAt') IS NULL
+  ALTER TABLE dbo.ClinicalOrderLine ADD ScheduledAt DATETIME2(3) NULL;   -- when a Procedure/Surgery order is planned for
+GO
+
 GO
 
 -- ---------------------------------------------------------------------
@@ -3775,6 +4020,36 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_subscriptions.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+IF OBJECT_ID('dbo.HospitalSubscriptions', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HospitalSubscriptions (
+        HospitalSubscriptionId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_HospitalSubscriptions PRIMARY KEY CONSTRAINT DF_HospitalSubscriptions_Id DEFAULT (NEWID()),
+        HospitalId UNIQUEIDENTIFIER NOT NULL CONSTRAINT FK_HospitalSubscriptions_Hospitals FOREIGN KEY REFERENCES dbo.Hospitals(HospitalID),
+        PlanId UNIQUEIDENTIFIER NULL,
+        Status NVARCHAR(50) NOT NULL CONSTRAINT DF_HospitalSubscriptions_Status DEFAULT ('Trial'),
+        TrialStartDate DATETIME2(3) NULL,
+        TrialEndDate DATETIME2(3) NULL,
+        SubscriptionStartDate DATETIME2(3) NULL,
+        SubscriptionEndDate DATETIME2(3) NULL,
+        NextBillingDate DATETIME2(3) NULL,
+        PaymentAmount DECIMAL(18,2) NULL,
+        PaymentReference NVARCHAR(100) NULL,
+        PaymentDate DATETIME2(3) NULL,
+        CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HospitalSubscriptions_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HospitalSubscriptions_UpdatedAt DEFAULT (SYSUTCDATETIME())
+    );
+
+    PRINT 'Created table HospitalSubscriptions';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_triage.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4294,6 +4569,154 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_clinical_order_line_high_alert.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Phase 4 Â· MAR closed loop
+-- High-alert medication flag (insulin, heparin, opioids, KCl, chemo, ...), settable at order
+-- time by the ordering/verifying clinician. Drives the mandatory second-nurse witness at
+-- administration. A boolean flag rather than drug-name matching, since matching against the
+-- free-text ItemName/SaltName would be fragile. Idempotent.
+
+IF COL_LENGTH('dbo.ClinicalOrderLine','IsHighAlert') IS NULL
+  ALTER TABLE dbo.ClinicalOrderLine ADD IsHighAlert BIT NOT NULL
+    CONSTRAINT DF_COL_IsHighAlert DEFAULT (0);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospital_subscriptions_add_payment.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter HospitalSubscriptions Table (Add Payment Fields)
+-- Description: Adds PaymentAmount, PaymentReference, and PaymentDate for payment tracking
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns 
+    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptions]') AND name = 'PaymentAmount'
+)
+BEGIN
+    ALTER TABLE [dbo].[HospitalSubscriptions]
+    ADD PaymentAmount DECIMAL(18,2) NULL,
+        PaymentReference NVARCHAR(100) NULL,
+        PaymentDate DATETIME2(3) NULL;
+    
+    PRINT 'Added payment fields to HospitalSubscriptions table';
+END
+ELSE
+BEGIN
+    PRINT 'Payment fields already exist in HospitalSubscriptions table';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospitals_add_branding_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Add missing branding columns to Hospitals table
+-- Description: Adds GSTIN, PAN, and NABH_NABL to support new branding features
+-- =============================================================================
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Hospitals') AND name = 'GSTIN')
+BEGIN
+    ALTER TABLE dbo.Hospitals ADD GSTIN NVARCHAR(50) NULL;
+    PRINT 'Added GSTIN column to Hospitals table';
+END
+ELSE PRINT 'GSTIN column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Hospitals') AND name = 'PAN')
+BEGIN
+    ALTER TABLE dbo.Hospitals ADD PAN NVARCHAR(50) NULL;
+    PRINT 'Added PAN column to Hospitals table';
+END
+ELSE PRINT 'PAN column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Hospitals') AND name = 'NABH_NABL')
+BEGIN
+    ALTER TABLE dbo.Hospitals ADD NABH_NABL NVARCHAR(100) NULL;
+    PRINT 'Added NABH_NABL column to Hospitals table';
+END
+ELSE PRINT 'NABH_NABL column already exists';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_medication_administration_repoint_to_clinical_order.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Phase 4 Â· MAR closed loop
+-- Repoints the (never-wired) MedicationAdministration table from the dead MedicationOrder
+-- header onto the real CPOE ClinicalOrderLine. MedicationOrderId becomes legacy/nullable;
+-- OrderLineId is the column every new row populates. Idempotent â€” safe whether or not
+-- MedicationAdministration already exists from a prior guarded CREATE.
+
+IF COL_LENGTH('dbo.MedicationAdministration','OrderLineId') IS NULL
+  ALTER TABLE dbo.MedicationAdministration ADD OrderLineId UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_MA_OrderLine')
+  ALTER TABLE dbo.MedicationAdministration
+    ADD CONSTRAINT FK_MA_OrderLine FOREIGN KEY (OrderLineId)
+      REFERENCES dbo.ClinicalOrderLine(OrderLineId);
+GO
+
+-- MedicationOrderId now points at the dead MedicationOrder table â€” legacy only from here on.
+-- Relax to nullable so new rows (which populate OrderLineId instead) can be inserted.
+IF EXISTS (
+  SELECT 1 FROM sys.columns
+  WHERE object_id = OBJECT_ID('dbo.MedicationAdministration') AND name = 'MedicationOrderId' AND is_nullable = 0
+)
+  ALTER TABLE dbo.MedicationAdministration ALTER COLUMN MedicationOrderId UNIQUEIDENTIFIER NULL;
+GO
+
+-- EncounterId mirrors ClinicalOrder.EncounterId's own nullability (null when IPD billing is
+-- disabled on the admission).
+IF EXISTS (
+  SELECT 1 FROM sys.columns
+  WHERE object_id = OBJECT_ID('dbo.MedicationAdministration') AND name = 'EncounterId' AND is_nullable = 0
+)
+  ALTER TABLE dbo.MedicationAdministration ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+-- Exactly one of the legacy header (MedicationOrderId) / current header (OrderLineId) may be
+-- set. Safe to add now â€” confirmed zero rows have ever been written to this table.
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_MA_ExactlyOneOrderRef')
+  ALTER TABLE dbo.MedicationAdministration
+    ADD CONSTRAINT CK_MA_ExactlyOneOrderRef CHECK (
+      (CASE WHEN MedicationOrderId IS NOT NULL THEN 1 ELSE 0 END)
+      + (CASE WHEN OrderLineId IS NOT NULL THEN 1 ELSE 0 END) = 1
+    );
+GO
+
+-- Distinct from WitnessRequired (copied down from the order line at record time): this marks
+-- the instant a required witness actually confirmed, so it's an audit fact, not just a flag.
+IF COL_LENGTH('dbo.MedicationAdministration','WitnessConfirmedAt') IS NULL
+  ALTER TABLE dbo.MedicationAdministration ADD WitnessConfirmedAt DATETIME2(3) NULL;
+GO
+
+-- Drives the MAR grid query (one admission's administrations for a line, in a day window).
+-- The original IX_MA_AdmissionTimeline/IX_MA_OrderSlot (keyed on the legacy MedicationOrderId)
+-- are left untouched â€” dead weight, no functional need to alter them.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MA_OrderLineSlot' AND object_id=OBJECT_ID('dbo.MedicationAdministration'))
+BEGIN
+  CREATE INDEX IX_MA_OrderLineSlot
+  ON dbo.MedicationAdministration(OrderLineId, ScheduledFor)
+  INCLUDE (ActionStatus, ActedAt, ActedBy);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_medication_order_inventory_link.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4367,6 +4790,28 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_patientregistrations_ageunit.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- FILE: db/schema/migrations/alter_patientregistrations_ageunit.sql
+-- Description: Adds AgeUnit column and renames AgeYears to Age.
+
+IF COL_LENGTH('dbo.PatientRegistrations', 'AgeUnit') IS NULL
+BEGIN
+    ALTER TABLE dbo.PatientRegistrations ADD AgeUnit NVARCHAR(10) NULL DEFAULT 'Y';
+END
+GO
+
+IF COL_LENGTH('dbo.PatientRegistrations', 'AgeYears') IS NOT NULL
+BEGIN
+    EXEC sp_rename 'dbo.PatientRegistrations.AgeYears', 'Age', 'COLUMN';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_patientregistrations_allergies.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4413,6 +4858,50 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_patientregistrations_guardian_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =====================================================
+-- Migration: Add GuardianName and GuardianRelation
+--            to PatientRegistrations
+-- Purpose  : Separate the patient's guardian/relative
+--            from the medical referrer (doctor/agent).
+--            Guardian is permanent patient-level data;
+--            medical referrer stays on Appointments.
+-- =====================================================
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('dbo.PatientRegistrations')
+      AND name = 'GuardianName'
+)
+BEGIN
+    ALTER TABLE dbo.PatientRegistrations
+        ADD GuardianName NVARCHAR(150) NULL;
+    PRINT 'Column GuardianName added to PatientRegistrations.';
+END
+ELSE
+    PRINT 'Column GuardianName already exists â€” skipped.';
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('dbo.PatientRegistrations')
+      AND name = 'GuardianRelation'
+)
+BEGIN
+    ALTER TABLE dbo.PatientRegistrations
+        ADD GuardianRelation NVARCHAR(20) NULL;
+    PRINT 'Column GuardianRelation added to PatientRegistrations.';
+END
+ELSE
+    PRINT 'Column GuardianRelation already exists â€” skipped.';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_patientregistrations_merge_fields.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4423,17 +4912,6 @@ GO
 -- Idempotent: each column is only added if it doesn't already exist.
 IF COL_LENGTH('dbo.PatientRegistrations', 'MergedIntoPatientId') IS NULL
     ALTER TABLE dbo.PatientRegistrations ADD MergedIntoPatientId NVARCHAR(50) NULL;
-
--- FILE: db/schema/migrations/alter_patientregistrations_ageunit.sql
-IF COL_LENGTH('dbo.PatientRegistrations', 'AgeUnit') IS NULL
-BEGIN
-    ALTER TABLE dbo.PatientRegistrations ADD AgeUnit NVARCHAR(10) NULL DEFAULT 'Y';
-END
-
-IF COL_LENGTH('dbo.PatientRegistrations', 'AgeYears') IS NOT NULL
-BEGIN
-    EXEC sp_rename 'dbo.PatientRegistrations.AgeYears', 'Age', 'COLUMN';
-END
 GO
 IF COL_LENGTH('dbo.PatientRegistrations', 'MergedAt') IS NULL
     ALTER TABLE dbo.PatientRegistrations ADD MergedAt DATETIME2 NULL;
@@ -4592,6 +5070,41 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_hospital_subscriptions_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create HospitalSubscriptions Table
+-- Description: Adds HospitalSubscriptions for the billing feature
+-- =============================================================================
+
+IF OBJECT_ID('dbo.HospitalSubscriptions', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HospitalSubscriptions (
+        HospitalSubscriptionId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_HospitalSubscriptions PRIMARY KEY CONSTRAINT DF_HospitalSubscriptions_Id DEFAULT (NEWID()),
+        HospitalId UNIQUEIDENTIFIER NOT NULL CONSTRAINT FK_HospitalSubscriptions_Hospitals FOREIGN KEY REFERENCES dbo.Hospitals(HospitalID),
+        PlanId UNIQUEIDENTIFIER NULL,
+        Status NVARCHAR(50) NOT NULL CONSTRAINT DF_HospitalSubscriptions_Status DEFAULT ('Trial'),
+        TrialStartDate DATETIME2(3) NULL,
+        TrialEndDate DATETIME2(3) NULL,
+        SubscriptionStartDate DATETIME2(3) NULL,
+        SubscriptionEndDate DATETIME2(3) NULL,
+        NextBillingDate DATETIME2(3) NULL,
+        PaymentAmount DECIMAL(18,2) NULL,
+        PaymentReference NVARCHAR(100) NULL,
+        PaymentDate DATETIME2(3) NULL,
+        CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HospitalSubscriptions_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HospitalSubscriptions_UpdatedAt DEFAULT (SYSUTCDATETIME())
+    );
+
+    PRINT 'Created table HospitalSubscriptions';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_hospitalchains_and_chainid.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4627,6 +5140,46 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Hospitals_ChainId' AND object_id = OBJECT_ID('dbo.Hospitals'))
     CREATE INDEX IX_Hospitals_ChainId ON dbo.Hospitals(ChainId) WHERE ChainId IS NOT NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_invoice_print_settings.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create InvoicePrintSettings table
+-- Description: Adds the InvoicePrintSettings table used during hospital registration
+-- =============================================================================
+
+IF OBJECT_ID('dbo.InvoicePrintSettings', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.InvoicePrintSettings (
+        InvoicePrintId      UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_InvoicePrintSettings PRIMARY KEY,
+        HospitalId          UNIQUEIDENTIFIER NOT NULL,
+        HeaderHeight        INT NULL,
+        FooterHeight        INT NULL,
+        ContentLeftMargin   INT NULL,
+        ContentRightMargin  INT NULL,
+        OverFlowPage        BIT NULL,
+        FontFamily          NVARCHAR(100) NULL,
+        FontSize            INT NULL,
+        FontWeight          NVARCHAR(50) NULL,
+        TextColour          NVARCHAR(50) NULL,
+        URI                 NVARCHAR(1000) NULL,
+        CreatedByUserId     UNIQUEIDENTIFIER NULL,
+        CreatedAt           DATETIME2(3) NOT NULL CONSTRAINT DF_InvoicePrintSettings_CreatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedAt           DATETIME2(3) NOT NULL CONSTRAINT DF_InvoicePrintSettings_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT FK_InvoicePrintSettings_Hospital FOREIGN KEY (HospitalId) REFERENCES dbo.Hospitals(HospitalID) ON DELETE CASCADE
+    );
+    PRINT 'Created table: InvoicePrintSettings';
+END
+ELSE
+BEGIN
+    PRINT 'Table already exists: InvoicePrintSettings';
+END
 GO
 
 GO

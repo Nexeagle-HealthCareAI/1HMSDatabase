@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-01 21:52  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-02 00:25  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -3640,6 +3640,81 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_nursing_care_plan.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Single flat table, not header+lines: unlike a CPOE order (several lines created together in
+-- one transaction), each nursing diagnosis is independently opened and independently resolved at
+-- its own time, so ClinicalOrder/ClinicalOrderLine's header/lines split doesn't apply here.
+IF OBJECT_ID('dbo.NursingCarePlanItem','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.NursingCarePlanItem
+  (
+    CarePlanItemId       UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_NCP_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId           UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId          UNIQUEIDENTIFIER NOT NULL,
+    EncounterId          UNIQUEIDENTIFIER NULL,
+    PatientId            NVARCHAR(20)     NULL,
+
+    -- Free-text, NOT a NANDA-I coded taxonomy â€” same spirit as ClinicalOrderLine.ItemName.
+    NursingDiagnosis     NVARCHAR(500)    NOT NULL,
+    Goal                 NVARCHAR(1000)   NULL,
+    PlannedInterventions NVARCHAR(MAX)    NULL,
+
+    StatusCode           NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_NCP_Status DEFAULT ('ACTIVE'),   -- ACTIVE / RESOLVED / DISCONTINUED
+
+    CreatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_NCP_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy            NVARCHAR(100)    NULL,
+    CreatedByUserId      UNIQUEIDENTIFIER NULL,
+
+    ResolvedAt           DATETIME2(3)     NULL,
+    ResolvedBy           NVARCHAR(100)    NULL,
+    ResolvedByUserId     UNIQUEIDENTIFIER NULL,
+    ResolutionNotes      NVARCHAR(1000)   NULL,
+
+    UpdatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_NCP_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy            NVARCHAR(100)    NULL,
+
+    RowVersion           ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_NursingCarePlanItem PRIMARY KEY CLUSTERED (CarePlanItemId),
+
+    CONSTRAINT FK_NCP_Admission FOREIGN KEY (AdmissionId)
+      REFERENCES dbo.Admission(AdmissionId),
+
+    CONSTRAINT CK_NCP_Status CHECK (StatusCode IN ('ACTIVE','RESOLVED','DISCONTINUED')),
+
+    CONSTRAINT CK_NCP_ResolvedConsistency CHECK (
+      (StatusCode = 'ACTIVE' AND ResolvedAt IS NULL)
+      OR
+      (StatusCode IN ('RESOLVED','DISCONTINUED') AND ResolvedAt IS NOT NULL)
+    )
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_NCP_AdmissionActive' AND object_id=OBJECT_ID('dbo.NursingCarePlanItem'))
+BEGIN
+  CREATE INDEX IX_NCP_AdmissionActive
+  ON dbo.NursingCarePlanItem(HospitalId, AdmissionId, StatusCode)
+  INCLUDE (NursingDiagnosis, CreatedAt);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_NCP_AdmissionTimeline' AND object_id=OBJECT_ID('dbo.NursingCarePlanItem'))
+BEGIN
+  CREATE INDEX IX_NCP_AdmissionTimeline
+  ON dbo.NursingCarePlanItem(HospitalId, AdmissionId, CreatedAt DESC);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_pcpndt.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -3950,6 +4025,97 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_restraint.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+IF OBJECT_ID('dbo.RestraintOrder','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.RestraintOrder
+  (
+    RestraintOrderId       UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_RO_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId             UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId            UNIQUEIDENTIFIER NOT NULL,
+    EncounterId            UNIQUEIDENTIFIER NULL,
+    PatientId              NVARCHAR(20)     NULL,
+
+    RestraintType          NVARCHAR(100)    NOT NULL,   -- free text e.g. "Physical - wrist", "Chemical"
+    Reason                 NVARCHAR(500)    NOT NULL,
+
+    OrderedByDoctorId      UNIQUEIDENTIFIER NULL,
+    OrderedByDoctorName    NVARCHAR(200)    NOT NULL,   -- NABH: restraints require a physician order
+    OrderedAt              DATETIME2(3)     NOT NULL CONSTRAINT DF_RO_OrderedAt DEFAULT SYSUTCDATETIME(),
+
+    StartedAt              DATETIME2(3)     NOT NULL CONSTRAINT DF_RO_StartedAt DEFAULT SYSUTCDATETIME(),
+    StartedBy              NVARCHAR(150)    NULL,
+    StartedByUserId        UNIQUEIDENTIFIER NULL,
+
+    MonitoringIntervalMins INT              NOT NULL CONSTRAINT DF_RO_Interval DEFAULT (30),
+
+    FamilyNotified          BIT             NOT NULL CONSTRAINT DF_RO_FamilyNotified DEFAULT (0),
+    FamilyNotifiedAt        DATETIME2(3)    NULL,
+    FamilyNotificationNotes NVARCHAR(500)   NULL,
+    RelatedConsentRecordId  UNIQUEIDENTIFIER NULL,   -- optional link to a signed ConsentRecord, if captured
+
+    ReleasedAt             DATETIME2(3)     NULL,
+    ReleasedBy             NVARCHAR(150)    NULL,
+    ReleasedByUserId       UNIQUEIDENTIFIER NULL,
+    ReleaseReason          NVARCHAR(500)    NULL,
+
+    StatusCode             NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_RO_Status DEFAULT ('ACTIVE'),   -- ACTIVE / RELEASED
+
+    Notes                  NVARCHAR(1000)   NULL,
+
+    CreatedAt              DATETIME2(3)     NOT NULL CONSTRAINT DF_RO_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy              NVARCHAR(100)    NULL,
+    UpdatedAt              DATETIME2(3)     NOT NULL CONSTRAINT DF_RO_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy              NVARCHAR(100)    NULL,
+
+    RowVersion             ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_RestraintOrder PRIMARY KEY CLUSTERED (RestraintOrderId),
+
+    CONSTRAINT FK_RO_Admission FOREIGN KEY (AdmissionId)
+      REFERENCES dbo.Admission(AdmissionId),
+    CONSTRAINT FK_RO_ConsentRecord FOREIGN KEY (RelatedConsentRecordId)
+      REFERENCES dbo.ConsentRecord(ConsentRecordId),
+
+    CONSTRAINT CK_RO_Status CHECK (StatusCode IN ('ACTIVE','RELEASED')),
+    CONSTRAINT CK_RO_Interval CHECK (MonitoringIntervalMins > 0 AND MonitoringIntervalMins <= 240),
+
+    CONSTRAINT CK_RO_ReleaseConsistency CHECK (
+      (StatusCode = 'ACTIVE' AND ReleasedAt IS NULL)
+      OR
+      (StatusCode = 'RELEASED' AND ReleasedAt IS NOT NULL)
+    )
+  );
+END
+GO
+
+-- Only one ACTIVE restraint order per admission at a time (mirrors UX_BA_BedActive on
+-- BedAssignment) â€” a patient under an existing active restraint must have it released before a
+-- new one is opened.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_RO_AdmissionActive' AND object_id=OBJECT_ID('dbo.RestraintOrder'))
+BEGIN
+  CREATE UNIQUE INDEX UX_RO_AdmissionActive
+  ON dbo.RestraintOrder(HospitalId, AdmissionId)
+  WHERE StatusCode = 'ACTIVE';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_RO_AdmissionHistory' AND object_id=OBJECT_ID('dbo.RestraintOrder'))
+BEGIN
+  CREATE INDEX IX_RO_AdmissionHistory
+  ON dbo.RestraintOrder(HospitalId, AdmissionId, StartedAt DESC);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_round_note.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4014,6 +4180,79 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_RN_Parent' AND object_id
 BEGIN
   CREATE INDEX IX_RN_Parent ON dbo.RoundNote(ParentNoteId)
   WHERE ParentNoteId IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_sbar_handover.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+IF OBJECT_ID('dbo.ShiftHandoverNote','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.ShiftHandoverNote
+  (
+    ShiftHandoverNoteId  UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_SHN_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId           UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId          UNIQUEIDENTIFIER NOT NULL,
+    EncounterId          UNIQUEIDENTIFIER NULL,
+    PatientId            NVARCHAR(20)     NULL,
+
+    -- Which ward shift this handover covers (3-shift Indian ward convention).
+    ShiftCode            NVARCHAR(10)     NOT NULL,
+    ShiftDate            DATE             NOT NULL,   -- IST calendar date the shift belongs to (app-computed)
+
+    OutgoingNurseName    NVARCHAR(150)    NOT NULL,
+    OutgoingNurseUserId  UNIQUEIDENTIFIER NULL,
+    IncomingNurseName    NVARCHAR(150)    NULL,
+    IncomingNurseUserId  UNIQUEIDENTIFIER NULL,
+    IncomingAckAt        DATETIME2(3)     NULL,
+
+    -- Free-text fallback: when IsFreeText = 1, FreeTextNote carries the whole handover and the
+    -- 4 SBAR fields are ignored/NULL. When IsFreeText = 0, only Situation is mandatory â€” nurses
+    -- are never forced to fill Background/Assessment/Recommendation. See CK_SHN_FreeTextOrSbar.
+    IsFreeText           BIT              NOT NULL CONSTRAINT DF_SHN_FreeText DEFAULT (0),
+    FreeTextNote         NVARCHAR(MAX)    NULL,
+
+    Situation            NVARCHAR(MAX)    NULL,
+    Background           NVARCHAR(MAX)    NULL,
+    Assessment           NVARCHAR(MAX)    NULL,
+    Recommendation       NVARCHAR(MAX)    NULL,
+
+    HandoverAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_SHN_HandoverAt DEFAULT SYSUTCDATETIME(),
+
+    CreatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_SHN_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy            NVARCHAR(100)    NULL,
+    UpdatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_SHN_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy            NVARCHAR(100)    NULL,
+
+    RowVersion           ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_ShiftHandoverNote PRIMARY KEY CLUSTERED (ShiftHandoverNoteId),
+
+    CONSTRAINT FK_SHN_Admission FOREIGN KEY (AdmissionId)
+      REFERENCES dbo.Admission(AdmissionId),
+
+    CONSTRAINT CK_SHN_Shift CHECK (ShiftCode IN ('MORNING','EVENING','NIGHT')),
+
+    CONSTRAINT CK_SHN_FreeTextOrSbar CHECK (
+      (IsFreeText = 1 AND FreeTextNote IS NOT NULL AND LEN(FreeTextNote) > 0)
+      OR
+      (IsFreeText = 0 AND Situation IS NOT NULL AND LEN(Situation) > 0)
+    )
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_SHN_AdmissionTimeline' AND object_id=OBJECT_ID('dbo.ShiftHandoverNote'))
+BEGIN
+  CREATE INDEX IX_SHN_AdmissionTimeline
+  ON dbo.ShiftHandoverNote(HospitalId, AdmissionId, HandoverAt DESC)
+  INCLUDE (ShiftCode, ShiftDate, IsFreeText, OutgoingNurseName);
 END
 GO
 
@@ -4748,6 +4987,45 @@ BEGIN
   ON dbo.MedicationOrder(InventoryItemId)
   WHERE InventoryItemId IS NOT NULL;
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_nursing_docs_encounterid_nullable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Nursing Documentation & SBAR Handover phase.
+-- VitalReading/FluidEntry/GlucoseReading/NursingAssessment/RoundNote were all originally scaffolded
+-- with EncounterId NOT NULL, but Admission.EncounterId is nullable (null when a given admission has
+-- IPD billing disabled â€” see EnableIpdBilling). Nursing/clinical charting has nothing to do with
+-- billing, so it must not be gated on an encounter existing. Relax to nullable, guarded (these
+-- tables may already be deployed empty from the original 2026-05-26 scaffolding â€” never edit the
+-- CREATE TABLE body in place).
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.VitalReading') AND name = 'EncounterId' AND is_nullable = 0)
+  ALTER TABLE dbo.VitalReading ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.FluidEntry') AND name = 'EncounterId' AND is_nullable = 0)
+  ALTER TABLE dbo.FluidEntry ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.GlucoseReading') AND name = 'EncounterId' AND is_nullable = 0)
+  ALTER TABLE dbo.GlucoseReading ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.NursingAssessment') AND name = 'EncounterId' AND is_nullable = 0)
+  ALTER TABLE dbo.NursingAssessment ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.RoundNote') AND name = 'EncounterId' AND is_nullable = 0)
+  ALTER TABLE dbo.RoundNote ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.ConsentRecord') AND name = 'EncounterId' AND is_nullable = 0)
+  ALTER TABLE dbo.ConsentRecord ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
 GO
 
 GO

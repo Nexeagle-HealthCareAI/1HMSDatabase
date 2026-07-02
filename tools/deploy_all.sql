@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-02 08:44  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-03 00:01  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -2160,6 +2160,201 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_cssd.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- CSSD (Central Sterile Supply Department) â€” instrument set/tray master, sterilization cycle
+-- log (biological/chemical indicator results), and a movement/audit-trail table mirroring
+-- InventoryMovement's shape (issue-to-OT -> return -> wash -> pack -> sterilize -> store loop).
+-- Set/tray granularity, not individual-instrument â€” matches real CSSD operating practice.
+--
+-- NOTE: InstrumentSetMovement.SurgeryCaseId FK to dbo.SurgeryCase is deferred to
+-- create_tables_zz_foreign_keys.sql â€” this file (create_tables_cssd.sql, 'c') sorts before
+-- create_tables_ot.sql ('o') in deploy order, so SurgeryCase doesn't exist yet when this file runs.
+
+IF OBJECT_ID('dbo.InstrumentSet','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.InstrumentSet
+  (
+    InstrumentSetId      UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_ISET_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId           UNIQUEIDENTIFIER NOT NULL,
+
+    SetCode              NVARCHAR(50)     NOT NULL,
+    SetName               NVARCHAR(200)   NOT NULL,
+    Category               NVARCHAR(50)   NULL,   -- free text e.g. GENERAL/ORTHO/CARDIAC â€” hospitals vary, not a fixed enum
+    ItemComposition        NVARCHAR(1000) NULL,   -- free text description of contents
+
+    CurrentStatus          NVARCHAR(20)   NOT NULL CONSTRAINT DF_ISET_Status DEFAULT 'AVAILABLE',
+    CurrentLocation        NVARCHAR(200)  NULL,
+
+    IsActive               BIT            NOT NULL CONSTRAINT DF_ISET_IsActive DEFAULT (1),
+
+    CreatedAt              DATETIME2(3)   NOT NULL CONSTRAINT DF_ISET_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy              NVARCHAR(100)  NULL,
+    UpdatedAt              DATETIME2(3)   NOT NULL CONSTRAINT DF_ISET_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy              NVARCHAR(100)  NULL,
+
+    RowVersion             ROWVERSION     NOT NULL,
+
+    CONSTRAINT PK_InstrumentSet PRIMARY KEY CLUSTERED (InstrumentSetId),
+    CONSTRAINT CK_ISET_Status CHECK (CurrentStatus IN
+      ('AVAILABLE','ISSUED','IN_USE','RETURNED_SOILED','WASHING','PACKED','STERILIZING','STERILE','QUARANTINED','RETIRED'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_ISET_HospitalCode' AND object_id=OBJECT_ID('dbo.InstrumentSet'))
+BEGIN
+  CREATE UNIQUE INDEX UX_ISET_HospitalCode
+  ON dbo.InstrumentSet(HospitalId, SetCode);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ISET_HospitalStatus' AND object_id=OBJECT_ID('dbo.InstrumentSet'))
+BEGIN
+  CREATE INDEX IX_ISET_HospitalStatus
+  ON dbo.InstrumentSet(HospitalId, IsActive, CurrentStatus)
+  INCLUDE (SetName, Category, CurrentLocation);
+END
+GO
+
+IF OBJECT_ID('dbo.SterilizationCycle','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.SterilizationCycle
+  (
+    SterilizationCycleId    UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_STC_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId               UNIQUEIDENTIFIER NOT NULL,
+
+    CycleNumber               NVARCHAR(50)   NOT NULL,
+    AutoclaveLabel             NVARCHAR(100) NULL,
+    CycleType                  NVARCHAR(20)  NOT NULL CONSTRAINT DF_STC_CycleType DEFAULT 'STEAM',
+
+    StartedAt                  DATETIME2(3)  NOT NULL CONSTRAINT DF_STC_StartedAt DEFAULT SYSUTCDATETIME(),
+    EndedAt                    DATETIME2(3)  NULL,
+
+    BiologicalIndicatorResult  NVARCHAR(20)  NOT NULL CONSTRAINT DF_STC_BioResult DEFAULT 'PENDING',
+    ChemicalIndicatorResult    NVARCHAR(20)  NULL,
+
+    OperatorName                NVARCHAR(200) NOT NULL,
+    OperatorByUserId             UNIQUEIDENTIFIER NULL,
+
+    Notes                        NVARCHAR(1000) NULL,
+
+    CreatedAt                    DATETIME2(3)  NOT NULL CONSTRAINT DF_STC_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy                    NVARCHAR(100) NULL,
+
+    RowVersion                   ROWVERSION    NOT NULL,
+
+    CONSTRAINT PK_SterilizationCycle PRIMARY KEY CLUSTERED (SterilizationCycleId),
+    CONSTRAINT CK_STC_CycleType CHECK (CycleType IN ('STEAM','ETO','PLASMA')),
+    CONSTRAINT CK_STC_BioResult CHECK (BiologicalIndicatorResult IN ('PASS','FAIL','PENDING')),
+    CONSTRAINT CK_STC_ChemResult CHECK (ChemicalIndicatorResult IS NULL OR ChemicalIndicatorResult IN ('PASS','FAIL'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_STC_HospitalCycleNumber' AND object_id=OBJECT_ID('dbo.SterilizationCycle'))
+BEGIN
+  CREATE UNIQUE INDEX UX_STC_HospitalCycleNumber
+  ON dbo.SterilizationCycle(HospitalId, CycleNumber);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_STC_HospitalTimeline' AND object_id=OBJECT_ID('dbo.SterilizationCycle'))
+BEGIN
+  CREATE INDEX IX_STC_HospitalTimeline
+  ON dbo.SterilizationCycle(HospitalId, StartedAt DESC);
+END
+GO
+
+-- Child table: one cycle sterilizes multiple sets.
+IF OBJECT_ID('dbo.SterilizationCycleItem','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.SterilizationCycleItem
+  (
+    SterilizationCycleItemId  UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_STCI_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId                 UNIQUEIDENTIFIER NOT NULL,
+    SterilizationCycleId       UNIQUEIDENTIFIER NOT NULL,
+    InstrumentSetId            UNIQUEIDENTIFIER NOT NULL,
+
+    CONSTRAINT PK_SterilizationCycleItem PRIMARY KEY CLUSTERED (SterilizationCycleItemId),
+    CONSTRAINT FK_STCI_Cycle FOREIGN KEY (SterilizationCycleId) REFERENCES dbo.SterilizationCycle(SterilizationCycleId),
+    CONSTRAINT FK_STCI_InstrumentSet FOREIGN KEY (InstrumentSetId) REFERENCES dbo.InstrumentSet(InstrumentSetId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_STCI_CycleSet' AND object_id=OBJECT_ID('dbo.SterilizationCycleItem'))
+BEGIN
+  CREATE UNIQUE INDEX UX_STCI_CycleSet
+  ON dbo.SterilizationCycleItem(SterilizationCycleId, InstrumentSetId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_STCI_Set' AND object_id=OBJECT_ID('dbo.SterilizationCycleItem'))
+BEGIN
+  CREATE INDEX IX_STCI_Set
+  ON dbo.SterilizationCycleItem(InstrumentSetId);
+END
+GO
+
+-- Insert-only audit trail, mirrors InventoryMovement's shape. Every movement also updates
+-- InstrumentSet.CurrentStatus/CurrentLocation (denormalized, same relationship as
+-- InventoryItem.CurrentStock to InventoryMovement).
+IF OBJECT_ID('dbo.InstrumentSetMovement','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.InstrumentSetMovement
+  (
+    InstrumentSetMovementId  UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_ISM_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId                UNIQUEIDENTIFIER NOT NULL,
+    InstrumentSetId            UNIQUEIDENTIFIER NOT NULL,
+
+    MovementType                NVARCHAR(20)   NOT NULL,
+    SurgeryCaseId                UNIQUEIDENTIFIER NULL,   -- set on ISSUE_TO_OT/RETURN; FK deferred, see header note
+
+    MovedAt                       DATETIME2(3)  NOT NULL CONSTRAINT DF_ISM_MovedAt DEFAULT SYSUTCDATETIME(),
+    MovedBy                       NVARCHAR(200) NULL,
+    MovedByUserId                  UNIQUEIDENTIFIER NULL,
+
+    Notes                          NVARCHAR(500) NULL,
+
+    CreatedAt                      DATETIME2(3)  NOT NULL CONSTRAINT DF_ISM_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_InstrumentSetMovement PRIMARY KEY CLUSTERED (InstrumentSetMovementId),
+    CONSTRAINT FK_ISM_InstrumentSet FOREIGN KEY (InstrumentSetId) REFERENCES dbo.InstrumentSet(InstrumentSetId),
+    CONSTRAINT CK_ISM_Type CHECK (MovementType IN
+      ('ISSUE_TO_OT','RETURN','SEND_TO_WASH','PACK','QUARANTINE','DISCARD','RECEIVE_STERILE'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ISM_SetTimeline' AND object_id=OBJECT_ID('dbo.InstrumentSetMovement'))
+BEGIN
+  CREATE INDEX IX_ISM_SetTimeline
+  ON dbo.InstrumentSetMovement(HospitalId, InstrumentSetId, MovedAt DESC);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ISM_SurgeryCase' AND object_id=OBJECT_ID('dbo.InstrumentSetMovement'))
+BEGIN
+  CREATE INDEX IX_ISM_SurgeryCase
+  ON dbo.InstrumentSetMovement(SurgeryCaseId)
+  WHERE SurgeryCaseId IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_day_close.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -3715,6 +3910,369 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_ot.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Operation Theatre (OT) â€” full scope: theatre resource + booking, surgery case lifecycle,
+-- pre-op assessment, WHO Surgical Safety Checklist, intra-op record, and intra-op item usage
+-- (which doubles as the pharmacy-deduct trigger, billing source, and CSSD implant log).
+-- Tables declared in dependency order since they're all new in this one file.
+
+IF OBJECT_ID('dbo.OperationTheatre','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.OperationTheatre
+  (
+    TheatreId          UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_OT_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
+
+    TheatreCode        NVARCHAR(50)     NOT NULL,
+    TheatreName        NVARCHAR(200)    NOT NULL,
+
+    [Status]           NVARCHAR(20)     NOT NULL CONSTRAINT DF_OT_Status DEFAULT 'AVAILABLE',
+    IsActive           BIT              NOT NULL CONSTRAINT DF_OT_IsActive DEFAULT (1),
+
+    CreatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_OT_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy          NVARCHAR(100)    NULL,
+    UpdatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_OT_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy          NVARCHAR(100)    NULL,
+
+    RowVersion         ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_OperationTheatre PRIMARY KEY CLUSTERED (TheatreId),
+    CONSTRAINT CK_OT_Status CHECK ([Status] IN ('AVAILABLE','IN_USE','CLEANING','UNAVAILABLE'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_OT_HospitalCode' AND object_id=OBJECT_ID('dbo.OperationTheatre'))
+BEGIN
+  CREATE UNIQUE INDEX UX_OT_HospitalCode
+  ON dbo.OperationTheatre(HospitalId, TheatreCode);
+END
+GO
+
+IF OBJECT_ID('dbo.SurgeryCase','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.SurgeryCase
+  (
+    SurgeryCaseId       UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_SC_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId          UNIQUEIDENTIFIER NOT NULL,
+    AdmissionId         UNIQUEIDENTIFIER NOT NULL,
+    EncounterId         UNIQUEIDENTIFIER NULL,   -- nullable: Admission.EncounterId is null when EnableIpdBilling=false
+    PatientId           NVARCHAR(50)     NULL,
+
+    ProcedureName       NVARCHAR(300)    NOT NULL,
+    SurgeryType          NVARCHAR(20)    NOT NULL CONSTRAINT DF_SC_SurgeryType DEFAULT 'ELECTIVE',
+    Urgency              NVARCHAR(20)    NOT NULL CONSTRAINT DF_SC_Urgency DEFAULT 'ROUTINE',
+
+    RequestedBy          NVARCHAR(200)   NULL,
+    RequestedAt           DATETIME2(3)   NOT NULL CONSTRAINT DF_SC_RequestedAt DEFAULT SYSUTCDATETIME(),
+
+    SurgeonDoctorId       UNIQUEIDENTIFIER NULL,
+    SurgeonName           NVARCHAR(200)  NULL,
+    AnaesthetistDoctorId  UNIQUEIDENTIFIER NULL,
+    AnaesthetistName      NVARCHAR(200)  NULL,
+
+    StatusCode            NVARCHAR(20)   NOT NULL CONSTRAINT DF_SC_Status DEFAULT 'REQUESTED',
+    CancelledReason        NVARCHAR(500) NULL,
+
+    CreatedAt              DATETIME2(3)  NOT NULL CONSTRAINT DF_SC_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy               NVARCHAR(100) NULL,
+    UpdatedAt                DATETIME2(3) NOT NULL CONSTRAINT DF_SC_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy                 NVARCHAR(100) NULL,
+
+    RowVersion             ROWVERSION     NOT NULL,
+
+    CONSTRAINT PK_SurgeryCase PRIMARY KEY CLUSTERED (SurgeryCaseId),
+    CONSTRAINT FK_SC_Admission FOREIGN KEY (AdmissionId) REFERENCES dbo.Admission(AdmissionId),
+    CONSTRAINT CK_SC_SurgeryType CHECK (SurgeryType IN ('ELECTIVE','EMERGENCY')),
+    CONSTRAINT CK_SC_Urgency CHECK (Urgency IN ('ROUTINE','URGENT','EMERGENCY')),
+    CONSTRAINT CK_SC_Status CHECK (StatusCode IN ('REQUESTED','SCHEDULED','PRE_OP','IN_THEATRE','POST_OP','COMPLETED','CANCELLED'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_SC_AdmissionTimeline' AND object_id=OBJECT_ID('dbo.SurgeryCase'))
+BEGIN
+  CREATE INDEX IX_SC_AdmissionTimeline
+  ON dbo.SurgeryCase(HospitalId, AdmissionId, RequestedAt DESC)
+  INCLUDE (StatusCode, ProcedureName);
+END
+GO
+
+IF OBJECT_ID('dbo.SurgeryStatusHistory','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.SurgeryStatusHistory
+  (
+    HistoryId       UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_SSH_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId      UNIQUEIDENTIFIER NOT NULL,
+    SurgeryCaseId   UNIQUEIDENTIFIER NOT NULL,
+
+    FromStatus      NVARCHAR(20)     NULL,
+    ToStatus        NVARCHAR(20)     NOT NULL,
+    ChangedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_SSH_ChangedAt DEFAULT SYSUTCDATETIME(),
+    ChangedBy       NVARCHAR(200)    NULL,
+    Reason          NVARCHAR(500)    NULL,
+
+    CONSTRAINT PK_SurgeryStatusHistory PRIMARY KEY CLUSTERED (HistoryId),
+    CONSTRAINT FK_SSH_SurgeryCase FOREIGN KEY (SurgeryCaseId) REFERENCES dbo.SurgeryCase(SurgeryCaseId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_SSH_CaseTimeline' AND object_id=OBJECT_ID('dbo.SurgeryStatusHistory'))
+BEGIN
+  CREATE INDEX IX_SSH_CaseTimeline
+  ON dbo.SurgeryStatusHistory(HospitalId, SurgeryCaseId, ChangedAt DESC);
+END
+GO
+
+IF OBJECT_ID('dbo.OTBooking','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.OTBooking
+  (
+    OTBookingId      UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_OTB_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId       UNIQUEIDENTIFIER NOT NULL,
+    SurgeryCaseId    UNIQUEIDENTIFIER NOT NULL,
+    TheatreId        UNIQUEIDENTIFIER NOT NULL,
+
+    ScheduledStart   DATETIME2(3)     NOT NULL,
+    ScheduledEnd     DATETIME2(3)     NOT NULL,
+
+    StatusCode       NVARCHAR(20)     NOT NULL CONSTRAINT DF_OTB_Status DEFAULT 'SCHEDULED',
+
+    CreatedAt        DATETIME2(3)     NOT NULL CONSTRAINT DF_OTB_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy        NVARCHAR(100)    NULL,
+    UpdatedAt        DATETIME2(3)     NOT NULL CONSTRAINT DF_OTB_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy        NVARCHAR(100)    NULL,
+
+    RowVersion       ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_OTBooking PRIMARY KEY CLUSTERED (OTBookingId),
+    CONSTRAINT FK_OTB_SurgeryCase FOREIGN KEY (SurgeryCaseId) REFERENCES dbo.SurgeryCase(SurgeryCaseId),
+    CONSTRAINT FK_OTB_Theatre FOREIGN KEY (TheatreId) REFERENCES dbo.OperationTheatre(TheatreId),
+    CONSTRAINT CK_OTB_Status CHECK (StatusCode IN ('SCHEDULED','IN_PROGRESS','COMPLETED','CANCELLED')),
+    CONSTRAINT CK_OTB_TimeRange CHECK (ScheduledEnd > ScheduledStart)
+  );
+END
+GO
+
+-- One active (SCHEDULED/IN_PROGRESS) booking per case at a time â€” mirrors UX_RO_AdmissionActive
+-- on RestraintOrder. Rescheduling updates this row in place rather than inserting a new one.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_OTB_CaseActive' AND object_id=OBJECT_ID('dbo.OTBooking'))
+BEGIN
+  CREATE UNIQUE INDEX UX_OTB_CaseActive
+  ON dbo.OTBooking(SurgeryCaseId)
+  WHERE StatusCode IN ('SCHEDULED','IN_PROGRESS');
+END
+GO
+
+-- Backs the theatre-overlap check a booking handler runs before inserting/updating a booking.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_OTB_TheatreWindow' AND object_id=OBJECT_ID('dbo.OTBooking'))
+BEGIN
+  CREATE INDEX IX_OTB_TheatreWindow
+  ON dbo.OTBooking(HospitalId, TheatreId, ScheduledStart, ScheduledEnd)
+  INCLUDE (StatusCode, SurgeryCaseId);
+END
+GO
+
+IF OBJECT_ID('dbo.PreOpAssessment','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PreOpAssessment
+  (
+    PreOpAssessmentId       UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_POA_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId              UNIQUEIDENTIFIER NOT NULL,
+    SurgeryCaseId            UNIQUEIDENTIFIER NOT NULL,
+
+    AsaGrade                NVARCHAR(5)      NULL,
+    NpoConfirmed             BIT             NOT NULL CONSTRAINT DF_POA_Npo DEFAULT (0),
+    AllergiesReviewed        BIT             NOT NULL CONSTRAINT DF_POA_Allergies DEFAULT (0),
+    InvestigationsReviewed   BIT             NOT NULL CONSTRAINT DF_POA_Investigations DEFAULT (0),
+    ConsentConfirmed         BIT             NOT NULL CONSTRAINT DF_POA_Consent DEFAULT (0),
+
+    Notes                    NVARCHAR(1000)  NULL,
+
+    AssessedBy               NVARCHAR(200)   NOT NULL,
+    AssessedAt                DATETIME2(3)   NOT NULL CONSTRAINT DF_POA_AssessedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_PreOpAssessment PRIMARY KEY CLUSTERED (PreOpAssessmentId),
+    CONSTRAINT FK_POA_SurgeryCase FOREIGN KEY (SurgeryCaseId) REFERENCES dbo.SurgeryCase(SurgeryCaseId),
+    CONSTRAINT CK_POA_AsaGrade CHECK (AsaGrade IS NULL OR AsaGrade IN ('I','II','III','IV','V','VI'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_POA_CaseTimeline' AND object_id=OBJECT_ID('dbo.PreOpAssessment'))
+BEGIN
+  CREATE INDEX IX_POA_CaseTimeline
+  ON dbo.PreOpAssessment(HospitalId, SurgeryCaseId, AssessedAt DESC);
+END
+GO
+
+-- Fixed WHO 2009 Surgical Safety Checklist â€” 3 phases, one row per case. Each phase's item
+-- answers are a compact JSON blob against a fixed item list (IpdConstants.WhoChecklistItems on
+-- the API side) rather than ~25 boolean columns â€” the item list itself isn't DB-enforced or
+-- per-hospital-customizable this phase, same soft-validation posture as ConsentTemplate.TypeCode.
+IF OBJECT_ID('dbo.SurgicalSafetyChecklist','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.SurgicalSafetyChecklist
+  (
+    ChecklistId          UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_SSC_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId           UNIQUEIDENTIFIER NOT NULL,
+    SurgeryCaseId        UNIQUEIDENTIFIER NOT NULL,
+
+    SignInCompletedAt    DATETIME2(3)     NULL,
+    SignInCompletedBy    NVARCHAR(200)    NULL,
+    SignInItemsJson      NVARCHAR(MAX)    NULL,
+    SignInNotes          NVARCHAR(500)    NULL,
+
+    TimeOutCompletedAt   DATETIME2(3)     NULL,
+    TimeOutCompletedBy   NVARCHAR(200)    NULL,
+    TimeOutItemsJson     NVARCHAR(MAX)    NULL,
+    TimeOutNotes         NVARCHAR(500)    NULL,
+
+    SignOutCompletedAt   DATETIME2(3)     NULL,
+    SignOutCompletedBy   NVARCHAR(200)    NULL,
+    SignOutItemsJson     NVARCHAR(MAX)    NULL,
+    SignOutNotes         NVARCHAR(500)    NULL,
+
+    CreatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_SSC_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy            NVARCHAR(100)    NULL,
+    UpdatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_SSC_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy            NVARCHAR(100)    NULL,
+
+    RowVersion           ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_SurgicalSafetyChecklist PRIMARY KEY CLUSTERED (ChecklistId),
+    CONSTRAINT FK_SSC_SurgeryCase FOREIGN KEY (SurgeryCaseId) REFERENCES dbo.SurgeryCase(SurgeryCaseId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_SSC_Case' AND object_id=OBJECT_ID('dbo.SurgicalSafetyChecklist'))
+BEGIN
+  CREATE UNIQUE INDEX UX_SSC_Case
+  ON dbo.SurgicalSafetyChecklist(SurgeryCaseId);
+END
+GO
+
+IF OBJECT_ID('dbo.IntraOpRecord','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.IntraOpRecord
+  (
+    IntraOpRecordId       UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_IOR_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId            UNIQUEIDENTIFIER NOT NULL,
+    SurgeryCaseId         UNIQUEIDENTIFIER NOT NULL,
+
+    AnaesthesiaType       NVARCHAR(20)     NULL,
+    AnaesthesiaStartAt    DATETIME2(3)     NULL,
+    AnaesthesiaEndAt      DATETIME2(3)     NULL,
+
+    SurgeryStartAt        DATETIME2(3)     NULL,   -- incision
+    SurgeryEndAt          DATETIME2(3)     NULL,   -- closure
+
+    EstimatedBloodLossMl  DECIMAL(18,2)    NULL,
+    Findings              NVARCHAR(2000)   NULL,
+    ProcedurePerformed    NVARCHAR(300)    NULL,   -- actual, may differ from SurgeryCase.ProcedureName
+    SurgicalTeam          NVARCHAR(1000)   NULL,   -- free text: surgeon/assistant/anaesthetist/scrub/circulating names
+    ComplicationsNotes    NVARCHAR(2000)   NULL,
+
+    RecordedBy            NVARCHAR(200)    NOT NULL,
+    RecordedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_IOR_RecordedAt DEFAULT SYSUTCDATETIME(),
+
+    CreatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_IOR_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy             NVARCHAR(100)    NULL,
+    UpdatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_IOR_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy             NVARCHAR(100)    NULL,
+
+    RowVersion            ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_IntraOpRecord PRIMARY KEY CLUSTERED (IntraOpRecordId),
+    CONSTRAINT FK_IOR_SurgeryCase FOREIGN KEY (SurgeryCaseId) REFERENCES dbo.SurgeryCase(SurgeryCaseId),
+    CONSTRAINT CK_IOR_AnaesthesiaType CHECK (AnaesthesiaType IS NULL OR AnaesthesiaType IN ('GA','SPINAL','EPIDURAL','LOCAL','SEDATION','REGIONAL'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_IOR_Case' AND object_id=OBJECT_ID('dbo.IntraOpRecord'))
+BEGIN
+  CREATE UNIQUE INDEX UX_IOR_Case
+  ON dbo.IntraOpRecord(SurgeryCaseId);
+END
+GO
+
+-- Items actually used during surgery â€” descriptive (recorded after use), distinct from CPOE's
+-- prescriptive ClinicalOrder. One row here can simultaneously drive an InventoryMovement/stock
+-- deduction, a billing charge event, and (Category=IMPLANT) serve as the implant traceability
+-- log CSSD needs â€” no separate ImplantLog table.
+IF OBJECT_ID('dbo.IntraOpItemUsage','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.IntraOpItemUsage
+  (
+    IntraOpItemUsageId    UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_IOU_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId            UNIQUEIDENTIFIER NOT NULL,
+    SurgeryCaseId         UNIQUEIDENTIFIER NOT NULL,
+
+    InventoryItemId       UNIQUEIDENTIFIER NULL,   -- nullable: free-text fallback item, mirrors ClinicalOrderLine.ItemName
+    ItemName              NVARCHAR(200)    NOT NULL,
+    Category              NVARCHAR(20)     NOT NULL CONSTRAINT DF_IOU_Category DEFAULT 'CONSUMABLE',
+
+    Qty                   DECIMAL(18,3)    NOT NULL,
+    LotNumber             NVARCHAR(100)    NULL,
+    SerialNumber          NVARCHAR(100)    NULL,
+
+    ChargeId              UNIQUEIDENTIFIER NULL,
+    UnitRate              DECIMAL(18,2)    NULL,
+    ChargeEventId         UNIQUEIDENTIFIER NULL,
+    InventoryMovementId   UNIQUEIDENTIFIER NULL,
+
+    RecordedBy            NVARCHAR(200)    NOT NULL,
+    RecordedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_IOU_RecordedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_IntraOpItemUsage PRIMARY KEY CLUSTERED (IntraOpItemUsageId),
+    CONSTRAINT FK_IOU_SurgeryCase FOREIGN KEY (SurgeryCaseId) REFERENCES dbo.SurgeryCase(SurgeryCaseId),
+    CONSTRAINT FK_IOU_InventoryItem FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT CK_IOU_Category CHECK (Category IN ('CONSUMABLE','IMPLANT'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_IOU_Case' AND object_id=OBJECT_ID('dbo.IntraOpItemUsage'))
+BEGIN
+  CREATE INDEX IX_IOU_Case
+  ON dbo.IntraOpItemUsage(HospitalId, SurgeryCaseId, RecordedAt DESC);
+END
+GO
+
+-- Backs implant-recall lookups (find every patient/case an implant lot/serial went into).
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_IOU_ImplantTrace' AND object_id=OBJECT_ID('dbo.IntraOpItemUsage'))
+BEGIN
+  CREATE INDEX IX_IOU_ImplantTrace
+  ON dbo.IntraOpItemUsage(HospitalId, Category, LotNumber, SerialNumber)
+  WHERE Category = 'IMPLANT';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_pcpndt.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4591,6 +5149,17 @@ BEGIN
 END
 GO
 
+-- InstrumentSetMovement â†’ SurgeryCase (create_tables_cssd.sql sorts before create_tables_ot.sql)
+IF OBJECT_ID('dbo.InstrumentSetMovement','U') IS NOT NULL
+   AND OBJECT_ID('dbo.SurgeryCase','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_ISM_SurgeryCase')
+BEGIN
+  ALTER TABLE dbo.InstrumentSetMovement
+    ADD CONSTRAINT FK_ISM_SurgeryCase FOREIGN KEY (SurgeryCaseId)
+    REFERENCES dbo.SurgeryCase(SurgeryCaseId);
+END
+GO
+
 GO
 
 -- ---------------------------------------------------------------------
@@ -5410,6 +5979,23 @@ IF COL_LENGTH('dbo.BillingInvoice', 'BuyerGstin') IS NULL
 GO
 IF COL_LENGTH('dbo.BillingInvoice', 'PlaceOfSupplyStateCode') IS NULL
   ALTER TABLE dbo.BillingInvoice ADD PlaceOfSupplyStateCode NVARCHAR(2) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_transfusion_event_encounterid_nullable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- OT phase (Blood Bank module).
+-- TransfusionEvent was scaffolded (2026-05-26) with EncounterId NOT NULL, same bug pattern as
+-- VitalReading/FluidEntry/GlucoseReading/NursingAssessment/RoundNote/ConsentRecord/DischargeSummary
+-- (fixed in prior phases). Admission.EncounterId is nullable when EnableIpdBilling=false â€” a
+-- billing-disabled admission must still be able to record a transfusion. Relax to nullable, guarded.
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.TransfusionEvent') AND name = 'EncounterId' AND is_nullable = 0)
+  ALTER TABLE dbo.TransfusionEvent ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
 GO
 
 GO

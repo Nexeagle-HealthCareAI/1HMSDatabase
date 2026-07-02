@@ -57,3 +57,14 @@ BEGIN
     REFERENCES dbo.Admission(AdmissionId);
 END
 GO
+
+-- InstrumentSetMovement → SurgeryCase (create_tables_cssd.sql sorts before create_tables_ot.sql)
+IF OBJECT_ID('dbo.InstrumentSetMovement','U') IS NOT NULL
+   AND OBJECT_ID('dbo.SurgeryCase','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_ISM_SurgeryCase')
+BEGIN
+  ALTER TABLE dbo.InstrumentSetMovement
+    ADD CONSTRAINT FK_ISM_SurgeryCase FOREIGN KEY (SurgeryCaseId)
+    REFERENCES dbo.SurgeryCase(SurgeryCaseId);
+END
+GO

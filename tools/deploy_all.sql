@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-02 00:25  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-02 08:44  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -4745,6 +4745,37 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_admissioncoverage_irdai_clocks.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Discharge phase.
+-- IRDAI discharge-process clock milestones not already captured elsewhere: final bill/discharge
+-- summary submitted to the insurer, and the insurer's response received. The other two milestones
+-- (discharge decision, physical discharge) are already computed from AdmissionStatusHistory â€” no
+-- schema change needed for those. Kept as separate timestamp pairs, not folded into
+-- AdmissionCoverage.StatusCode, since that column already carries the pre-auth sanction workflow
+-- (PENDING/APPROVED/QUERIED/REJECTED/ENHANCED) â€” a different process from final-claim submission.
+
+IF COL_LENGTH('dbo.AdmissionCoverage','ClaimSubmittedAt') IS NULL
+  ALTER TABLE dbo.AdmissionCoverage ADD ClaimSubmittedAt DATETIME2(3) NULL;
+GO
+
+IF COL_LENGTH('dbo.AdmissionCoverage','ClaimSubmittedBy') IS NULL
+  ALTER TABLE dbo.AdmissionCoverage ADD ClaimSubmittedBy NVARCHAR(100) NULL;
+GO
+
+IF COL_LENGTH('dbo.AdmissionCoverage','InsurerApprovalAt') IS NULL
+  ALTER TABLE dbo.AdmissionCoverage ADD InsurerApprovalAt DATETIME2(3) NULL;
+GO
+
+IF COL_LENGTH('dbo.AdmissionCoverage','InsurerApprovalBy') IS NULL
+  ALTER TABLE dbo.AdmissionCoverage ADD InsurerApprovalBy NVARCHAR(100) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_admissiondaybill_admissionid_nullable.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4761,6 +4792,38 @@ IF EXISTS (
 )
 BEGIN
     ALTER TABLE dbo.AdmissionDayBill ALTER COLUMN AdmissionId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_billingchargeevent_chargeid.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Discharge phase.
+-- BillingChargeEvent never stored a link back to ChargeMaster (AddChargeEventHandler already
+-- receives ChargeDetail.ChargeId per line but silently drops it before persisting). Needed so the
+-- TPA payable/non-payable split can join an admission's full charge history to
+-- ChargeMaster.IsIRDAIPayable. Nullable â€” pre-existing rows have no reliable backfill path and
+-- surface as "Unclassified" in the split query rather than being guessed at.
+
+IF COL_LENGTH('dbo.BillingChargeEvent','ChargeId') IS NULL
+  ALTER TABLE dbo.BillingChargeEvent ADD ChargeId UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BCE_ChargeMaster')
+  ALTER TABLE dbo.BillingChargeEvent
+    ADD CONSTRAINT FK_BCE_ChargeMaster FOREIGN KEY (ChargeId)
+      REFERENCES dbo.ChargeMaster(ChargeId);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_BCE_Charge' AND object_id=OBJECT_ID('dbo.BillingChargeEvent'))
+BEGIN
+  CREATE INDEX IX_BCE_Charge
+  ON dbo.BillingChargeEvent(HospitalId, ChargeId)
+  WHERE ChargeId IS NOT NULL;
 END
 GO
 
@@ -4808,6 +4871,21 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_chargemaster_irdai_payable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Discharge phase.
+-- Per-item IRDAI payable/non-payable classification (real TPA claim forms carry a "Non-Payable
+-- Items" annexure â€” IRDAI List I/II/III/IV concept). Hospital-configurable, default payable.
+IF COL_LENGTH('dbo.ChargeMaster','IsIRDAIPayable') IS NULL
+  ALTER TABLE dbo.ChargeMaster ADD IsIRDAIPayable BIT NOT NULL
+    CONSTRAINT DF_CM_IRDAIPayable DEFAULT (1);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_clinical_order_line_high_alert.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4821,6 +4899,23 @@ GO
 IF COL_LENGTH('dbo.ClinicalOrderLine','IsHighAlert') IS NULL
   ALTER TABLE dbo.ClinicalOrderLine ADD IsHighAlert BIT NOT NULL
     CONSTRAINT DF_COL_IsHighAlert DEFAULT (0);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_discharge_summary_encounterid_nullable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Discharge phase.
+-- DischargeSummary was scaffolded (2026-05-26) with EncounterId NOT NULL, same batch/bug as
+-- VitalReading/FluidEntry/GlucoseReading/NursingAssessment/RoundNote/ConsentRecord (fixed in the
+-- Nursing Documentation phase). Admission.EncounterId is nullable when EnableIpdBilling=false â€”
+-- a billing-disabled admission must still be dischargeable. Relax to nullable, guarded.
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.DischargeSummary') AND name = 'EncounterId' AND is_nullable = 0)
+  ALTER TABLE dbo.DischargeSummary ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
 GO
 
 GO

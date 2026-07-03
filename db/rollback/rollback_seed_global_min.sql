@@ -90,7 +90,7 @@ FROM dbo.RolePermissions RP
 JOIN dbo.Roles R
   ON RP.RoleID = R.RoleID
 WHERE R.HospitalID IS NULL
-  AND R.RoleName IN (N'Admin', N'AdminDoctor', N'Receptionist', N'Nurse', N'Doctor')
+  AND R.RoleName IN (N'Admin', N'AdminDoctor', N'Receptionist', N'Nurse', N'Doctor', N'Accountant')
   AND RP.PermissionKey IN (
         N'admin_panel',
         N'appointment_scheduler',
@@ -102,7 +102,7 @@ WHERE R.HospitalID IS NULL
 -- 4b) Roles themselves (global, system-defined)
 DELETE FROM dbo.Roles
 WHERE HospitalID IS NULL
-  AND RoleName IN (N'Admin', N'AdminDoctor', N'Receptionist', N'Nurse', N'Doctor')
+  AND RoleName IN (N'Admin', N'AdminDoctor', N'Receptionist', N'Nurse', N'Doctor', N'Accountant')
   AND IsSystemDefined = 1;
 
 

@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-03 00:21  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-03 17:05  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -2154,6 +2154,76 @@ BEGIN
   CREATE INDEX IX_CR_AdmissionTimeline
   ON dbo.ConsentRecord(HospitalId, AdmissionId, SignedAt DESC)
   INCLUDE (TemplateTypeCode, TemplateTitle, SignedByName);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_consultant_incentive.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Billing phase.
+-- Consultant (treating-doctor) incentive sub-ledger. Mirrors ReferralIncentive's shape
+-- (StatusCode ACCRUED/PAID/CANCELLED, PaidAt/By/PayoutRef/TdsAmount, audit) for a different
+-- concept: who TREATED the patient (BillingChargeEvent.AttributedDoctorId), not who referred
+-- them. One row accrued per charge line that has both an attributed doctor and IncentiveAmount > 0.
+
+IF OBJECT_ID('dbo.ConsultantIncentiveLedger', 'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.ConsultantIncentiveLedger
+  (
+    ConsultantIncentiveLedgerId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_CIL_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+    DoctorId          UNIQUEIDENTIFIER NOT NULL,
+    PatientId         NVARCHAR(20)     NOT NULL,
+    EncounterId       UNIQUEIDENTIFIER NULL,
+    ChargeEventId     UNIQUEIDENTIFIER NOT NULL,
+
+    IncentiveAmount   DECIMAL(18,2)    NOT NULL,
+
+    StatusCode        NVARCHAR(20)     NOT NULL
+      CONSTRAINT DF_CIL_Status DEFAULT ('ACCRUED'),   -- ACCRUED/PAID/CANCELLED
+
+    AccruedAt         DATETIME2(3)     NOT NULL
+      CONSTRAINT DF_CIL_AccruedAt DEFAULT SYSUTCDATETIME(),
+
+    PaidAt            DATETIME2(3)     NULL,
+    PaidBy            NVARCHAR(100)    NULL,
+    PayoutRef         NVARCHAR(100)    NULL,
+    TdsAmount         DECIMAL(18,2)    NULL,
+
+    CancelledAt       DATETIME2(3)     NULL,
+    CancelledBy       NVARCHAR(100)    NULL,
+    CancelReason      NVARCHAR(300)    NULL,
+
+    CreatedAt         DATETIME2(3)     NOT NULL
+      CONSTRAINT DF_CIL_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy         NVARCHAR(100)    NULL,
+
+    UpdatedAt         DATETIME2(3)     NOT NULL
+      CONSTRAINT DF_CIL_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy         NVARCHAR(100)    NULL,
+
+    RowVersion        ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_ConsultantIncentiveLedger PRIMARY KEY CLUSTERED (ConsultantIncentiveLedgerId),
+
+    CONSTRAINT FK_CIL_Doctor FOREIGN KEY (DoctorId)
+      REFERENCES dbo.Doctors(DoctorID),
+
+    CONSTRAINT FK_CIL_ChargeEvent FOREIGN KEY (ChargeEventId)
+      REFERENCES dbo.BillingChargeEvent(ChargeEventId),
+
+    CONSTRAINT CK_CIL_Incentive CHECK (IncentiveAmount >= 0),
+    CONSTRAINT CK_CIL_Status    CHECK (StatusCode IN ('ACCRUED','PAID','CANCELLED'))
+  );
+
+  CREATE INDEX IX_CIL_Doctor_Status ON dbo.ConsultantIncentiveLedger (HospitalId, DoctorId, StatusCode);
+  CREATE UNIQUE INDEX UX_CIL_ChargeEvent ON dbo.ConsultantIncentiveLedger (ChargeEventId);
 END
 GO
 
@@ -4542,6 +4612,83 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_rate_card.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Billing phase (revenue engine) â€” "Tariff = f(service, payer, room class)". ChargeMaster keeps
+-- one DefaultRate; these two small tables layer payer-specific overrides and a room-class
+-- multiplier on top, rather than a full (item x payer x room) rate matrix.
+
+IF OBJECT_ID('dbo.ChargeMasterPayerRate','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.ChargeMasterPayerRate
+  (
+    ChargeMasterPayerRateId  UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_CMPR_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId               UNIQUEIDENTIFIER NOT NULL,
+    ChargeId                 UNIQUEIDENTIFIER NOT NULL,
+    PayerType                NVARCHAR(20)     NOT NULL,   -- CASH/TPA/SCHEME
+    OverrideRate             DECIMAL(18,2)    NOT NULL,
+
+    IsActive                 BIT              NOT NULL CONSTRAINT DF_CMPR_IsActive DEFAULT (1),
+
+    CreatedAt                DATETIME2(3)     NOT NULL CONSTRAINT DF_CMPR_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy                NVARCHAR(100)    NULL,
+    UpdatedAt                DATETIME2(3)     NOT NULL CONSTRAINT DF_CMPR_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy                NVARCHAR(100)    NULL,
+
+    RowVersion               ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_ChargeMasterPayerRate PRIMARY KEY CLUSTERED (ChargeMasterPayerRateId),
+    CONSTRAINT FK_CMPR_ChargeMaster FOREIGN KEY (ChargeId) REFERENCES dbo.ChargeMaster(ChargeId),
+    CONSTRAINT CK_CMPR_PayerType CHECK (PayerType IN ('CASH','TPA','SCHEME'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_CMPR_ChargePayer' AND object_id=OBJECT_ID('dbo.ChargeMasterPayerRate'))
+BEGIN
+  CREATE UNIQUE INDEX UX_CMPR_ChargePayer
+  ON dbo.ChargeMasterPayerRate(HospitalId, ChargeId, PayerType);
+END
+GO
+
+IF OBJECT_ID('dbo.RoomClassRateMultiplier','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.RoomClassRateMultiplier
+  (
+    RoomClassRateMultiplierId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_RCRM_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId                 UNIQUEIDENTIFIER NOT NULL,
+    RoomType                   NVARCHAR(20)     NOT NULL,
+    MultiplierPercent          DECIMAL(6,2)     NOT NULL CONSTRAINT DF_RCRM_Multiplier DEFAULT (100),
+
+    CreatedAt                  DATETIME2(3)     NOT NULL CONSTRAINT DF_RCRM_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy                  NVARCHAR(100)    NULL,
+    UpdatedAt                  DATETIME2(3)     NOT NULL CONSTRAINT DF_RCRM_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy                  NVARCHAR(100)    NULL,
+
+    RowVersion                 ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_RoomClassRateMultiplier PRIMARY KEY CLUSTERED (RoomClassRateMultiplierId),
+    CONSTRAINT CK_RCRM_Multiplier CHECK (MultiplierPercent > 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_RCRM_HospitalRoomType' AND object_id=OBJECT_ID('dbo.RoomClassRateMultiplier'))
+BEGIN
+  CREATE UNIQUE INDEX UX_RCRM_HospitalRoomType
+  ON dbo.RoomClassRateMultiplier(HospitalId, RoomType);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_referral.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -5480,6 +5627,61 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_admissioncoverage_enhancement.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Billing phase.
+-- Pre-auth enhancement tracking: when utilization approaches the sanctioned amount, the
+-- billing desk requests a higher sanction from the insurer/TPA and later records approval.
+-- EnhancedSanctionedAmount holds the PROPOSED new total sanctioned amount (not an incremental
+-- add-on) â€” it only becomes the effective sanctioned amount once EnhancementApprovedAt is set;
+-- until then, utilization still compares against the original SanctionedAmount. Manual internal
+-- tracking only, same as the IRDAI clocks above â€” no real insurer/TPA API submission (no sandbox
+-- access).
+
+IF COL_LENGTH('dbo.AdmissionCoverage','EnhancementRequestedAt') IS NULL
+  ALTER TABLE dbo.AdmissionCoverage ADD EnhancementRequestedAt DATETIME2(3) NULL;
+GO
+
+IF COL_LENGTH('dbo.AdmissionCoverage','EnhancementRequestedBy') IS NULL
+  ALTER TABLE dbo.AdmissionCoverage ADD EnhancementRequestedBy NVARCHAR(100) NULL;
+GO
+
+IF COL_LENGTH('dbo.AdmissionCoverage','EnhancedSanctionedAmount') IS NULL
+  ALTER TABLE dbo.AdmissionCoverage ADD EnhancedSanctionedAmount DECIMAL(18,2) NULL;
+GO
+
+IF COL_LENGTH('dbo.AdmissionCoverage','EnhancementApprovedAt') IS NULL
+  ALTER TABLE dbo.AdmissionCoverage ADD EnhancementApprovedAt DATETIME2(3) NULL;
+GO
+
+IF COL_LENGTH('dbo.AdmissionCoverage','EnhancementApprovedBy') IS NULL
+  ALTER TABLE dbo.AdmissionCoverage ADD EnhancementApprovedBy NVARCHAR(100) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_admissioncoverage_entitled_room_category.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Billing phase (revenue engine).
+-- Captures the payer's entitled room category at admission, so the TPA split can compute the
+-- room-rent "proportionate deduction" the IRDAI split requires: if the patient occupies a room
+-- above their entitlement, only the entitled-tier rate stays payable by the insurer â€” the
+-- differential becomes the patient's own non-payable liability. Free-text matching
+-- BedMaster.WardType's own convention (soft-validated via IpdConstants.WardType, no CHECK
+-- constraint â€” same posture as WardType itself).
+
+IF COL_LENGTH('dbo.AdmissionCoverage','EntitledRoomCategory') IS NULL
+  ALTER TABLE dbo.AdmissionCoverage ADD EntitledRoomCategory NVARCHAR(20) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_admissioncoverage_irdai_clocks.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -5528,6 +5730,22 @@ IF EXISTS (
 BEGIN
     ALTER TABLE dbo.AdmissionDayBill ALTER COLUMN AdmissionId UNIQUEIDENTIFIER NULL;
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_billingchargeevent_attributed_doctor.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Billing phase.
+-- Best-effort treating-doctor attribution for consultant incentive accrual. Populated by the
+-- caller (CPOE: ClinicalOrder.OrderedByDoctorId; OT: SurgeryCase.SurgeonDoctorId) when known â€”
+-- left NULL otherwise, same soft-link convention as ClinicalOrder.OrderedByDoctorId (no FK).
+
+IF COL_LENGTH('dbo.BillingChargeEvent','AttributedDoctorId') IS NULL
+  ALTER TABLE dbo.BillingChargeEvent ADD AttributedDoctorId UNIQUEIDENTIFIER NULL;
 GO
 
 GO
@@ -5634,6 +5852,23 @@ GO
 IF COL_LENGTH('dbo.ClinicalOrderLine','IsHighAlert') IS NULL
   ALTER TABLE dbo.ClinicalOrderLine ADD IsHighAlert BIT NOT NULL
     CONSTRAINT DF_COL_IsHighAlert DEFAULT (0);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_clinicalorderline_daily_recurring.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Billing phase.
+-- Marks a CPOE order line (e.g. oxygen, continuous monitoring) as accruing one charge per IST
+-- day it stays ACTIVE, rather than charging once at order time. Consumed by the nightly job's
+-- PostDailyRecurringCharges step (mirrors PostDailyBedCharges' shape).
+
+IF COL_LENGTH('dbo.ClinicalOrderLine','IsDailyRecurringCharge') IS NULL
+  ALTER TABLE dbo.ClinicalOrderLine ADD IsDailyRecurringCharge BIT NOT NULL
+    CONSTRAINT DF_COL_DailyRecurring DEFAULT (0);
 GO
 
 GO

@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-04 21:34  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-05 00:04  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -6583,6 +6583,36 @@ GO
 -- Idempotent: only added if it doesn't already exist.
 IF COL_LENGTH('dbo.Prescription', 'SystemicExamination') IS NULL
     ALTER TABLE dbo.Prescription ADD SystemicExamination NVARCHAR(MAX) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_room_floor_required.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Room/Bed Master unification: floor is now a structural part of a room's identity, not just a
+-- label â€” Bed Master's new hierarchy is Floor -> Room -> Bed, and room numbers are only unique
+-- WITHIN a floor (two different floors may both legitimately have a "Room 101"). Backfill any
+-- existing NULL FloorNo before making it required, so the ALTER never fails on live data.
+
+UPDATE dbo.Room SET FloorNo = 'UNASSIGNED' WHERE FloorNo IS NULL;
+GO
+
+IF EXISTS (
+  SELECT 1 FROM sys.columns
+  WHERE object_id = OBJECT_ID('dbo.Room') AND name = 'FloorNo' AND is_nullable = 1
+)
+  ALTER TABLE dbo.Room ALTER COLUMN FloorNo NVARCHAR(20) NOT NULL;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'UX_ROOM_No' AND parent_object_id = OBJECT_ID('dbo.Room'))
+  ALTER TABLE dbo.Room DROP CONSTRAINT UX_ROOM_No;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'UX_ROOM_Floor_RoomNo' AND parent_object_id = OBJECT_ID('dbo.Room'))
+  ALTER TABLE dbo.Room ADD CONSTRAINT UX_ROOM_Floor_RoomNo UNIQUE (HospitalId, FloorNo, RoomNo);
 GO
 
 GO

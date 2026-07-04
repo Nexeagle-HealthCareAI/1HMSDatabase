@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-05 00:04  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-05 00:43  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -6874,6 +6874,22 @@ ELSE
 BEGIN
     PRINT 'Table already exists: InvoicePrintSettings';
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/fix_billing_policy_ipd_bed_charge_mode.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Data fix, not a schema change. The Configuration page's "IPD Bed Charge: Auto" toggle wrote
+-- IpdBedChargeMode = 'AUTO', but the nightly bed-charge job (easyHMSNightJob) has always checked
+-- for 'DAILY_AUTO' (matching this column's documented intent) â€” the two never matched, so any
+-- hospital that already flipped the toggle before this fix silently got no automatic bed charges.
+-- Idempotent: safe to re-run, only touches rows still carrying the stale 'AUTO' value.
+
+UPDATE dbo.BillingPolicy SET IpdBedChargeMode = 'DAILY_AUTO' WHERE IpdBedChargeMode = 'AUTO';
 GO
 
 GO

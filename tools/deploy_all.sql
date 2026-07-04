@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-04 13:56  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-04 19:51  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -1323,6 +1323,59 @@ BEGIN
   CREATE INDEX IX_AL_Admission
   ON dbo.AuditLog(HospitalId, AdmissionId, CreatedAt DESC)
   WHERE AdmissionId IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_billing_payment_allocation_charge.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- QA sweep, Phase C items 16/18. BillingPaymentAllocation only ties a payment to an invoice as
+-- a lump sum â€” there was no way to tell which specific charge(s) within that invoice the money
+-- actually covered, so cancelling one charge on a partially-paid multi-service invoice couldn't
+-- safely reverse just that charge's share of a payment. This table is that missing breakdown.
+
+IF OBJECT_ID('dbo.BillingPaymentAllocationCharge','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.BillingPaymentAllocationCharge
+  (
+    AllocationChargeId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PAYALC_Id DEFAULT NEWSEQUENTIALID(),
+
+    AllocationId       UNIQUEIDENTIFIER NOT NULL,
+    ChargeEventId      UNIQUEIDENTIFIER NOT NULL,
+    Amount             DECIMAL(18,2)    NOT NULL,
+
+    CreatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_PAYALC_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy          NVARCHAR(100)    NULL,
+
+    CONSTRAINT PK_BillingPaymentAllocationCharge PRIMARY KEY CLUSTERED (AllocationChargeId),
+
+    CONSTRAINT FK_PAYALC_Allocation FOREIGN KEY (AllocationId)
+      REFERENCES dbo.BillingPaymentAllocation(AllocationId),
+
+    CONSTRAINT FK_PAYALC_ChargeEvent FOREIGN KEY (ChargeEventId)
+      REFERENCES dbo.BillingChargeEvent(ChargeEventId),
+
+    CONSTRAINT CK_PAYALC_Amt CHECK (Amount > 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PAYALC_Charge' AND object_id=OBJECT_ID('dbo.BillingPaymentAllocationCharge'))
+BEGIN
+  CREATE INDEX IX_PAYALC_Charge
+  ON dbo.BillingPaymentAllocationCharge(ChargeEventId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PAYALC_Allocation' AND object_id=OBJECT_ID('dbo.BillingPaymentAllocationCharge'))
+BEGIN
+  CREATE INDEX IX_PAYALC_Allocation
+  ON dbo.BillingPaymentAllocationCharge(AllocationId);
 END
 GO
 
@@ -5874,6 +5927,32 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_billingchargeevent_idempotency_key.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- QA sweep, Phase C item 17.
+-- The offline sync engine's outbox replay already sends an Idempotency-Key header on every
+-- retried write (syncEngine.ts), but AddChargeEventHandler never read or stored it, so a
+-- retried "add-event" call (e.g. after a dropped response on a flaky connection) silently
+-- posted the same charges twice. Nullable â€” only calls made through the offline outbox carry
+-- a key; direct/online calls stay null and are never treated as duplicates of each other.
+
+IF COL_LENGTH('dbo.BillingChargeEvent','IdempotencyKey') IS NULL
+  ALTER TABLE dbo.BillingChargeEvent ADD IdempotencyKey NVARCHAR(100) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UQ_BCE_Hospital_IdempotencyKey' AND object_id=OBJECT_ID('dbo.BillingChargeEvent'))
+BEGIN
+  CREATE UNIQUE INDEX UQ_BCE_Hospital_IdempotencyKey
+  ON dbo.BillingChargeEvent(HospitalId, IdempotencyKey)
+  WHERE IdempotencyKey IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_billingpolicy_drop_finalize_and_discount.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -5960,6 +6039,28 @@ GO
 IF COL_LENGTH('dbo.ClinicalOrderLine','IsDailyRecurringCharge') IS NULL
   ALTER TABLE dbo.ClinicalOrderLine ADD IsDailyRecurringCharge BIT NOT NULL
     CONSTRAINT DF_COL_DailyRecurring DEFAULT (0);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_credit_approval_discount_type.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Widen CreditApproval.PaymentType to also allow 'DISCOUNT' â€” a retroactive discount that would
+-- reduce an invoice below amount already collected now routes through the same admin-approval
+-- gate as an over-crediting ADVANCE/REFUND, instead of applying silently.
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_CA_PaymentType')
+BEGIN
+  ALTER TABLE dbo.CreditApproval DROP CONSTRAINT CK_CA_PaymentType;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_CA_PaymentType')
+BEGIN
+  ALTER TABLE dbo.CreditApproval ADD CONSTRAINT CK_CA_PaymentType CHECK (PaymentType IN ('ADVANCE','REFUND','DISCOUNT'));
+END
 GO
 
 GO

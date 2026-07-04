@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-04 21:07  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-04 21:34  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -5106,6 +5106,61 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_room_master.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Configuration: Room master. Previously a room was just a free-text RoomCode duplicated on every
+-- BedMaster row, with no entity of its own and nothing enforcing how many beds it actually holds.
+-- This table is the real "room" record â€” you set the room number/ward/type/rate/capacity once,
+-- then beds are created against it (BedMaster.RoomId), with capacity enforced at bed-creation time.
+
+IF OBJECT_ID('dbo.Room','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Room
+  (
+    RoomId          UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_ROOM_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId      UNIQUEIDENTIFIER NOT NULL,
+
+    WardCode        NVARCHAR(30)     NOT NULL,
+    WardName        NVARCHAR(100)    NOT NULL,
+    WardType        NVARCHAR(20)     NOT NULL,
+    FloorNo         NVARCHAR(20)     NULL,
+
+    RoomNo          NVARCHAR(30)     NOT NULL,
+    RoomType        NVARCHAR(20)     NULL,
+    CapacityInRoom  INT              NOT NULL CONSTRAINT DF_ROOM_Capacity DEFAULT (1),
+    DailyRate       DECIMAL(18,2)    NOT NULL CONSTRAINT DF_ROOM_Rate DEFAULT (0),
+
+    IsActive        BIT              NOT NULL CONSTRAINT DF_ROOM_Active DEFAULT (1),
+
+    CreatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_ROOM_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy       NVARCHAR(100)    NULL,
+    UpdatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_ROOM_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy       NVARCHAR(100)    NULL,
+
+    RowVersion      ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_Room PRIMARY KEY CLUSTERED (RoomId),
+    CONSTRAINT UX_ROOM_No UNIQUE (HospitalId, RoomNo),
+    CONSTRAINT CK_ROOM_Capacity CHECK (CapacityInRoom > 0),
+    CONSTRAINT CK_ROOM_Rate CHECK (DailyRate >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ROOM_Hospital' AND object_id=OBJECT_ID('dbo.Room'))
+BEGIN
+  CREATE INDEX IX_ROOM_Hospital
+  ON dbo.Room(HospitalId, IsActive);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_round_note.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -5873,6 +5928,34 @@ IF EXISTS (
 )
 BEGIN
     ALTER TABLE dbo.AdmissionDayBill ALTER COLUMN AdmissionId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_bedmaster_room_id.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Links each bed to the Room master row it belongs to. Nullable â€” beds created the old way
+-- (free-text RoomCode only, no Room master row) keep working unchanged.
+
+IF COL_LENGTH('dbo.BedMaster','RoomId') IS NULL
+  ALTER TABLE dbo.BedMaster ADD RoomId UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BM_Room')
+  ALTER TABLE dbo.BedMaster
+    ADD CONSTRAINT FK_BM_Room FOREIGN KEY (RoomId)
+      REFERENCES dbo.Room(RoomId);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_BM_Room' AND object_id=OBJECT_ID('dbo.BedMaster'))
+BEGIN
+  CREATE INDEX IX_BM_Room
+  ON dbo.BedMaster(RoomId)
+  WHERE RoomId IS NOT NULL;
 END
 GO
 

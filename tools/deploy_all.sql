@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-03 17:05  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-04 00:27  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -5594,6 +5594,31 @@ GO
 -- #####################################################################
 -- ##  SECTION: MIGRATIONS (column ALTERs)
 -- #####################################################################
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_admission_referring_facility.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Admission phase (admission-flow spec).
+-- Structured "referred/transferred in from an outside facility" capture â€” distinct from the
+-- existing ReferralSource/ReferralName/ReferredByReferrerId, which track referral COMMISSION
+-- (the Referrer entity), not which PHC/nursing home/hospital physically sent the patient in.
+-- Needed for PM-JAY referral rules and the hospital's own referral-network analytics. Idempotent.
+IF OBJECT_ID('dbo.Admission', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Admission', 'ReferringFacilityName') IS NULL
+        ALTER TABLE dbo.Admission ADD ReferringFacilityName NVARCHAR(200) NULL;
+
+    IF COL_LENGTH('dbo.Admission', 'ReferringFacilityType') IS NULL
+        ALTER TABLE dbo.Admission ADD ReferringFacilityType NVARCHAR(20) NULL;
+
+    IF COL_LENGTH('dbo.Admission', 'ReferringFacilityContact') IS NULL
+        ALTER TABLE dbo.Admission ADD ReferringFacilityContact NVARCHAR(20) NULL;
+END
+GO
+
+GO
 
 -- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_admission_type_referral.sql

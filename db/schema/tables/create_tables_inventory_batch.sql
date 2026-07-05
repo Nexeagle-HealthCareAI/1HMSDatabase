@@ -38,7 +38,8 @@ BEGIN
 
     CONSTRAINT PK_Batch PRIMARY KEY CLUSTERED (BatchId),
     CONSTRAINT FK_BATCH_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
-    CONSTRAINT FK_BATCH_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId),
+    -- FK_BATCH_Store deferred to create_tables_zz_foreign_keys.sql: Store is created in
+    -- create_tables_inventory_store.sql, which sorts AFTER this file alphabetically.
     CONSTRAINT CK_BATCH_Status CHECK ([Status] IN ('ACTIVE','EXHAUSTED','EXPIRED','QUARANTINED','RECALLED')),
     CONSTRAINT CK_BATCH_RemainingQty CHECK (RemainingQty >= 0),
     CONSTRAINT CK_BATCH_ReceivedQty CHECK (ReceivedQty >= 0)
@@ -78,7 +79,7 @@ BEGIN
 
     CONSTRAINT PK_StockLevel PRIMARY KEY CLUSTERED (StockLevelId),
     CONSTRAINT FK_SL_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
-    CONSTRAINT FK_SL_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId),
+    -- FK_SL_Store deferred to create_tables_zz_foreign_keys.sql (see note on FK_BATCH_Store above).
     CONSTRAINT UX_SL_ItemStore UNIQUE (InventoryItemId, StoreId),
     CONSTRAINT CK_SL_Qty CHECK (QtyOnHand >= 0)
   );

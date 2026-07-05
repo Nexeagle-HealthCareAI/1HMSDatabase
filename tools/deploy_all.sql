@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-05 17:11  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-05 17:50  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -3407,7 +3407,8 @@ BEGIN
 
     CONSTRAINT PK_Batch PRIMARY KEY CLUSTERED (BatchId),
     CONSTRAINT FK_BATCH_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
-    CONSTRAINT FK_BATCH_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId),
+    -- FK_BATCH_Store deferred to create_tables_zz_foreign_keys.sql: Store is created in
+    -- create_tables_inventory_store.sql, which sorts AFTER this file alphabetically.
     CONSTRAINT CK_BATCH_Status CHECK ([Status] IN ('ACTIVE','EXHAUSTED','EXPIRED','QUARANTINED','RECALLED')),
     CONSTRAINT CK_BATCH_RemainingQty CHECK (RemainingQty >= 0),
     CONSTRAINT CK_BATCH_ReceivedQty CHECK (ReceivedQty >= 0)
@@ -3447,7 +3448,7 @@ BEGIN
 
     CONSTRAINT PK_StockLevel PRIMARY KEY CLUSTERED (StockLevelId),
     CONSTRAINT FK_SL_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
-    CONSTRAINT FK_SL_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId),
+    -- FK_SL_Store deferred to create_tables_zz_foreign_keys.sql (see note on FK_BATCH_Store above).
     CONSTRAINT UX_SL_ItemStore UNIQUE (InventoryItemId, StoreId),
     CONSTRAINT CK_SL_Qty CHECK (QtyOnHand >= 0)
   );
@@ -3507,7 +3508,7 @@ BEGIN
     CONSTRAINT PK_NarcoticRegisterEntry PRIMARY KEY CLUSTERED (RegisterEntryId),
     CONSTRAINT FK_NRE_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
     CONSTRAINT FK_NRE_Batch FOREIGN KEY (BatchId) REFERENCES dbo.Batch(BatchId),
-    CONSTRAINT FK_NRE_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId),
+    -- FK_NRE_Store deferred to create_tables_zz_foreign_keys.sql: Store sorts AFTER this file alphabetically.
     CONSTRAINT CK_NRE_FormType CHECK (FormType IN ('3D','3E','3H')),
     CONSTRAINT CK_NRE_Direction CHECK (Direction IN ('IN','OUT')),
     CONSTRAINT CK_NRE_Qty CHECK (Qty > 0)
@@ -3544,8 +3545,8 @@ BEGIN
     RecordedBy     NVARCHAR(200)    NULL,
     BreachFlag     BIT              NOT NULL CONSTRAINT DF_CCTL_Breach DEFAULT (0),
 
-    CONSTRAINT PK_ColdChainTempLog PRIMARY KEY CLUSTERED (LogId),
-    CONSTRAINT FK_CCTL_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId)
+    CONSTRAINT PK_ColdChainTempLog PRIMARY KEY CLUSTERED (LogId)
+    -- FK_CCTL_Store deferred to create_tables_zz_foreign_keys.sql (see note on FK_NRE_Store above).
   );
 END
 GO
@@ -3604,7 +3605,7 @@ BEGIN
 
     CONSTRAINT PK_Indent PRIMARY KEY CLUSTERED (IndentId),
     CONSTRAINT UX_IND_Number UNIQUE (HospitalId, IndentNumber),
-    CONSTRAINT FK_IND_Store FOREIGN KEY (RequestingStoreId) REFERENCES dbo.Store(StoreId),
+    -- FK_IND_Store deferred to create_tables_zz_foreign_keys.sql: Store sorts AFTER this file alphabetically.
     CONSTRAINT CK_IND_Status CHECK ([Status] IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','CONVERTED_TO_PO','CANCELLED'))
   );
 END
@@ -3679,7 +3680,7 @@ BEGIN
 
     CONSTRAINT PK_PurchaseOrder PRIMARY KEY CLUSTERED (PurchaseOrderId),
     CONSTRAINT UX_PO_Number UNIQUE (HospitalId, PoNumber),
-    CONSTRAINT FK_PO_Vendor FOREIGN KEY (VendorId) REFERENCES dbo.Vendor(VendorId),
+    -- FK_PO_Vendor deferred to create_tables_zz_foreign_keys.sql: Vendor sorts AFTER this file alphabetically.
     CONSTRAINT FK_PO_Indent FOREIGN KEY (IndentId) REFERENCES dbo.Indent(IndentId),
     CONSTRAINT CK_PO_Status CHECK ([Status] IN ('DRAFT','APPROVED','SENT','PARTIALLY_RECEIVED','RECEIVED','CANCELLED'))
   );
@@ -3757,8 +3758,8 @@ BEGIN
     CONSTRAINT PK_GoodsReceiptNote PRIMARY KEY CLUSTERED (GrnId),
     CONSTRAINT UX_GRN_Number UNIQUE (HospitalId, GrnNumber),
     CONSTRAINT FK_GRN_PO FOREIGN KEY (PurchaseOrderId) REFERENCES dbo.PurchaseOrder(PurchaseOrderId),
-    CONSTRAINT FK_GRN_Vendor FOREIGN KEY (VendorId) REFERENCES dbo.Vendor(VendorId),
-    CONSTRAINT FK_GRN_Store FOREIGN KEY (ReceivedStoreId) REFERENCES dbo.Store(StoreId),
+    -- FK_GRN_Vendor / FK_GRN_Store deferred to create_tables_zz_foreign_keys.sql: Vendor/Store both
+    -- sort AFTER this file alphabetically.
     CONSTRAINT CK_GRN_MatchStatus CHECK (MatchStatus IN ('MATCHED','MISMATCH','PENDING'))
   );
 END
@@ -6223,6 +6224,98 @@ BEGIN
 END
 GO
 
+-- Inventory Management (INV-1/2/7/8): create_tables_inventory_store.sql/create_tables_inventory_vendor.sql
+-- sort AFTER create_tables_inventory_batch.sql/_compliance.sql/_procurement.sql alphabetically, so every
+-- FK from those earlier files to Store/Vendor is deferred here instead of inline.
+
+-- Batch â†’ Store
+IF OBJECT_ID('dbo.Batch','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Store','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BATCH_Store')
+BEGIN
+  ALTER TABLE dbo.Batch
+    ADD CONSTRAINT FK_BATCH_Store FOREIGN KEY (StoreId)
+    REFERENCES dbo.Store(StoreId);
+END
+GO
+
+-- StockLevel â†’ Store
+IF OBJECT_ID('dbo.StockLevel','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Store','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_SL_Store')
+BEGIN
+  ALTER TABLE dbo.StockLevel
+    ADD CONSTRAINT FK_SL_Store FOREIGN KEY (StoreId)
+    REFERENCES dbo.Store(StoreId);
+END
+GO
+
+-- NarcoticRegisterEntry â†’ Store
+IF OBJECT_ID('dbo.NarcoticRegisterEntry','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Store','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_NRE_Store')
+BEGIN
+  ALTER TABLE dbo.NarcoticRegisterEntry
+    ADD CONSTRAINT FK_NRE_Store FOREIGN KEY (StoreId)
+    REFERENCES dbo.Store(StoreId);
+END
+GO
+
+-- ColdChainTempLog â†’ Store
+IF OBJECT_ID('dbo.ColdChainTempLog','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Store','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_CCTL_Store')
+BEGIN
+  ALTER TABLE dbo.ColdChainTempLog
+    ADD CONSTRAINT FK_CCTL_Store FOREIGN KEY (StoreId)
+    REFERENCES dbo.Store(StoreId);
+END
+GO
+
+-- Indent â†’ Store
+IF OBJECT_ID('dbo.Indent','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Store','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_IND_Store')
+BEGIN
+  ALTER TABLE dbo.Indent
+    ADD CONSTRAINT FK_IND_Store FOREIGN KEY (RequestingStoreId)
+    REFERENCES dbo.Store(StoreId);
+END
+GO
+
+-- PurchaseOrder â†’ Vendor
+IF OBJECT_ID('dbo.PurchaseOrder','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Vendor','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_PO_Vendor')
+BEGIN
+  ALTER TABLE dbo.PurchaseOrder
+    ADD CONSTRAINT FK_PO_Vendor FOREIGN KEY (VendorId)
+    REFERENCES dbo.Vendor(VendorId);
+END
+GO
+
+-- GoodsReceiptNote â†’ Vendor
+IF OBJECT_ID('dbo.GoodsReceiptNote','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Vendor','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_GRN_Vendor')
+BEGIN
+  ALTER TABLE dbo.GoodsReceiptNote
+    ADD CONSTRAINT FK_GRN_Vendor FOREIGN KEY (VendorId)
+    REFERENCES dbo.Vendor(VendorId);
+END
+GO
+
+-- GoodsReceiptNote â†’ Store
+IF OBJECT_ID('dbo.GoodsReceiptNote','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Store','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_GRN_Store')
+BEGIN
+  ALTER TABLE dbo.GoodsReceiptNote
+    ADD CONSTRAINT FK_GRN_Store FOREIGN KEY (ReceivedStoreId)
+    REFERENCES dbo.Store(StoreId);
+END
+GO
+
 GO
 
 -- ---------------------------------------------------------------------
@@ -7693,14 +7786,34 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/dml_inventory_batch_backfill.sql
+-- FILE: db/schema/migrations/dml_inventory_store_backfill.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Inventory Management (INV-2): every InventoryItem with existing stock gets one opening-balance
--- Batch (in its hospital's Main Store) plus a matching StockLevel row, so FEFO/batch queries have
--- something to work with from day one instead of a stock number with no batch behind it. Idempotent
--- â€” guarded per item (OPENING-BAL batch number), safe to re-run.
+-- Inventory Management (INV-1/INV-2): every hospital gets exactly one MAIN store, so existing
+-- InventoryItem/BloodBag/InstrumentSet rows have somewhere to attach to once their Store-linked
+-- columns land in later migrations. Idempotent â€” safe to re-run (skips hospitals that already
+-- have one).
+--
+-- The opening-balance Batch/StockLevel backfill (INV-2, originally its own
+-- dml_inventory_batch_backfill.sql) is kept in this SAME file, after the Store insert: it depends
+-- on the MAIN store existing, and schema/migrations files run in plain alphabetical order with no
+-- core-first/last special-casing (unlike schema/tables), so "batch" would otherwise sort and run
+-- BEFORE "store" and silently backfill nothing (each migration is apply-once/tracked, so a
+-- no-op run would never be retried).
+
+INSERT INTO dbo.Store (StoreId, HospitalId, StoreCode, StoreName, StoreType, ParentStoreId, IsActive, CreatedAt, UpdatedAt)
+SELECT NEWID(), h.HospitalID, 'MAIN', 'Main Store', 'MAIN', NULL, 1, SYSUTCDATETIME(), SYSUTCDATETIME()
+FROM dbo.Hospitals h
+WHERE NOT EXISTS (
+  SELECT 1 FROM dbo.Store s WHERE s.HospitalId = h.HospitalID AND s.StoreType = 'MAIN'
+);
+GO
+
+-- Every InventoryItem with existing stock gets one opening-balance Batch (in its hospital's Main
+-- Store) plus a matching StockLevel row, so FEFO/batch queries have something to work with from
+-- day one instead of a stock number with no batch behind it. Idempotent â€” guarded per item
+-- (OPENING-BAL batch number), safe to re-run.
 
 INSERT INTO dbo.Batch (BatchId, HospitalId, InventoryItemId, StoreId, BatchNumber, ManufactureDate, ExpiryDate, UnitCost, ReceivedQty, RemainingQty, [Status], CreatedAt, UpdatedAt)
 SELECT NEWID(), i.HospitalId, i.InventoryItemId, s.StoreId, 'OPENING-BAL', NULL, NULL, i.DefaultRate, i.CurrentStock, i.CurrentStock, 'ACTIVE', SYSUTCDATETIME(), SYSUTCDATETIME()
@@ -7720,26 +7833,6 @@ WHERE i.CurrentStock > 0
   AND NOT EXISTS (
     SELECT 1 FROM dbo.StockLevel sl WHERE sl.InventoryItemId = i.InventoryItemId AND sl.StoreId = s.StoreId
   );
-GO
-
-GO
-
--- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/dml_inventory_store_backfill.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- Inventory Management (INV-1): every hospital gets exactly one MAIN store, so existing
--- InventoryItem/BloodBag/InstrumentSet rows have somewhere to attach to once their Store-linked
--- columns land in later migrations. Idempotent â€” safe to re-run (skips hospitals that already
--- have one).
-
-INSERT INTO dbo.Store (StoreId, HospitalId, StoreCode, StoreName, StoreType, ParentStoreId, IsActive, CreatedAt, UpdatedAt)
-SELECT NEWID(), h.HospitalID, 'MAIN', 'Main Store', 'MAIN', NULL, 1, SYSUTCDATETIME(), SYSUTCDATETIME()
-FROM dbo.Hospitals h
-WHERE NOT EXISTS (
-  SELECT 1 FROM dbo.Store s WHERE s.HospitalId = h.HospitalID AND s.StoreType = 'MAIN'
-);
 GO
 
 GO

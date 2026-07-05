@@ -36,7 +36,7 @@ BEGIN
     CONSTRAINT PK_NarcoticRegisterEntry PRIMARY KEY CLUSTERED (RegisterEntryId),
     CONSTRAINT FK_NRE_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
     CONSTRAINT FK_NRE_Batch FOREIGN KEY (BatchId) REFERENCES dbo.Batch(BatchId),
-    CONSTRAINT FK_NRE_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId),
+    -- FK_NRE_Store deferred to create_tables_zz_foreign_keys.sql: Store sorts AFTER this file alphabetically.
     CONSTRAINT CK_NRE_FormType CHECK (FormType IN ('3D','3E','3H')),
     CONSTRAINT CK_NRE_Direction CHECK (Direction IN ('IN','OUT')),
     CONSTRAINT CK_NRE_Qty CHECK (Qty > 0)
@@ -73,8 +73,8 @@ BEGIN
     RecordedBy     NVARCHAR(200)    NULL,
     BreachFlag     BIT              NOT NULL CONSTRAINT DF_CCTL_Breach DEFAULT (0),
 
-    CONSTRAINT PK_ColdChainTempLog PRIMARY KEY CLUSTERED (LogId),
-    CONSTRAINT FK_CCTL_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId)
+    CONSTRAINT PK_ColdChainTempLog PRIMARY KEY CLUSTERED (LogId)
+    -- FK_CCTL_Store deferred to create_tables_zz_foreign_keys.sql (see note on FK_NRE_Store above).
   );
 END
 GO

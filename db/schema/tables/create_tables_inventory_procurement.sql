@@ -38,7 +38,7 @@ BEGIN
 
     CONSTRAINT PK_Indent PRIMARY KEY CLUSTERED (IndentId),
     CONSTRAINT UX_IND_Number UNIQUE (HospitalId, IndentNumber),
-    CONSTRAINT FK_IND_Store FOREIGN KEY (RequestingStoreId) REFERENCES dbo.Store(StoreId),
+    -- FK_IND_Store deferred to create_tables_zz_foreign_keys.sql: Store sorts AFTER this file alphabetically.
     CONSTRAINT CK_IND_Status CHECK ([Status] IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','CONVERTED_TO_PO','CANCELLED'))
   );
 END
@@ -113,7 +113,7 @@ BEGIN
 
     CONSTRAINT PK_PurchaseOrder PRIMARY KEY CLUSTERED (PurchaseOrderId),
     CONSTRAINT UX_PO_Number UNIQUE (HospitalId, PoNumber),
-    CONSTRAINT FK_PO_Vendor FOREIGN KEY (VendorId) REFERENCES dbo.Vendor(VendorId),
+    -- FK_PO_Vendor deferred to create_tables_zz_foreign_keys.sql: Vendor sorts AFTER this file alphabetically.
     CONSTRAINT FK_PO_Indent FOREIGN KEY (IndentId) REFERENCES dbo.Indent(IndentId),
     CONSTRAINT CK_PO_Status CHECK ([Status] IN ('DRAFT','APPROVED','SENT','PARTIALLY_RECEIVED','RECEIVED','CANCELLED'))
   );
@@ -191,8 +191,8 @@ BEGIN
     CONSTRAINT PK_GoodsReceiptNote PRIMARY KEY CLUSTERED (GrnId),
     CONSTRAINT UX_GRN_Number UNIQUE (HospitalId, GrnNumber),
     CONSTRAINT FK_GRN_PO FOREIGN KEY (PurchaseOrderId) REFERENCES dbo.PurchaseOrder(PurchaseOrderId),
-    CONSTRAINT FK_GRN_Vendor FOREIGN KEY (VendorId) REFERENCES dbo.Vendor(VendorId),
-    CONSTRAINT FK_GRN_Store FOREIGN KEY (ReceivedStoreId) REFERENCES dbo.Store(StoreId),
+    -- FK_GRN_Vendor / FK_GRN_Store deferred to create_tables_zz_foreign_keys.sql: Vendor/Store both
+    -- sort AFTER this file alphabetically.
     CONSTRAINT CK_GRN_MatchStatus CHECK (MatchStatus IN ('MATCHED','MISMATCH','PENDING'))
   );
 END

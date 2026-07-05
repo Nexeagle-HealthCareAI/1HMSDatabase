@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-05 00:43  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-05 13:28  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -3363,6 +3363,487 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_inventory_batch.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Inventory Management (INV-2): batch/lot tracking + per-store stock position. Batch is the FEFO
+-- ledger (RemainingQty decremented per movement); StockLevel is the live "how much of this item is
+-- in this store" rollup the board/pickers read, separate from InventoryItem.CurrentStock's
+-- hospital-wide total.
+
+IF OBJECT_ID('dbo.Batch','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Batch
+  (
+    BatchId           UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_BATCH_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId   UNIQUEIDENTIFIER NOT NULL,
+    StoreId           UNIQUEIDENTIFIER NOT NULL,
+
+    BatchNumber       NVARCHAR(50)     NOT NULL,
+    ManufactureDate   DATETIME2(3)     NULL,
+    ExpiryDate        DATETIME2(3)     NULL,
+
+    UnitCost          DECIMAL(18,2)    NULL,
+    ReceivedQty       DECIMAL(18,3)    NOT NULL,
+    RemainingQty      DECIMAL(18,3)    NOT NULL,
+
+    -- Forward references to procurement (INV-6/INV-7) â€” plain columns for now, no FK constraint
+    -- until Vendor/GoodsReceiptNoteLine tables exist; a later guarded ALTER adds the FK.
+    VendorId          UNIQUEIDENTIFIER NULL,
+    GrnLineId         UNIQUEIDENTIFIER NULL,
+
+    [Status]          NVARCHAR(20)     NOT NULL CONSTRAINT DF_BATCH_Status DEFAULT 'ACTIVE',
+
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_BATCH_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy         NVARCHAR(100)    NULL,
+    UpdatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_BATCH_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy         NVARCHAR(100)    NULL,
+
+    RowVersion        ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_Batch PRIMARY KEY CLUSTERED (BatchId),
+    CONSTRAINT FK_BATCH_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT FK_BATCH_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId),
+    CONSTRAINT CK_BATCH_Status CHECK ([Status] IN ('ACTIVE','EXHAUSTED','EXPIRED','QUARANTINED','RECALLED')),
+    CONSTRAINT CK_BATCH_RemainingQty CHECK (RemainingQty >= 0),
+    CONSTRAINT CK_BATCH_ReceivedQty CHECK (ReceivedQty >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_BATCH_FefoLookup' AND object_id=OBJECT_ID('dbo.Batch'))
+BEGIN
+  CREATE INDEX IX_BATCH_FefoLookup
+  ON dbo.Batch(HospitalId, InventoryItemId, StoreId, [Status], ExpiryDate)
+  INCLUDE (RemainingQty, BatchNumber);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_BATCH_ExpiryScan' AND object_id=OBJECT_ID('dbo.Batch'))
+BEGIN
+  CREATE INDEX IX_BATCH_ExpiryScan
+  ON dbo.Batch(HospitalId, ExpiryDate)
+  WHERE [Status] = 'ACTIVE';
+END
+GO
+
+IF OBJECT_ID('dbo.StockLevel','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.StockLevel
+  (
+    StockLevelId      UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_SL_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId   UNIQUEIDENTIFIER NOT NULL,
+    StoreId           UNIQUEIDENTIFIER NOT NULL,
+
+    QtyOnHand         DECIMAL(18,3)    NOT NULL CONSTRAINT DF_SL_Qty DEFAULT (0),
+    UpdatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_SL_UpdatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_StockLevel PRIMARY KEY CLUSTERED (StockLevelId),
+    CONSTRAINT FK_SL_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT FK_SL_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId),
+    CONSTRAINT UX_SL_ItemStore UNIQUE (InventoryItemId, StoreId),
+    CONSTRAINT CK_SL_Qty CHECK (QtyOnHand >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_SL_HospitalStore' AND object_id=OBJECT_ID('dbo.StockLevel'))
+BEGIN
+  CREATE INDEX IX_SL_HospitalStore
+  ON dbo.StockLevel(HospitalId, StoreId)
+  INCLUDE (InventoryItemId, QtyOnHand);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_inventory_procurement.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Inventory Management (INV-7): procurement backbone â€” Indent (department request) -> Purchase
+-- Order -> Goods Receipt Note. GRN is where Batch rows actually get created (batch/expiry captured
+-- at receipt) and stock gets incremented via the same RecordInventoryMovement handler used
+-- everywhere else â€” no separate stock-mutation logic here. Single-level approval only this phase
+-- (not a configurable multi-tier workflow engine).
+
+IF OBJECT_ID('dbo.Indent','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Indent
+  (
+    IndentId           UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_IND_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
+    IndentNumber       NVARCHAR(30)     NOT NULL,
+    RequestingStoreId  UNIQUEIDENTIFIER NOT NULL,
+
+    [Status]           NVARCHAR(20)     NOT NULL CONSTRAINT DF_IND_Status DEFAULT 'SUBMITTED',
+    IsSystemGenerated  BIT              NOT NULL CONSTRAINT DF_IND_SysGen DEFAULT (0),
+
+    RequestedBy        NVARCHAR(200)    NULL,
+    RequestedByUserId  UNIQUEIDENTIFIER NULL,
+    RequestedAt        DATETIME2(3)     NOT NULL CONSTRAINT DF_IND_RequestedAt DEFAULT SYSUTCDATETIME(),
+
+    ApprovedBy         NVARCHAR(200)    NULL,
+    ApprovedByUserId   UNIQUEIDENTIFIER NULL,
+    ApprovedAt         DATETIME2(3)     NULL,
+    RejectedReason     NVARCHAR(500)    NULL,
+
+    Notes              NVARCHAR(500)    NULL,
+
+    CreatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_IND_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy          NVARCHAR(100)    NULL,
+    UpdatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_IND_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy          NVARCHAR(100)    NULL,
+
+    RowVersion         ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_Indent PRIMARY KEY CLUSTERED (IndentId),
+    CONSTRAINT UX_IND_Number UNIQUE (HospitalId, IndentNumber),
+    CONSTRAINT FK_IND_Store FOREIGN KEY (RequestingStoreId) REFERENCES dbo.Store(StoreId),
+    CONSTRAINT CK_IND_Status CHECK ([Status] IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','CONVERTED_TO_PO','CANCELLED'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_IND_HospitalStatus' AND object_id=OBJECT_ID('dbo.Indent'))
+BEGIN
+  CREATE INDEX IX_IND_HospitalStatus
+  ON dbo.Indent(HospitalId, [Status], RequestedAt DESC);
+END
+GO
+
+IF OBJECT_ID('dbo.IndentLine','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.IndentLine
+  (
+    IndentLineId    UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_INDL_Id DEFAULT NEWSEQUENTIALID(),
+
+    IndentId        UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId UNIQUEIDENTIFIER NOT NULL,
+    Qty             DECIMAL(18,3)    NOT NULL,
+    Notes           NVARCHAR(500)    NULL,
+
+    CONSTRAINT PK_IndentLine PRIMARY KEY CLUSTERED (IndentLineId),
+    CONSTRAINT FK_INDL_Indent FOREIGN KEY (IndentId) REFERENCES dbo.Indent(IndentId) ON DELETE CASCADE,
+    CONSTRAINT FK_INDL_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT CK_INDL_Qty CHECK (Qty > 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_INDL_Indent' AND object_id=OBJECT_ID('dbo.IndentLine'))
+BEGIN
+  CREATE INDEX IX_INDL_Indent
+  ON dbo.IndentLine(IndentId);
+END
+GO
+
+IF OBJECT_ID('dbo.PurchaseOrder','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PurchaseOrder
+  (
+    PurchaseOrderId       UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PO_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId            UNIQUEIDENTIFIER NOT NULL,
+    PoNumber              NVARCHAR(30)     NOT NULL,
+    VendorId              UNIQUEIDENTIFIER NOT NULL,
+    IndentId              UNIQUEIDENTIFIER NULL,
+
+    [Status]              NVARCHAR(20)     NOT NULL CONSTRAINT DF_PO_Status DEFAULT 'DRAFT',
+
+    OrderedBy             NVARCHAR(200)    NULL,
+    OrderedByUserId       UNIQUEIDENTIFIER NULL,
+    OrderedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_PO_OrderedAt DEFAULT SYSUTCDATETIME(),
+
+    ApprovedBy            NVARCHAR(200)    NULL,
+    ApprovedByUserId      UNIQUEIDENTIFIER NULL,
+    ApprovedAt            DATETIME2(3)     NULL,
+
+    ExpectedDeliveryDate  DATETIME2(3)     NULL,
+    CancelledReason       NVARCHAR(500)    NULL,
+    Notes                 NVARCHAR(500)    NULL,
+
+    CreatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_PO_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy             NVARCHAR(100)    NULL,
+    UpdatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_PO_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy             NVARCHAR(100)    NULL,
+
+    RowVersion            ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_PurchaseOrder PRIMARY KEY CLUSTERED (PurchaseOrderId),
+    CONSTRAINT UX_PO_Number UNIQUE (HospitalId, PoNumber),
+    CONSTRAINT FK_PO_Vendor FOREIGN KEY (VendorId) REFERENCES dbo.Vendor(VendorId),
+    CONSTRAINT FK_PO_Indent FOREIGN KEY (IndentId) REFERENCES dbo.Indent(IndentId),
+    CONSTRAINT CK_PO_Status CHECK ([Status] IN ('DRAFT','APPROVED','SENT','PARTIALLY_RECEIVED','RECEIVED','CANCELLED'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PO_HospitalStatus' AND object_id=OBJECT_ID('dbo.PurchaseOrder'))
+BEGIN
+  CREATE INDEX IX_PO_HospitalStatus
+  ON dbo.PurchaseOrder(HospitalId, [Status], OrderedAt DESC);
+END
+GO
+
+IF OBJECT_ID('dbo.PurchaseOrderLine','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PurchaseOrderLine
+  (
+    PurchaseOrderLineId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_POL_Id DEFAULT NEWSEQUENTIALID(),
+
+    PurchaseOrderId     UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId     UNIQUEIDENTIFIER NOT NULL,
+    Qty                 DECIMAL(18,3)    NOT NULL,
+    Rate                DECIMAL(18,2)    NOT NULL,
+    ReceivedQty         DECIMAL(18,3)    NOT NULL CONSTRAINT DF_POL_ReceivedQty DEFAULT (0),
+
+    RowVersion          ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_PurchaseOrderLine PRIMARY KEY CLUSTERED (PurchaseOrderLineId),
+    CONSTRAINT FK_POL_PO FOREIGN KEY (PurchaseOrderId) REFERENCES dbo.PurchaseOrder(PurchaseOrderId) ON DELETE CASCADE,
+    CONSTRAINT FK_POL_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT CK_POL_Qty CHECK (Qty > 0),
+    CONSTRAINT CK_POL_Rate CHECK (Rate >= 0),
+    CONSTRAINT CK_POL_ReceivedQty CHECK (ReceivedQty >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_POL_PO' AND object_id=OBJECT_ID('dbo.PurchaseOrderLine'))
+BEGIN
+  CREATE INDEX IX_POL_PO
+  ON dbo.PurchaseOrderLine(PurchaseOrderId);
+END
+GO
+
+IF OBJECT_ID('dbo.GoodsReceiptNote','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.GoodsReceiptNote
+  (
+    GrnId              UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_GRN_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
+    GrnNumber          NVARCHAR(30)     NOT NULL,
+    PurchaseOrderId    UNIQUEIDENTIFIER NOT NULL,
+    VendorId           UNIQUEIDENTIFIER NOT NULL,
+    ReceivedStoreId    UNIQUEIDENTIFIER NOT NULL,
+
+    InvoiceNumber      NVARCHAR(50)     NULL,
+    InvoiceDate        DATETIME2(3)     NULL,
+    InvoiceAmount      DECIMAL(18,2)    NULL,
+    MatchStatus        NVARCHAR(20)     NOT NULL CONSTRAINT DF_GRN_MatchStatus DEFAULT 'PENDING',
+
+    ReceivedBy         NVARCHAR(200)    NULL,
+    ReceivedByUserId   UNIQUEIDENTIFIER NULL,
+    ReceivedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_GRN_ReceivedAt DEFAULT SYSUTCDATETIME(),
+
+    Notes              NVARCHAR(500)    NULL,
+
+    CreatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_GRN_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy          NVARCHAR(100)    NULL,
+
+    RowVersion         ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_GoodsReceiptNote PRIMARY KEY CLUSTERED (GrnId),
+    CONSTRAINT UX_GRN_Number UNIQUE (HospitalId, GrnNumber),
+    CONSTRAINT FK_GRN_PO FOREIGN KEY (PurchaseOrderId) REFERENCES dbo.PurchaseOrder(PurchaseOrderId),
+    CONSTRAINT FK_GRN_Vendor FOREIGN KEY (VendorId) REFERENCES dbo.Vendor(VendorId),
+    CONSTRAINT FK_GRN_Store FOREIGN KEY (ReceivedStoreId) REFERENCES dbo.Store(StoreId),
+    CONSTRAINT CK_GRN_MatchStatus CHECK (MatchStatus IN ('MATCHED','MISMATCH','PENDING'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_GRN_HospitalTime' AND object_id=OBJECT_ID('dbo.GoodsReceiptNote'))
+BEGIN
+  CREATE INDEX IX_GRN_HospitalTime
+  ON dbo.GoodsReceiptNote(HospitalId, ReceivedAt DESC);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_GRN_PO' AND object_id=OBJECT_ID('dbo.GoodsReceiptNote'))
+BEGIN
+  CREATE INDEX IX_GRN_PO
+  ON dbo.GoodsReceiptNote(PurchaseOrderId);
+END
+GO
+
+IF OBJECT_ID('dbo.GoodsReceiptNoteLine','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.GoodsReceiptNoteLine
+  (
+    GrnLineId           UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_GRNL_Id DEFAULT NEWSEQUENTIALID(),
+
+    GrnId               UNIQUEIDENTIFIER NOT NULL,
+    PurchaseOrderLineId UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId     UNIQUEIDENTIFIER NOT NULL,
+
+    BatchNumber         NVARCHAR(50)     NOT NULL,
+    ManufactureDate     DATETIME2(3)     NULL,
+    ExpiryDate          DATETIME2(3)     NULL,
+    Qty                 DECIMAL(18,3)    NOT NULL,
+    Rate                DECIMAL(18,2)    NOT NULL,
+
+    CONSTRAINT PK_GoodsReceiptNoteLine PRIMARY KEY CLUSTERED (GrnLineId),
+    CONSTRAINT FK_GRNL_Grn FOREIGN KEY (GrnId) REFERENCES dbo.GoodsReceiptNote(GrnId) ON DELETE CASCADE,
+    CONSTRAINT FK_GRNL_POL FOREIGN KEY (PurchaseOrderLineId) REFERENCES dbo.PurchaseOrderLine(PurchaseOrderLineId),
+    CONSTRAINT FK_GRNL_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT CK_GRNL_Qty CHECK (Qty > 0),
+    CONSTRAINT CK_GRNL_Rate CHECK (Rate >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_GRNL_Grn' AND object_id=OBJECT_ID('dbo.GoodsReceiptNoteLine'))
+BEGIN
+  CREATE INDEX IX_GRNL_Grn
+  ON dbo.GoodsReceiptNoteLine(GrnId);
+END
+GO
+
+-- Deferred FK now that GoodsReceiptNoteLine exists (Batch.GrnLineId was added nullable, FK-less, in INV-2).
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BATCH_GrnLine')
+  ALTER TABLE dbo.Batch
+    ADD CONSTRAINT FK_BATCH_GrnLine FOREIGN KEY (GrnLineId) REFERENCES dbo.GoodsReceiptNoteLine(GrnLineId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_inventory_store.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Inventory Management (INV-1): store hierarchy. Central/ward/OT/pharmacy/CSSD/blood-bank/etc. are
+-- all Store rows, self-referencing via ParentStoreId. Every hospital gets one MAIN store
+-- auto-provisioned (see dml_inventory_store_backfill.sql); everything else nests under it.
+
+IF OBJECT_ID('dbo.Store','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Store
+  (
+    StoreId         UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_STORE_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId      UNIQUEIDENTIFIER NOT NULL,
+
+    StoreCode       NVARCHAR(30)     NOT NULL,
+    StoreName       NVARCHAR(100)    NOT NULL,
+    StoreType       NVARCHAR(20)     NOT NULL,
+
+    ParentStoreId   UNIQUEIDENTIFIER NULL,
+
+    MinTempCelsius  DECIMAL(5,2)     NULL,
+    MaxTempCelsius  DECIMAL(5,2)     NULL,
+
+    IsActive        BIT              NOT NULL CONSTRAINT DF_STORE_Active DEFAULT (1),
+
+    CreatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_STORE_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy       NVARCHAR(100)    NULL,
+    UpdatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_STORE_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy       NVARCHAR(100)    NULL,
+
+    RowVersion      ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_Store PRIMARY KEY CLUSTERED (StoreId),
+    CONSTRAINT UX_STORE_Code UNIQUE (HospitalId, StoreCode),
+    CONSTRAINT FK_STORE_Parent FOREIGN KEY (ParentStoreId) REFERENCES dbo.Store(StoreId),
+    CONSTRAINT CK_STORE_Type CHECK (StoreType IN ('MAIN','SUB','DEPARTMENT','OT','PHARMACY','COLD_CHAIN','NARCOTIC','BLOOD_BANK','CSSD'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_STORE_Hospital' AND object_id=OBJECT_ID('dbo.Store'))
+BEGIN
+  CREATE INDEX IX_STORE_Hospital
+  ON dbo.Store(HospitalId, IsActive);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_STORE_Parent' AND object_id=OBJECT_ID('dbo.Store'))
+BEGIN
+  CREATE INDEX IX_STORE_Parent
+  ON dbo.Store(ParentStoreId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_inventory_vendor.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Inventory Management (INV-6): vendor/supplier master â€” feeds the procurement backbone (INV-7:
+-- Indent/PO/GRN) and Batch.VendorId (already nullable from INV-2).
+
+IF OBJECT_ID('dbo.Vendor','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Vendor
+  (
+    VendorId           UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_VENDOR_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
+
+    VendorCode         NVARCHAR(30)     NOT NULL,
+    VendorName         NVARCHAR(200)    NOT NULL,
+    ContactPerson      NVARCHAR(100)    NULL,
+    Phone              NVARCHAR(20)     NULL,
+    Email              NVARCHAR(100)    NULL,
+    Address            NVARCHAR(500)    NULL,
+
+    GstNumber          NVARCHAR(20)     NULL,
+    DrugLicenseNumber  NVARCHAR(50)     NULL,
+    PaymentTermsDays   INT              NOT NULL CONSTRAINT DF_VENDOR_PayTerms DEFAULT (0),
+
+    IsActive           BIT              NOT NULL CONSTRAINT DF_VENDOR_Active DEFAULT (1),
+
+    CreatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_VENDOR_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy          NVARCHAR(100)    NULL,
+    UpdatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_VENDOR_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy          NVARCHAR(100)    NULL,
+
+    RowVersion         ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_Vendor PRIMARY KEY CLUSTERED (VendorId),
+    CONSTRAINT UX_VENDOR_Code UNIQUE (HospitalId, VendorCode),
+    CONSTRAINT CK_VENDOR_PayTerms CHECK (PaymentTermsDays >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_VENDOR_Hospital' AND object_id=OBJECT_ID('dbo.Vendor'))
+BEGIN
+  CREATE INDEX IX_VENDOR_Hospital
+  ON dbo.Vendor(HospitalId, IsActive);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BATCH_Vendor')
+  ALTER TABLE dbo.Batch
+    ADD CONSTRAINT FK_BATCH_Vendor FOREIGN KEY (VendorId) REFERENCES dbo.Vendor(VendorId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_ipd_scripts.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -6257,6 +6738,113 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_inventory_item_regulatory_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Inventory Management (INV-3): drug/regulatory metadata + reorder fields on InventoryItem. All
+-- additive/nullable-or-defaulted â€” existing rows (and the OT/CSSD callers that only ever set
+-- Category/Unit/CurrentStock) are unaffected.
+
+IF COL_LENGTH('dbo.InventoryItem','ScheduleClass') IS NULL
+  ALTER TABLE dbo.InventoryItem ADD ScheduleClass NVARCHAR(20) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_II_ScheduleClass')
+  ALTER TABLE dbo.InventoryItem
+    ADD CONSTRAINT CK_II_ScheduleClass CHECK (ScheduleClass IS NULL OR ScheduleClass IN ('H','H1','X','NARCOTIC'));
+GO
+
+IF COL_LENGTH('dbo.InventoryItem','IsLasa') IS NULL
+  ALTER TABLE dbo.InventoryItem ADD IsLasa BIT NOT NULL CONSTRAINT DF_II_IsLasa DEFAULT (0);
+GO
+
+IF COL_LENGTH('dbo.InventoryItem','IsHighAlert') IS NULL
+  ALTER TABLE dbo.InventoryItem ADD IsHighAlert BIT NOT NULL CONSTRAINT DF_II_IsHighAlert DEFAULT (0);
+GO
+
+IF COL_LENGTH('dbo.InventoryItem','StorageCondition') IS NULL
+  ALTER TABLE dbo.InventoryItem ADD StorageCondition NVARCHAR(20) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_II_StorageCondition')
+  ALTER TABLE dbo.InventoryItem
+    ADD CONSTRAINT CK_II_StorageCondition CHECK (StorageCondition IS NULL OR StorageCondition IN ('ROOM','COLD_CHAIN','FROZEN','CONTROLLED'));
+GO
+
+IF COL_LENGTH('dbo.InventoryItem','ReorderQty') IS NULL
+  ALTER TABLE dbo.InventoryItem ADD ReorderQty DECIMAL(18,3) NOT NULL CONSTRAINT DF_II_ReorderQty DEFAULT (0);
+GO
+
+IF COL_LENGTH('dbo.InventoryItem','MaxStockLevel') IS NULL
+  ALTER TABLE dbo.InventoryItem ADD MaxStockLevel DECIMAL(18,3) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_II_ScheduleClass' AND object_id=OBJECT_ID('dbo.InventoryItem'))
+BEGIN
+  CREATE INDEX IX_II_ScheduleClass
+  ON dbo.InventoryItem(HospitalId, ScheduleClass)
+  WHERE ScheduleClass IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_inventory_movement_store_batch_link.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Inventory Management (INV-2): link movements to a real Batch + Store pair (all nullable â€” legacy
+-- callers like IntraOpCommandHandlers.RecordIntraOpItemUsage keep working unchanged, passing neither).
+-- Also widens MovementType to allow TRANSFER (store-to-store moves that aren't a receive/issue).
+
+IF COL_LENGTH('dbo.InventoryMovement','BatchId') IS NULL
+  ALTER TABLE dbo.InventoryMovement ADD BatchId UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_IM_Batch')
+  ALTER TABLE dbo.InventoryMovement
+    ADD CONSTRAINT FK_IM_Batch FOREIGN KEY (BatchId) REFERENCES dbo.Batch(BatchId);
+GO
+
+IF COL_LENGTH('dbo.InventoryMovement','FromStoreId') IS NULL
+  ALTER TABLE dbo.InventoryMovement ADD FromStoreId UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_IM_FromStore')
+  ALTER TABLE dbo.InventoryMovement
+    ADD CONSTRAINT FK_IM_FromStore FOREIGN KEY (FromStoreId) REFERENCES dbo.Store(StoreId);
+GO
+
+IF COL_LENGTH('dbo.InventoryMovement','ToStoreId') IS NULL
+  ALTER TABLE dbo.InventoryMovement ADD ToStoreId UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_IM_ToStore')
+  ALTER TABLE dbo.InventoryMovement
+    ADD CONSTRAINT FK_IM_ToStore FOREIGN KEY (ToStoreId) REFERENCES dbo.Store(StoreId);
+GO
+
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_IM_Type')
+BEGIN
+  ALTER TABLE dbo.InventoryMovement DROP CONSTRAINT CK_IM_Type;
+  ALTER TABLE dbo.InventoryMovement
+    ADD CONSTRAINT CK_IM_Type CHECK (MovementType IN ('RECEIVE','ISSUE','RETURN','ADJUST_IN','ADJUST_OUT','TRANSFER'));
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_IM_Batch' AND object_id=OBJECT_ID('dbo.InventoryMovement'))
+BEGIN
+  CREATE INDEX IX_IM_Batch
+  ON dbo.InventoryMovement(BatchId)
+  WHERE BatchId IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_medication_administration_repoint_to_clinical_order.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -6395,6 +6983,34 @@ GO
 
 IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.ConsentRecord') AND name = 'EncounterId' AND is_nullable = 0)
   ALTER TABLE dbo.ConsentRecord ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_operationtheatre_department_price.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- OT Master (Configuration page): a theatre can now be associated with a doctor department and
+-- carries a flat usage price, posted as a BillingChargeEvent when a booking completes.
+
+IF COL_LENGTH('dbo.OperationTheatre','DepartmentId') IS NULL
+  ALTER TABLE dbo.OperationTheatre ADD DepartmentId UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_OT_Department')
+  ALTER TABLE dbo.OperationTheatre
+    ADD CONSTRAINT FK_OT_Department FOREIGN KEY (DepartmentId)
+      REFERENCES dbo.Departments(DepartmentID);
+GO
+
+IF COL_LENGTH('dbo.OperationTheatre','Price') IS NULL
+  ALTER TABLE dbo.OperationTheatre ADD Price DECIMAL(18,2) NOT NULL CONSTRAINT DF_OT_Price DEFAULT (0);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_OT_Price')
+  ALTER TABLE dbo.OperationTheatre ADD CONSTRAINT CK_OT_Price CHECK (Price >= 0);
 GO
 
 GO
@@ -6874,6 +7490,58 @@ ELSE
 BEGIN
     PRINT 'Table already exists: InvoicePrintSettings';
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/dml_inventory_batch_backfill.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Inventory Management (INV-2): every InventoryItem with existing stock gets one opening-balance
+-- Batch (in its hospital's Main Store) plus a matching StockLevel row, so FEFO/batch queries have
+-- something to work with from day one instead of a stock number with no batch behind it. Idempotent
+-- â€” guarded per item (OPENING-BAL batch number), safe to re-run.
+
+INSERT INTO dbo.Batch (BatchId, HospitalId, InventoryItemId, StoreId, BatchNumber, ManufactureDate, ExpiryDate, UnitCost, ReceivedQty, RemainingQty, [Status], CreatedAt, UpdatedAt)
+SELECT NEWID(), i.HospitalId, i.InventoryItemId, s.StoreId, 'OPENING-BAL', NULL, NULL, i.DefaultRate, i.CurrentStock, i.CurrentStock, 'ACTIVE', SYSUTCDATETIME(), SYSUTCDATETIME()
+FROM dbo.InventoryItem i
+JOIN dbo.Store s ON s.HospitalId = i.HospitalId AND s.StoreType = 'MAIN'
+WHERE i.CurrentStock > 0
+  AND NOT EXISTS (
+    SELECT 1 FROM dbo.Batch b WHERE b.InventoryItemId = i.InventoryItemId AND b.BatchNumber = 'OPENING-BAL'
+  );
+GO
+
+INSERT INTO dbo.StockLevel (StockLevelId, HospitalId, InventoryItemId, StoreId, QtyOnHand, UpdatedAt)
+SELECT NEWID(), i.HospitalId, i.InventoryItemId, s.StoreId, i.CurrentStock, SYSUTCDATETIME()
+FROM dbo.InventoryItem i
+JOIN dbo.Store s ON s.HospitalId = i.HospitalId AND s.StoreType = 'MAIN'
+WHERE i.CurrentStock > 0
+  AND NOT EXISTS (
+    SELECT 1 FROM dbo.StockLevel sl WHERE sl.InventoryItemId = i.InventoryItemId AND sl.StoreId = s.StoreId
+  );
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/dml_inventory_store_backfill.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Inventory Management (INV-1): every hospital gets exactly one MAIN store, so existing
+-- InventoryItem/BloodBag/InstrumentSet rows have somewhere to attach to once their Store-linked
+-- columns land in later migrations. Idempotent â€” safe to re-run (skips hospitals that already
+-- have one).
+
+INSERT INTO dbo.Store (StoreId, HospitalId, StoreCode, StoreName, StoreType, ParentStoreId, IsActive, CreatedAt, UpdatedAt)
+SELECT NEWID(), h.HospitalID, 'MAIN', 'Main Store', 'MAIN', NULL, 1, SYSUTCDATETIME(), SYSUTCDATETIME()
+FROM dbo.Hospitals h
+WHERE NOT EXISTS (
+  SELECT 1 FROM dbo.Store s WHERE s.HospitalId = h.HospitalID AND s.StoreType = 'MAIN'
+);
 GO
 
 GO

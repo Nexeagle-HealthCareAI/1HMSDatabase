@@ -4,6 +4,10 @@ IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_OT_Price')
   ALTER TABLE dbo.OperationTheatre DROP CONSTRAINT CK_OT_Price;
 GO
 
+IF EXISTS (SELECT 1 FROM sys.default_constraints WHERE name = 'DF_OT_Price')
+  ALTER TABLE dbo.OperationTheatre DROP CONSTRAINT DF_OT_Price;
+GO
+
 IF COL_LENGTH('dbo.OperationTheatre','Price') IS NOT NULL
   ALTER TABLE dbo.OperationTheatre DROP COLUMN Price;
 GO

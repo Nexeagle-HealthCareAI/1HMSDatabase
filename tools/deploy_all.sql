@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-05 16:38  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-05 17:11  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -6653,6 +6653,58 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_blood_bag_store_link.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Inventory Management (INV-10): unify Blood Bank under the Store model. Adds a nullable StoreId
+-- FK ALONGSIDE (not replacing) the existing free-text StorageLocation â€” crossmatch/reservation/
+-- transfusion business logic is untouched; this only gives BloodBag a real location reference so
+-- it can participate in the unified stock-visibility view.
+
+IF COL_LENGTH('dbo.BloodBag','StoreId') IS NULL
+  ALTER TABLE dbo.BloodBag ADD StoreId UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BB_Store')
+  ALTER TABLE dbo.BloodBag
+    ADD CONSTRAINT FK_BB_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_BB_Store' AND object_id=OBJECT_ID('dbo.BloodBag'))
+BEGIN
+  CREATE INDEX IX_BB_Store
+  ON dbo.BloodBag(StoreId)
+  WHERE StoreId IS NOT NULL;
+END
+GO
+
+-- Backfill: one Store (StoreType='BLOOD_BANK') per hospital per distinct legacy StorageLocation
+-- string, then point matching bags at it by name. Idempotent â€” guarded by StoreCode uniqueness and
+-- only touches bags that don't already have a StoreId.
+INSERT INTO dbo.Store (StoreId, HospitalId, StoreCode, StoreName, StoreType, IsActive, CreatedAt, UpdatedAt)
+SELECT NEWID(), loc.HospitalId, N'BB-' + CONVERT(NVARCHAR(20), ROW_NUMBER() OVER (PARTITION BY loc.HospitalId ORDER BY loc.StorageLocation)),
+       loc.StorageLocation, N'BLOOD_BANK', 1, SYSUTCDATETIME(), SYSUTCDATETIME()
+FROM (
+  SELECT DISTINCT HospitalId, StorageLocation
+  FROM dbo.BloodBag
+  WHERE StorageLocation IS NOT NULL AND StoreId IS NULL
+) loc
+WHERE NOT EXISTS (
+  SELECT 1 FROM dbo.Store s WHERE s.HospitalId = loc.HospitalId AND s.StoreName = loc.StorageLocation
+);
+GO
+
+UPDATE b
+SET b.StoreId = s.StoreId
+FROM dbo.BloodBag b
+JOIN dbo.Store s ON s.HospitalId = b.HospitalId AND s.StoreName = b.StorageLocation AND s.StoreType = N'BLOOD_BANK'
+WHERE b.StoreId IS NULL AND b.StorageLocation IS NOT NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_chargemaster_irdai_payable.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -6828,6 +6880,57 @@ BEGIN
     PRINT 'Added NABH_NABL column to Hospitals table';
 END
 ELSE PRINT 'NABH_NABL column already exists';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_instrument_set_store_link.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Inventory Management (INV-10): unify CSSD under the Store model. Adds a nullable StoreId FK
+-- ALONGSIDE (not replacing) the existing free-text CurrentLocation â€” the status-machine/
+-- sterilization-cycle business logic is untouched; this only gives InstrumentSet a real location
+-- reference so it can participate in the unified stock-visibility view.
+
+IF COL_LENGTH('dbo.InstrumentSet','StoreId') IS NULL
+  ALTER TABLE dbo.InstrumentSet ADD StoreId UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_IS_Store')
+  ALTER TABLE dbo.InstrumentSet
+    ADD CONSTRAINT FK_IS_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_IS_Store' AND object_id=OBJECT_ID('dbo.InstrumentSet'))
+BEGIN
+  CREATE INDEX IX_IS_Store
+  ON dbo.InstrumentSet(StoreId)
+  WHERE StoreId IS NOT NULL;
+END
+GO
+
+-- Backfill: one Store (StoreType='CSSD') per hospital per distinct legacy CurrentLocation string,
+-- then point matching sets at it by name. Idempotent.
+INSERT INTO dbo.Store (StoreId, HospitalId, StoreCode, StoreName, StoreType, IsActive, CreatedAt, UpdatedAt)
+SELECT NEWID(), loc.HospitalId, N'CSSD-' + CONVERT(NVARCHAR(20), ROW_NUMBER() OVER (PARTITION BY loc.HospitalId ORDER BY loc.CurrentLocation)),
+       loc.CurrentLocation, N'CSSD', 1, SYSUTCDATETIME(), SYSUTCDATETIME()
+FROM (
+  SELECT DISTINCT HospitalId, CurrentLocation
+  FROM dbo.InstrumentSet
+  WHERE CurrentLocation IS NOT NULL AND StoreId IS NULL
+) loc
+WHERE NOT EXISTS (
+  SELECT 1 FROM dbo.Store s WHERE s.HospitalId = loc.HospitalId AND s.StoreName = loc.CurrentLocation
+);
+GO
+
+UPDATE i
+SET i.StoreId = s.StoreId
+FROM dbo.InstrumentSet i
+JOIN dbo.Store s ON s.HospitalId = i.HospitalId AND s.StoreName = i.CurrentLocation AND s.StoreType = N'CSSD'
+WHERE i.StoreId IS NULL AND i.CurrentLocation IS NOT NULL;
 GO
 
 GO

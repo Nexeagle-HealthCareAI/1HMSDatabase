@@ -14,6 +14,7 @@ BEGIN
     StoreCode       NVARCHAR(30)     NOT NULL,
     StoreName       NVARCHAR(100)    NOT NULL,
     StoreType       NVARCHAR(20)     NOT NULL,
+    AssignedBoard   NVARCHAR(20)     NULL,
 
     ParentStoreId   UNIQUEIDENTIFIER NULL,
 
@@ -32,7 +33,8 @@ BEGIN
     CONSTRAINT PK_Store PRIMARY KEY CLUSTERED (StoreId),
     CONSTRAINT UX_STORE_Code UNIQUE (HospitalId, StoreCode),
     CONSTRAINT FK_STORE_Parent FOREIGN KEY (ParentStoreId) REFERENCES dbo.Store(StoreId),
-    CONSTRAINT CK_STORE_Type CHECK (StoreType IN ('MAIN','SUB','DEPARTMENT','OT','PHARMACY','COLD_CHAIN','NARCOTIC','BLOOD_BANK','CSSD'))
+    CONSTRAINT CK_STORE_Type CHECK (StoreType IN ('MAIN','SUB','DEPARTMENT','OT','PHARMACY','COLD_CHAIN','NARCOTIC','BLOOD_BANK','CSSD')),
+    CONSTRAINT CK_STORE_AssignedBoard CHECK (AssignedBoard IS NULL OR AssignedBoard IN ('OT','ICU','WARD'))
   );
 END
 GO

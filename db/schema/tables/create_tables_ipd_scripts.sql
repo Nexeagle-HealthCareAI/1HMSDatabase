@@ -11,6 +11,7 @@ BEGIN
     PrimaryDoctorId      UNIQUEIDENTIFIER NULL,
 
     AdmissionNo          NVARCHAR(30)     NOT NULL,
+    AdmissionToken       NVARCHAR(50)     NULL,
 
     AdmissionType        NVARCHAR(20)     NULL,   -- EMERGENCY / ELECTIVE / DAYCARE / LAMA
     ReferralSource       NVARCHAR(20)     NULL,   -- SELF / DOCTOR / HOSPITAL

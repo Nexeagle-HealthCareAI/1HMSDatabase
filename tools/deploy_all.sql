@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-09 14:47  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-09 18:43  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -6487,6 +6487,23 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_admission_referral_package_type.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Optional link from an Advise-Admission referral to a PackageType â€” plain nullable column, no
+-- enforced FK, so a doctor can tag a package type even when no OT Plan is configured yet.
+-- Idempotent.
+IF OBJECT_ID('dbo.AdmissionReferral', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.AdmissionReferral', 'PackageTypeId') IS NULL
+        ALTER TABLE dbo.AdmissionReferral ADD PackageTypeId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_admission_referring_facility.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7384,6 +7401,23 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_ot_plan_package_type.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Optional link from an OT Plan to a PackageType â€” plain nullable column, not an enforced FK
+-- (matches Admission.OtPlanId's precedent), so this migration doesn't need to run after
+-- create_package_types_table.sql. Idempotent.
+IF OBJECT_ID('dbo.OTPlan', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.OTPlan', 'PackageTypeId') IS NULL
+        ALTER TABLE dbo.OTPlan ADD PackageTypeId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_patientregistrations_admission_fields.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8021,6 +8055,53 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_OTPlan_Hospital' AND object_id = OBJECT_ID('dbo.OTPlan'))
     CREATE INDEX IX_OTPlan_Hospital ON dbo.OTPlan (HospitalId, IsActive, DisplayOrder);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_package_types_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create PackageType Table
+-- Description: Reusable, hospital-scoped billing package labels (e.g. "Full
+--              Package", "Non Package") optionally attached to an OT Plan or an
+--              Advise Admission referral. No per-component pricing â€” just a
+--              name, an optional overall price, and an optional free-text list
+--              of what's included (OT Med, Ward Med, Room Rent, Procedure...).
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PackageType', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PackageType (
+        PackageTypeId   UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_PkgType_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId      UNIQUEIDENTIFIER NOT NULL,
+        Name            NVARCHAR(200)    NOT NULL,
+        Price           DECIMAL(18,2)    NULL,
+        ComponentsJson  NVARCHAR(MAX)    NULL,
+
+        IsActive        BIT              NOT NULL CONSTRAINT DF_PkgType_IsActive DEFAULT (1),
+
+        CreatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_PkgType_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CreatedBy       NVARCHAR(500)    NULL,
+        UpdatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_PkgType_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedBy       NVARCHAR(500)    NULL,
+
+        RowVersion      ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_PackageType PRIMARY KEY CLUSTERED (PackageTypeId)
+    );
+
+    PRINT 'Created table PackageType';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PkgType_Hospital' AND object_id = OBJECT_ID('dbo.PackageType'))
+    CREATE INDEX IX_PkgType_Hospital ON dbo.PackageType (HospitalId, IsActive);
 GO
 
 GO

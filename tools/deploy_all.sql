@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-09 21:23  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-09 22:52  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -6662,6 +6662,33 @@ IF EXISTS (
 )
 BEGIN
     ALTER TABLE dbo.AdmissionDayBill ALTER COLUMN AdmissionId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_appointments_cancellation_audit.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Appointment cancellation audit trail
+-- Description: CancelAppointmentHandler had no reason/actor tracking â€” just a
+--              generic status flip. Adds a free-text reason plus who/when
+--              cancelled, matching the same audit shape used elsewhere.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Appointments', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Appointments', 'CancellationReason') IS NULL
+        ALTER TABLE dbo.Appointments ADD CancellationReason NVARCHAR(500) NULL;
+
+    IF COL_LENGTH('dbo.Appointments', 'CancelledAt') IS NULL
+        ALTER TABLE dbo.Appointments ADD CancelledAt DATETIME2 NULL;
+
+    IF COL_LENGTH('dbo.Appointments', 'CancelledBy') IS NULL
+        ALTER TABLE dbo.Appointments ADD CancelledBy NVARCHAR(500) NULL;
 END
 GO
 

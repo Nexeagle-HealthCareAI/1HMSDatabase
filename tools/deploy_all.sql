@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-05 19:40  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-09 14:47  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -3842,6 +3842,7 @@ BEGIN
     StoreCode       NVARCHAR(30)     NOT NULL,
     StoreName       NVARCHAR(100)    NOT NULL,
     StoreType       NVARCHAR(20)     NOT NULL,
+    AssignedBoard   NVARCHAR(20)     NULL,
 
     ParentStoreId   UNIQUEIDENTIFIER NULL,
 
@@ -3860,7 +3861,8 @@ BEGIN
     CONSTRAINT PK_Store PRIMARY KEY CLUSTERED (StoreId),
     CONSTRAINT UX_STORE_Code UNIQUE (HospitalId, StoreCode),
     CONSTRAINT FK_STORE_Parent FOREIGN KEY (ParentStoreId) REFERENCES dbo.Store(StoreId),
-    CONSTRAINT CK_STORE_Type CHECK (StoreType IN ('MAIN','SUB','DEPARTMENT','OT','PHARMACY','COLD_CHAIN','NARCOTIC','BLOOD_BANK','CSSD'))
+    CONSTRAINT CK_STORE_Type CHECK (StoreType IN ('MAIN','SUB','DEPARTMENT','OT','PHARMACY','COLD_CHAIN','NARCOTIC','BLOOD_BANK','CSSD')),
+    CONSTRAINT CK_STORE_AssignedBoard CHECK (AssignedBoard IS NULL OR AssignedBoard IN ('OT','ICU','WARD'))
   );
 END
 GO
@@ -3957,6 +3959,7 @@ BEGIN
     PrimaryDoctorId      UNIQUEIDENTIFIER NULL,
 
     AdmissionNo          NVARCHAR(30)     NOT NULL,
+    AdmissionToken       NVARCHAR(50)     NULL,
 
     AdmissionType        NVARCHAR(20)     NULL,   -- EMERGENCY / ELECTIVE / DAYCARE / LAMA
     ReferralSource       NVARCHAR(20)     NULL,   -- SELF / DOCTOR / HOSPITAL
@@ -6439,6 +6442,51 @@ GO
 -- #####################################################################
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_admission_add_token.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration to add AdmissionToken to Admission table
+
+IF NOT EXISTS(
+    SELECT 1 FROM sys.columns 
+    WHERE Name = N'AdmissionToken' 
+      AND Object_ID = Object_ID(N'dbo.Admission')
+)
+BEGIN
+    ALTER TABLE dbo.Admission
+    ADD AdmissionToken NVARCHAR(50) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_admission_ot_plan.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Snapshot of the OT Plan picked at admit time (if any) â€” kept as plain nullable columns, not an
+-- enforced FK to OTPlan, so this migration doesn't need to run after create_ot_plans_table.sql.
+-- ProcedureName/SuggestedIcuLevel are frozen at admit time (not a live join) so editing or
+-- retiring the plan later never changes what an already-admitted patient's record shows.
+-- Idempotent.
+IF OBJECT_ID('dbo.Admission', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Admission', 'OtPlanId') IS NULL
+        ALTER TABLE dbo.Admission ADD OtPlanId UNIQUEIDENTIFIER NULL;
+
+    IF COL_LENGTH('dbo.Admission', 'OtPlanProcedureNameSnapshot') IS NULL
+        ALTER TABLE dbo.Admission ADD OtPlanProcedureNameSnapshot NVARCHAR(300) NULL;
+
+    IF COL_LENGTH('dbo.Admission', 'OtPlanSuggestedIcuLevel') IS NULL
+        ALTER TABLE dbo.Admission ADD OtPlanSuggestedIcuLevel NVARCHAR(20) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_admission_referring_facility.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -6973,6 +7021,35 @@ BEGIN
     PRINT 'Added NABH_NABL column to Hospitals table';
 END
 ELSE PRINT 'NABH_NABL column already exists';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_indent_internal_workflow.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration to support Internal Stock Requests (Indents) & Partial Fulfillment
+
+-- 1. Add TargetStoreId to Indent table to track which store is being requested for stock
+IF NOT EXISTS (
+    SELECT * FROM sys.columns 
+    WHERE object_id = OBJECT_ID(N'[Indent]') AND name = 'TargetStoreId'
+)
+BEGIN
+    ALTER TABLE [Indent] ADD [TargetStoreId] uniqueidentifier NULL;
+END
+GO
+
+-- 2. Add IssuedQty to IndentLine table to track partial fulfillments
+IF NOT EXISTS (
+    SELECT * FROM sys.columns 
+    WHERE object_id = OBJECT_ID(N'[IndentLine]') AND name = 'IssuedQty'
+)
+BEGIN
+    ALTER TABLE [IndentLine] ADD [IssuedQty] decimal(18,2) NOT NULL DEFAULT 0;
+END
 GO
 
 GO
@@ -7525,6 +7602,37 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_store_add_assigned_board.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration to add AssignedBoard to Store table
+
+IF NOT EXISTS(
+    SELECT 1 FROM sys.columns 
+    WHERE Name = N'AssignedBoard' 
+      AND Object_ID = Object_ID(N'dbo.Store')
+)
+BEGIN
+    ALTER TABLE dbo.Store
+    ADD AssignedBoard NVARCHAR(20) NULL;
+END
+GO
+
+IF NOT EXISTS(
+    SELECT 1 FROM sys.check_constraints 
+    WHERE name = 'CK_STORE_AssignedBoard'
+      AND parent_object_id = Object_ID(N'dbo.Store')
+)
+BEGIN
+    ALTER TABLE dbo.Store
+    ADD CONSTRAINT CK_STORE_AssignedBoard CHECK (AssignedBoard IS NULL OR AssignedBoard IN ('OT','ICU','WARD'));
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_tables_gst_engine.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7862,6 +7970,190 @@ ELSE
 BEGIN
     PRINT 'Table already exists: InvoicePrintSettings';
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_ot_plans_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create OTPlan Table
+-- Description: Reusable, department-scoped procedure templates (e.g. "PCNL Plan"
+--              under Urology) that pre-fill room/ICU defaults at admission time
+--              and the procedure name at Surgery Case time.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.OTPlan', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.OTPlan (
+        OtPlanId            UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_OTPlan_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId          UNIQUEIDENTIFIER NOT NULL,
+        DepartmentId        UNIQUEIDENTIFIER NULL,   -- NULL = any department / general
+
+        PlanName            NVARCHAR(200)    NOT NULL,
+        ProcedureName       NVARCHAR(300)    NOT NULL,
+        DefaultRoomCategory NVARCHAR(20)     NULL,    -- GENERAL / SEMI_PRIVATE / PRIVATE
+        SuggestedIcuLevel   NVARCHAR(20)     NULL,    -- LEVEL_1 / LEVEL_2 / LEVEL_3
+
+        IsActive            BIT              NOT NULL CONSTRAINT DF_OTPlan_IsActive DEFAULT (1),
+        DisplayOrder        INT              NOT NULL CONSTRAINT DF_OTPlan_DisplayOrder DEFAULT (0),
+
+        CreatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_OTPlan_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CreatedBy           NVARCHAR(500)    NULL,
+        UpdatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_OTPlan_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedBy           NVARCHAR(500)    NULL,
+
+        RowVersion          ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_OTPlan PRIMARY KEY CLUSTERED (OtPlanId),
+        CONSTRAINT FK_OTPlan_Department FOREIGN KEY (DepartmentId) REFERENCES dbo.Departments(DepartmentID),
+        CONSTRAINT FK_OTPlan_Hospital FOREIGN KEY (HospitalId) REFERENCES dbo.Hospitals(HospitalID)
+    );
+
+    PRINT 'Created table OTPlan';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_OTPlan_Hospital' AND object_id = OBJECT_ID('dbo.OTPlan'))
+    CREATE INDEX IX_OTPlan_Hospital ON dbo.OTPlan (HospitalId, IsActive, DisplayOrder);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_prescription_drawings_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create PrescriptionDrawing Table
+-- Description: Doctor-drawn freehand images attached to a prescription, appended
+--              as extra pages at the end of the printed prescription PDF.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PrescriptionDrawing', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PrescriptionDrawing (
+        DrawingId      UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_PresDraw_DrawingId DEFAULT NEWSEQUENTIALID(),
+
+        ApptId         UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT FK_PresDraw_Appt
+                FOREIGN KEY REFERENCES dbo.Appointments(ApptId) ON DELETE CASCADE,
+
+        PatientId      NVARCHAR(50)     NOT NULL,
+        HospitalId     UNIQUEIDENTIFIER NULL,
+        DoctorId       UNIQUEIDENTIFIER NULL,
+
+        Label          NVARCHAR(200)    NULL,
+        StorageUrl     NVARCHAR(500)    NULL,
+        FileName       NVARCHAR(255)    NOT NULL,
+        SequenceNo     INT              NOT NULL
+            CONSTRAINT DF_PresDraw_SequenceNo DEFAULT (0),
+
+        UploadedAt     DATETIME2(3)     NOT NULL
+            CONSTRAINT DF_PresDraw_UploadedAt DEFAULT (SYSUTCDATETIME()),
+        UploadedBy     NVARCHAR(500)    NULL,
+
+        RowVersion     ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_PrescriptionDrawing
+            PRIMARY KEY CLUSTERED (DrawingId)
+    );
+
+    PRINT 'Created table PrescriptionDrawing';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_referred_admission_tables.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create AdmissionReferral + AdmissionReferralStatusHistory Tables
+-- Description: Doctor-initiated "advise admission" worklist â€” created from the
+--              prescription board, tracked through PENDING/CONVERTED/NOT_ADMITTED/
+--              FOLLOW_UP on the IPD board's Referred Admissions tab, converted
+--              (linked to a real Admission) when the patient is actually admitted.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.AdmissionReferral', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AdmissionReferral (
+        ReferralId            UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_AdmRef_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId            UNIQUEIDENTIFIER NOT NULL,
+        PatientId             NVARCHAR(50)     NOT NULL,
+        ReferringDoctorId     UNIQUEIDENTIFIER NOT NULL,
+        AppointmentId         UNIQUEIDENTIFIER NULL,
+        OtPlanId              UNIQUEIDENTIFIER NULL,
+
+        ProcedureName         NVARCHAR(300)    NULL,
+        ProbableAdmissionDate DATETIME2(3)     NULL,
+        CaseType              NVARCHAR(20)     NOT NULL,   -- EMERGENCY / PLANNED / URGENT
+        Notes                 NVARCHAR(1000)   NULL,
+
+        StatusCode            NVARCHAR(20)     NOT NULL
+            CONSTRAINT DF_AdmRef_Status DEFAULT ('PENDING'),
+            -- PENDING / CONVERTED / NOT_ADMITTED / FOLLOW_UP
+
+        NotAdmittedReason     NVARCHAR(500)    NULL,
+        FollowUpDate          DATETIME2(3)     NULL,
+        FollowUpNotes         NVARCHAR(500)    NULL,
+        ConvertedAdmissionId  UNIQUEIDENTIFIER NULL,
+
+        CreatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_AdmRef_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CreatedBy             NVARCHAR(500)    NULL,
+        UpdatedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_AdmRef_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedBy             NVARCHAR(500)    NULL,
+
+        RowVersion            ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_AdmissionReferral PRIMARY KEY CLUSTERED (ReferralId),
+        CONSTRAINT FK_AdmRef_Doctor FOREIGN KEY (ReferringDoctorId) REFERENCES dbo.Doctors(DoctorID),
+        CONSTRAINT FK_AdmRef_OTPlan FOREIGN KEY (OtPlanId) REFERENCES dbo.OTPlan(OtPlanId),
+        CONSTRAINT FK_AdmRef_Admission FOREIGN KEY (ConvertedAdmissionId) REFERENCES dbo.Admission(AdmissionId)
+    );
+
+    PRINT 'Created table AdmissionReferral';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_AdmRef_Hospital' AND object_id = OBJECT_ID('dbo.AdmissionReferral'))
+    CREATE INDEX IX_AdmRef_Hospital ON dbo.AdmissionReferral (HospitalId, StatusCode, CreatedAt DESC);
+GO
+
+IF OBJECT_ID('dbo.AdmissionReferralStatusHistory', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AdmissionReferralStatusHistory (
+        HistoryId   UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ARSH_Id DEFAULT NEWSEQUENTIALID(),
+        ReferralId  UNIQUEIDENTIFIER NOT NULL,
+
+        StatusCode  NVARCHAR(20)     NOT NULL,
+        ChangedAt   DATETIME2(3)     NOT NULL CONSTRAINT DF_ARSH_ChangedAt DEFAULT (SYSUTCDATETIME()),
+        ChangedBy   NVARCHAR(500)    NULL,
+        Notes       NVARCHAR(500)    NULL,
+
+        CONSTRAINT PK_AdmissionReferralStatusHistory PRIMARY KEY CLUSTERED (HistoryId),
+        CONSTRAINT FK_ARSH_Referral FOREIGN KEY (ReferralId)
+            REFERENCES dbo.AdmissionReferral(ReferralId) ON DELETE CASCADE
+    );
+
+    PRINT 'Created table AdmissionReferralStatusHistory';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ARSH_Referral' AND object_id = OBJECT_ID('dbo.AdmissionReferralStatusHistory'))
+    CREATE INDEX IX_ARSH_Referral ON dbo.AdmissionReferralStatusHistory (ReferralId, ChangedAt DESC);
 GO
 
 GO

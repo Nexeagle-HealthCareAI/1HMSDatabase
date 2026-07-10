@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-09 18:43  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-10 09:40  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -6668,6 +6668,33 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_appointments_cancellation_audit.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Appointment cancellation audit trail
+-- Description: CancelAppointmentHandler had no reason/actor tracking â€” just a
+--              generic status flip. Adds a free-text reason plus who/when
+--              cancelled, matching the same audit shape used elsewhere.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Appointments', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Appointments', 'CancellationReason') IS NULL
+        ALTER TABLE dbo.Appointments ADD CancellationReason NVARCHAR(500) NULL;
+
+    IF COL_LENGTH('dbo.Appointments', 'CancelledAt') IS NULL
+        ALTER TABLE dbo.Appointments ADD CancelledAt DATETIME2 NULL;
+
+    IF COL_LENGTH('dbo.Appointments', 'CancelledBy') IS NULL
+        ALTER TABLE dbo.Appointments ADD CancelledBy NVARCHAR(500) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_bedmaster_room_id.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7866,6 +7893,58 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_discharge_medication_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create DischargeMedication Table
+-- Description: Structured discharge/home-medication list for a DischargeSummary â€”
+--              one row per medicine (name, dosage, route, frequency, duration,
+--              instructions), mirroring PrescriptionMedicine's shape. Replaces
+--              hand-typing the whole list into DischargeSummary.DischargeMedications
+--              (that text column is left in place, now a derived/generated mirror
+--              of this table rather than the source of truth).
+--              No enforced FK to DischargeSummary â€” same unconstrained convention
+--              used elsewhere this session â€” so this migration doesn't need to run
+--              after create_discharge_config_tables.sql (or wherever DischargeSummary
+--              is created). Idempotent.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DischargeMedication', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DischargeMedication (
+        DischargeMedicationId  UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_DischargeMedication_Id DEFAULT NEWSEQUENTIALID(),
+
+        DischargeSummaryId     UNIQUEIDENTIFIER NOT NULL,
+
+        MedicineName            NVARCHAR(300)    NULL,
+        Dosage                  NVARCHAR(200)    NULL,
+        Route                   NVARCHAR(100)    NULL,
+        Frequency               NVARCHAR(100)    NULL,
+        Durations               NVARCHAR(100)    NULL,
+        Instructions             NVARCHAR(500)    NULL,
+        SaltName                NVARCHAR(300)    NULL,
+        DisplayOrder            INT              NULL,
+
+        CreatedAt               DATETIME2(3)     NOT NULL CONSTRAINT DF_DischargeMedication_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedAt                DATETIME2(3)     NOT NULL CONSTRAINT DF_DischargeMedication_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+
+        CONSTRAINT PK_DischargeMedication PRIMARY KEY CLUSTERED (DischargeMedicationId)
+    );
+
+    PRINT 'Created table DischargeMedication';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DischargeMedication_Summary' AND object_id = OBJECT_ID('dbo.DischargeMedication'))
+    CREATE INDEX IX_DischargeMedication_Summary ON dbo.DischargeMedication (DischargeSummaryId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_doctor_prescription_field_configs.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8004,6 +8083,44 @@ ELSE
 BEGIN
     PRINT 'Table already exists: InvoicePrintSettings';
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_ot_plan_package_types_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create OTPlanPackageType Table
+-- Description: Many-to-many link letting an OT Plan offer several Package Types
+--              (e.g. an OT Plan may list both "Full Package" and "Non Package" as
+--              selectable options). Supersedes the single OTPlan.PackageTypeId
+--              column (added by alter_ot_plan_package_type.sql) as the source of
+--              truth for the OT Plans configuration board; that column is left in
+--              place, unused, rather than dropped (already-deployed column).
+--              No enforced FK â€” same unconstrained convention as OTPlan.PackageTypeId,
+--              so this migration doesn't need to run after create_ot_plans_table.sql
+--              or create_package_types_table.sql. Idempotent.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.OTPlanPackageType', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.OTPlanPackageType (
+        OtPlanId        UNIQUEIDENTIFIER NOT NULL,
+        PackageTypeId   UNIQUEIDENTIFIER NOT NULL,
+        CreatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_OTPlanPkgType_CreatedAt DEFAULT (SYSUTCDATETIME()),
+
+        CONSTRAINT PK_OTPlanPackageType PRIMARY KEY CLUSTERED (OtPlanId, PackageTypeId)
+    );
+
+    PRINT 'Created table OTPlanPackageType';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_OTPlanPkgType_PackageType' AND object_id = OBJECT_ID('dbo.OTPlanPackageType'))
+    CREATE INDEX IX_OTPlanPkgType_PackageType ON dbo.OTPlanPackageType (PackageTypeId);
 GO
 
 GO

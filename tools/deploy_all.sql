@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-10 15:44  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-12 16:38  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -7057,6 +7057,30 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_doctors_add_ispubliclylisted.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Per-doctor public directory opt-in
+-- Description: Adds Doctors.IsPubliclyListed â€” off by default. A doctor only appears
+--              in the platform-wide public directory when BOTH their hospital has
+--              opted in (Hospitals.IsPubliclyListed) AND the hospital admin has
+--              explicitly listed this specific doctor. Lets a hospital that's opted
+--              into the directory still curate which doctors actually show, rather
+--              than all-or-nothing. Guarded ALTER on the already-deployed Doctors table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Doctors', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Doctors', 'IsPubliclyListed') IS NULL
+        ALTER TABLE dbo.Doctors ADD IsPubliclyListed BIT NOT NULL CONSTRAINT DF_Doctors_IsPubliclyListed DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_hospital_subscriptions_add_payment.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7114,6 +7138,30 @@ BEGIN
     PRINT 'Added NABH_NABL column to Hospitals table';
 END
 ELSE PRINT 'NABH_NABL column already exists';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospitals_add_ispubliclylisted.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Hospital public directory opt-in
+-- Description: Adds Hospitals.IsPubliclyListed â€” off by default. A hospital only
+--              appears in the platform-wide public doctor directory (Nexeagle's
+--              "find a doctor" page, spanning every opted-in hospital) once this
+--              is explicitly turned on in hospital settings. Replaces the old
+--              single-hospital-API-key scoping model. Guarded ALTER on the
+--              already-deployed Hospitals table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Hospitals', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Hospitals', 'IsPubliclyListed') IS NULL
+        ALTER TABLE dbo.Hospitals ADD IsPubliclyListed BIT NOT NULL CONSTRAINT DF_Hospitals_IsPubliclyListed DEFAULT (0);
+END
 GO
 
 GO
@@ -7704,6 +7752,30 @@ GO
 -- Idempotent: only added if it doesn't already exist.
 IF COL_LENGTH('dbo.Prescription', 'SystemicExamination') IS NULL
     ALTER TABLE dbo.Prescription ADD SystemicExamination NVARCHAR(MAX) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_publicapiclient_hospitalid_nullable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: PublicApiClient becomes a platform-wide key, not per-hospital
+-- Description: PublicApiClient.HospitalId was NOT NULL under the old model (one API
+--              key = one hospital, scoped by PublicApiKeyFilter). The public API is
+--              now a platform-wide, opt-in multi-hospital directory â€” HospitalId is
+--              resolved per-request from the doctor being queried/booked (+
+--              Hospital.IsPubliclyListed), never from the key. Relax to nullable;
+--              existing rows keep whatever HospitalId they have, but it is now
+--              purely informational (which hospital's admin, if any, requested the
+--              key) and no longer read for authorization. Guarded ALTER, same
+--              pattern as alter_nursing_docs_encounterid_nullable.sql.
+-- =============================================================================
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.PublicApiClient') AND name = 'HospitalId' AND is_nullable = 0)
+  ALTER TABLE dbo.PublicApiClient ALTER COLUMN HospitalId UNIQUEIDENTIFIER NULL;
 GO
 
 GO

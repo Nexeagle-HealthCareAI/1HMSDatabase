@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-10 09:40  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-10 15:44  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -6668,6 +6668,55 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_appointments_booking_metadata.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Public booking source metadata
+-- Description: Adds Appointments.BookingIpAddress / BookingReferrerUrl / BookingUtmCampaign
+--              â€” captured only for public (Nexeagle) bookings, for later abuse-tracking and
+--              marketing-attribution analysis (which page/campaign drove the booking).
+--              Guarded ALTER on the already-deployed Appointments table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Appointments', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Appointments', 'BookingIpAddress') IS NULL
+        ALTER TABLE dbo.Appointments ADD BookingIpAddress NVARCHAR(64) NULL;
+
+    IF COL_LENGTH('dbo.Appointments', 'BookingReferrerUrl') IS NULL
+        ALTER TABLE dbo.Appointments ADD BookingReferrerUrl NVARCHAR(500) NULL;
+
+    IF COL_LENGTH('dbo.Appointments', 'BookingUtmCampaign') IS NULL
+        ALTER TABLE dbo.Appointments ADD BookingUtmCampaign NVARCHAR(200) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_appointments_booking_source.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Appointment booking source
+-- Description: Adds Appointments.BookingSource ("INTERNAL" / "NEXEAGLE_PUBLIC")
+--              for audit/reporting traceability of where a booking came from.
+--              Guarded ALTER on the already-deployed Appointments table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Appointments', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Appointments', 'BookingSource') IS NULL
+        ALTER TABLE dbo.Appointments ADD BookingSource NVARCHAR(50) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_appointments_cancellation_audit.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7594,6 +7643,33 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_patientregistrations_marketing_consent.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Patient marketing/communication consent
+-- Description: Adds PatientRegistrations.MarketingConsent (+ MarketingConsentAt) so an
+--              opt-in given at public (Nexeagle) booking time can be tracked and reused
+--              later for follow-up SMS/email/marketing. Once true it is only ever
+--              upgraded, never silently cleared by a later booking that doesn't ask â€”
+--              see AppointmentBookingHelpers.FindOrCreatePatientAsync. Guarded ALTER on
+--              the already-deployed PatientRegistrations table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PatientRegistrations', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.PatientRegistrations', 'MarketingConsent') IS NULL
+        ALTER TABLE dbo.PatientRegistrations ADD MarketingConsent BIT NOT NULL CONSTRAINT DF_PatientRegistrations_MarketingConsent DEFAULT (0);
+
+    IF COL_LENGTH('dbo.PatientRegistrations', 'MarketingConsentAt') IS NULL
+        ALTER TABLE dbo.PatientRegistrations ADD MarketingConsentAt DATETIME2(3) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_patientregistrations_merge_fields.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8266,6 +8342,56 @@ BEGIN
 
     PRINT 'Created table PrescriptionDrawing';
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_public_api_client_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create PublicApiClient Table
+-- Description: Per-hospital API key for external integrations (e.g. the Nexeagle
+--              public booking website). One row per external integration per
+--              hospital â€” a leaked key only exposes the one hospital it belongs
+--              to, never every tenant. ApiKeyHash stores a SHA-256 hash only;
+--              the raw key is shown once at creation and never persisted.
+--              No enforced FK to Hospitals â€” same unconstrained convention used
+--              elsewhere this session â€” so this migration doesn't need to run
+--              after the Hospitals table's creation file. Idempotent.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PublicApiClient', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PublicApiClient (
+        ApiClientId    UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_PublicApiClient_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId     UNIQUEIDENTIFIER NOT NULL,
+
+        ClientName     NVARCHAR(200)    NULL,
+        ApiKeyHash     NVARCHAR(200)    NOT NULL,
+        IsActive       BIT              NOT NULL CONSTRAINT DF_PublicApiClient_IsActive DEFAULT (1),
+        LastUsedAt     DATETIME2(3)     NULL,
+
+        CreatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_PublicApiClient_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_PublicApiClient_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+
+        CONSTRAINT PK_PublicApiClient PRIMARY KEY CLUSTERED (ApiClientId)
+    );
+
+    PRINT 'Created table PublicApiClient';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PublicApiClient_Hospital' AND object_id = OBJECT_ID('dbo.PublicApiClient'))
+    CREATE INDEX IX_PublicApiClient_Hospital ON dbo.PublicApiClient (HospitalId);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PublicApiClient_ApiKeyHash' AND object_id = OBJECT_ID('dbo.PublicApiClient'))
+    CREATE UNIQUE INDEX IX_PublicApiClient_ApiKeyHash ON dbo.PublicApiClient (ApiKeyHash);
 GO
 
 GO

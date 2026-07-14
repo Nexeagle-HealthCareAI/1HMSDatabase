@@ -94,3 +94,57 @@ N'<h3>Informed Consent for Blood and Blood Product Transfusion</h3>
   );
 END
 GO
+
+-- ───── Discharge advice & consent ───────────────────────────────────────────
+DECLARE @HospitalId4 UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
+DECLARE @Now4 DATETIME2(3) = SYSUTCDATETIME();
+
+IF NOT EXISTS (
+  SELECT 1 FROM dbo.ConsentTemplate
+  WHERE HospitalId = @HospitalId4 AND TypeCode = N'DISCHARGE' AND [Language] = N'EN' AND IsActive = 1
+)
+BEGIN
+  INSERT INTO dbo.ConsentTemplate (HospitalId, TypeCode, Title, [Language], Version, BodyHtml, IsActive, CreatedAt, CreatedBy, UpdatedAt, UpdatedBy)
+  VALUES (
+    @HospitalId4, N'DISCHARGE', N'Discharge Advice & Consent', N'EN', 1,
+N'<h3>Discharge Advice &amp; Consent</h3>
+<p>I confirm that my/the patient''s diagnosis, the treatment given during this admission, and the condition at the time of discharge have been explained to me in a language I understand.</p>
+<ul>
+  <li>I have been given the discharge medications, dosage instructions, diet and activity advice, and follow-up plan in writing.</li>
+  <li>I have been told the warning signs and symptoms for which I should seek immediate medical attention or return to the hospital.</li>
+  <li>I have had the opportunity to ask questions about my/the patient''s condition and ongoing care, and all my questions have been answered satisfactorily.</li>
+  <li>I agree to the patient being discharged from the hospital''s care at this time.</li>
+</ul>
+<p>I understand that continued follow-up as advised is important for a full recovery.</p>',
+    1, @Now4, N'SEED', @Now4, N'SEED'
+  );
+END
+GO
+
+-- ───── Leave Against Medical Advice (LAMA) consent ──────────────────────────
+DECLARE @HospitalId5 UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
+DECLARE @Now5 DATETIME2(3) = SYSUTCDATETIME();
+
+IF NOT EXISTS (
+  SELECT 1 FROM dbo.ConsentTemplate
+  WHERE HospitalId = @HospitalId5 AND TypeCode = N'LAMA' AND [Language] = N'EN' AND IsActive = 1
+)
+BEGIN
+  INSERT INTO dbo.ConsentTemplate (HospitalId, TypeCode, Title, [Language], Version, BodyHtml, IsActive, CreatedAt, CreatedBy, UpdatedAt, UpdatedBy)
+  VALUES (
+    @HospitalId5, N'LAMA', N'Leave Against Medical Advice (LAMA) Consent', N'EN', 1,
+N'<h3>Leave Against Medical Advice</h3>
+<p>I am voluntarily choosing to leave the hospital, or to remove the patient from the hospital, before treatment has been completed and against the advice of the treating doctor(s).</p>
+<h4>Acknowledgement of risk</h4>
+<ul>
+  <li>I have been informed of my/the patient''s current diagnosis and the treatment that is still recommended.</li>
+  <li>I have been explained the risks of leaving before treatment is complete, including but not limited to worsening of the condition, complications, permanent disability, or death.</li>
+  <li>I have had the opportunity to ask questions about these risks, and all my questions have been answered.</li>
+  <li>I understand I may return to this hospital for further care at any time, and that a follow-up plan/referral has been offered to me.</li>
+</ul>
+<h4>Release</h4>
+<p>I hereby release the hospital, its doctors, and its staff from all liability for any consequences that may result from my/the patient leaving against medical advice.</p>',
+    1, @Now5, N'SEED', @Now5, N'SEED'
+  );
+END
+GO

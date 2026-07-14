@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-14 11:43  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-14 17:04  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -10174,7 +10174,11 @@ WHEN MATCHED AND (t.DisplayName <> s.DisplayName OR t.SortOrder <> s.SortOrder O
     (N'NOTE',N'General doctor notes'),
     (N'IMMUNIZATION',N'Vaccinations and immunizations'),
     (N'FOLLOW_UP',N'Follow-up plans and referrals'),
-    (N'ATTACHMENT',N'Uploaded documents, reports, or images')
+    (N'ATTACHMENT',N'Uploaded documents, reports, or images'),
+    (N'FOLLOW_UP_INSTRUCTIONS',N'Discharge follow-up instructions'),
+    (N'DIET_INSTRUCTIONS',N'Discharge diet instructions'),
+    (N'ACTIVITY_RESTRICTIONS',N'Discharge activity restrictions'),
+    (N'ICD10',N'ICD-10 diagnosis codes')
   ) a(LookupTypeCode,[Description])
 )
 MERGE dbo.LookupTypes AS t

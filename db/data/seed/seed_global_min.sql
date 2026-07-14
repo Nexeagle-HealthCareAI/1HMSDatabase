@@ -266,7 +266,11 @@ WHEN MATCHED AND (t.DisplayName <> s.DisplayName OR t.SortOrder <> s.SortOrder O
     (N'NOTE',N'General doctor notes'),
     (N'IMMUNIZATION',N'Vaccinations and immunizations'),
     (N'FOLLOW_UP',N'Follow-up plans and referrals'),
-    (N'ATTACHMENT',N'Uploaded documents, reports, or images')
+    (N'ATTACHMENT',N'Uploaded documents, reports, or images'),
+    (N'FOLLOW_UP_INSTRUCTIONS',N'Discharge follow-up instructions'),
+    (N'DIET_INSTRUCTIONS',N'Discharge diet instructions'),
+    (N'ACTIVITY_RESTRICTIONS',N'Discharge activity restrictions'),
+    (N'ICD10',N'ICD-10 diagnosis codes')
   ) a(LookupTypeCode,[Description])
 )
 MERGE dbo.LookupTypes AS t

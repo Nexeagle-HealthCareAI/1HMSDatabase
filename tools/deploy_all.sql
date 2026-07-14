@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-14 01:49  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-14 11:43  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -8122,6 +8122,152 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_device_assignment_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create DeviceAssignment Table
+-- Description: Tracks invasive devices (central line, urinary catheter, ETT) that
+--              drive CLABSI/CAUTI/VAP risk. Unlike RestraintOrder (one ACTIVE row
+--              per admission), a patient can have multiple concurrent device types
+--              at once, so the "one active" rule is scoped per (admission, device
+--              type) via UX_DA_AdmissionDeviceTypeActive. InsertedAt/RemovedAt span
+--              feeds device-days for the hospital-level infection-rate view.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DeviceAssignment', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DeviceAssignment
+    (
+        DeviceAssignmentId  UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_DA_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId          UNIQUEIDENTIFIER NOT NULL,
+        AdmissionId         UNIQUEIDENTIFIER NOT NULL,
+        EncounterId         UNIQUEIDENTIFIER NULL,
+        PatientId           NVARCHAR(50)     NULL,
+
+        DeviceType          NVARCHAR(30)     NOT NULL,   -- CENTRAL_LINE / URINARY_CATHETER / ETT
+
+        InsertionSite       NVARCHAR(100)    NULL,
+        Indication          NVARCHAR(300)    NULL,
+
+        InsertedByDoctorName NVARCHAR(200)   NOT NULL,
+        InsertedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_DA_InsertedAt DEFAULT (SYSUTCDATETIME()),
+
+        RemovedAt           DATETIME2(3)     NULL,
+        RemovedBy           NVARCHAR(150)    NULL,
+        RemovedByUserId     UNIQUEIDENTIFIER NULL,
+        RemovalReason       NVARCHAR(300)    NULL,
+
+        StatusCode          NVARCHAR(20)     NOT NULL
+            CONSTRAINT DF_DA_Status DEFAULT ('ACTIVE'),   -- ACTIVE / REMOVED
+
+        Notes               NVARCHAR(500)    NULL,
+
+        CreatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_DA_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CreatedBy           NVARCHAR(100)    NULL,
+        UpdatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_DA_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedBy           NVARCHAR(100)    NULL,
+
+        RowVersion          ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_DeviceAssignment PRIMARY KEY CLUSTERED (DeviceAssignmentId),
+        CONSTRAINT FK_DA_Admission FOREIGN KEY (AdmissionId) REFERENCES dbo.Admission(AdmissionId),
+        CONSTRAINT CK_DA_DeviceType CHECK (DeviceType IN ('CENTRAL_LINE','URINARY_CATHETER','ETT')),
+        CONSTRAINT CK_DA_Status CHECK (StatusCode IN ('ACTIVE','REMOVED')),
+        CONSTRAINT CK_DA_RemovalConsistency CHECK (
+            (StatusCode = 'ACTIVE' AND RemovedAt IS NULL)
+            OR
+            (StatusCode = 'REMOVED' AND RemovedAt IS NOT NULL)
+        )
+    );
+
+    PRINT 'Created table DeviceAssignment';
+END
+GO
+
+-- Only one ACTIVE device per (admission, device type) at a time -- a patient can have
+-- an active central line AND catheter AND ETT concurrently, just not two active central
+-- lines simultaneously.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DA_AdmissionDeviceTypeActive' AND object_id = OBJECT_ID('dbo.DeviceAssignment'))
+BEGIN
+    CREATE UNIQUE INDEX UX_DA_AdmissionDeviceTypeActive
+    ON dbo.DeviceAssignment(HospitalId, AdmissionId, DeviceType)
+    WHERE StatusCode = 'ACTIVE';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DA_AdmissionHistory' AND object_id = OBJECT_ID('dbo.DeviceAssignment'))
+    CREATE INDEX IX_DA_AdmissionHistory ON dbo.DeviceAssignment (HospitalId, AdmissionId, InsertedAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_device_care_bundle_check_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create DeviceCareBundleCheck Table
+-- Description: Logs a CLABSI/CAUTI/VAP care-bundle compliance check against an
+--              active device. Insert-only (real bundles are checked every shift,
+--              not once a day, so this is a timestamped log rather than a
+--              one-row-per-calendar-day upsert). Item-level compliance is stored
+--              as a compact ItemsJson blob rather than a child table -- the item
+--              set per device type is a short, fixed, backend-constant list
+--              (IpdConstants.CareBundleItems) that nothing queries at the item
+--              level; CompliantCount/TotalItems/AllCompliant are computed and
+--              trusted only from the server, never the client.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DeviceCareBundleCheck', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DeviceCareBundleCheck
+    (
+        CheckId             UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_DCBC_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId          UNIQUEIDENTIFIER NOT NULL,
+        AdmissionId         UNIQUEIDENTIFIER NOT NULL,
+        DeviceAssignmentId  UNIQUEIDENTIFIER NOT NULL,
+        DeviceType          NVARCHAR(30)     NOT NULL,   -- denormalized from DeviceAssignment for board batching
+
+        ItemsJson           NVARCHAR(MAX)    NOT NULL,
+        CompliantCount      INT              NOT NULL,
+        TotalItems          INT              NOT NULL,
+        AllCompliant        BIT              NOT NULL,
+
+        Notes               NVARCHAR(500)    NULL,
+
+        CheckedBy           NVARCHAR(200)    NOT NULL,
+        CheckedByUserId     UNIQUEIDENTIFIER NULL,
+        CheckedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_DCBC_CheckedAt DEFAULT (SYSUTCDATETIME()),
+
+        CreatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_DCBC_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CreatedBy           NVARCHAR(100)    NULL,
+
+        RowVersion          ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_DeviceCareBundleCheck PRIMARY KEY CLUSTERED (CheckId),
+        CONSTRAINT FK_DCBC_Admission FOREIGN KEY (AdmissionId) REFERENCES dbo.Admission(AdmissionId),
+        CONSTRAINT FK_DCBC_DeviceAssignment FOREIGN KEY (DeviceAssignmentId) REFERENCES dbo.DeviceAssignment(DeviceAssignmentId),
+        CONSTRAINT CK_DCBC_DeviceType CHECK (DeviceType IN ('CENTRAL_LINE','URINARY_CATHETER','ETT'))
+    );
+
+    PRINT 'Created table DeviceCareBundleCheck';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DCBC_DeviceTimeline' AND object_id = OBJECT_ID('dbo.DeviceCareBundleCheck'))
+    CREATE INDEX IX_DCBC_DeviceTimeline ON dbo.DeviceCareBundleCheck (DeviceAssignmentId, CheckedAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_discharge_config_tables.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8283,6 +8429,82 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_early_warning_score_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create EarlyWarningScore Table
+-- Description: NEWS2-style composite deterioration score, computed from routine
+--              vitals. Deliberately NOT nested under an ICU table prefix -- this
+--              scores any IPD admission (ward or ICU), so a deteriorating ward
+--              patient is flagged before a crisis, not just tracked once they
+--              reach ICU. EarlyWarningScoreCalculator (API side) is the single
+--              source of truth for how inputs map to each component's score;
+--              this table stores raw inputs + computed components + total, same
+--              shape as SofaScore/ApacheIIScore.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.EarlyWarningScore', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.EarlyWarningScore
+    (
+        ScoreId              UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_EWS_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId           UNIQUEIDENTIFIER NOT NULL,
+        AdmissionId          UNIQUEIDENTIFIER NOT NULL,
+        EncounterId          UNIQUEIDENTIFIER NULL,
+        PatientId            NVARCHAR(50)     NULL,
+
+        -- Raw inputs
+        RespiratoryRate      INT              NULL,
+        Spo2                 DECIMAL(5,2)     NULL,
+        SupplementalOxygen   BIT              NOT NULL CONSTRAINT DF_EWS_O2 DEFAULT (0),
+        SystolicBp           INT              NULL,
+        Pulse                INT              NULL,
+        ConsciousnessLevel   NVARCHAR(20)     NOT NULL CONSTRAINT DF_EWS_Consciousness DEFAULT ('ALERT'),
+        TemperatureC         DECIMAL(5,2)     NULL,
+
+        -- Computed component scores (0-3 each)
+        RrScore              INT              NOT NULL,
+        Spo2Score            INT              NOT NULL,
+        O2Score              INT              NOT NULL,
+        BpScore              INT              NOT NULL,
+        PulseScore           INT              NOT NULL,
+        ConsciousnessScore   INT              NOT NULL,
+        TempScore            INT              NOT NULL,
+        TotalScore           INT              NOT NULL,
+        RiskBand             NVARCHAR(20)     NOT NULL,
+
+        Notes                NVARCHAR(1000)   NULL,
+
+        ScoredBy             NVARCHAR(200)    NOT NULL,
+        ScoredAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_EWS_ScoredAt DEFAULT (SYSUTCDATETIME()),
+
+        CreatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_EWS_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CreatedBy            NVARCHAR(100)    NULL,
+
+        RowVersion           ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_EarlyWarningScore PRIMARY KEY CLUSTERED (ScoreId),
+        CONSTRAINT FK_EWS_Admission FOREIGN KEY (AdmissionId) REFERENCES dbo.Admission(AdmissionId),
+        CONSTRAINT CK_EWS_Consciousness CHECK (ConsciousnessLevel IN ('ALERT','VOICE','PAIN','UNRESPONSIVE','CONFUSION_NEW')),
+        CONSTRAINT CK_EWS_RiskBand CHECK (RiskBand IN ('LOW','LOW_MEDIUM','MEDIUM','HIGH')),
+        CONSTRAINT CK_EWS_TotalScore CHECK (TotalScore >= 0 AND TotalScore <= 20)
+    );
+
+    PRINT 'Created table EarlyWarningScore';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_EWS_AdmissionTimeline' AND object_id = OBJECT_ID('dbo.EarlyWarningScore'))
+    CREATE INDEX IX_EWS_AdmissionTimeline ON dbo.EarlyWarningScore (HospitalId, AdmissionId, ScoredAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_hospital_subscriptions_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8353,6 +8575,66 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Hospitals_ChainId' AND object_id = OBJECT_ID('dbo.Hospitals'))
     CREATE INDEX IX_Hospitals_ChainId ON dbo.Hospitals(ChainId) WHERE ChainId IS NOT NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_infection_event_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create InfectionEvent Table
+-- Description: Insert-only log of a diagnosed device-associated infection
+--              (CLABSI/CAUTI/VAP) or other HAI. DeviceAssignmentId is nullable to
+--              allow logging a non-device-associated infection. Feeds the
+--              hospital-level "infections per 1000 device-days" summary (NHSN
+--              standard metric), computed by pairing counts here against
+--              DeviceDaysCalculator over DeviceAssignment spans.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.InfectionEvent', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.InfectionEvent
+    (
+        InfectionEventId    UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_IE_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId          UNIQUEIDENTIFIER NOT NULL,
+        AdmissionId         UNIQUEIDENTIFIER NOT NULL,
+        DeviceAssignmentId  UNIQUEIDENTIFIER NULL,
+
+        InfectionType       NVARCHAR(20)     NOT NULL,   -- CLABSI / CAUTI / VAP / OTHER
+
+        DiagnosedAt             DATETIME2(3) NOT NULL CONSTRAINT DF_IE_DiagnosedAt DEFAULT (SYSUTCDATETIME()),
+        DiagnosedByDoctorName   NVARCHAR(200) NOT NULL,
+        CultureOrganism         NVARCHAR(200) NULL,
+
+        Notes               NVARCHAR(500)    NULL,
+
+        CreatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_IE_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CreatedBy           NVARCHAR(100)    NULL,
+
+        RowVersion          ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_InfectionEvent PRIMARY KEY CLUSTERED (InfectionEventId),
+        CONSTRAINT FK_IE_Admission FOREIGN KEY (AdmissionId) REFERENCES dbo.Admission(AdmissionId),
+        CONSTRAINT FK_IE_DeviceAssignment FOREIGN KEY (DeviceAssignmentId) REFERENCES dbo.DeviceAssignment(DeviceAssignmentId),
+        CONSTRAINT CK_IE_InfectionType CHECK (InfectionType IN ('CLABSI','CAUTI','VAP','OTHER'))
+    );
+
+    PRINT 'Created table InfectionEvent';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_IE_AdmissionTimeline' AND object_id = OBJECT_ID('dbo.InfectionEvent'))
+    CREATE INDEX IX_IE_AdmissionTimeline ON dbo.InfectionEvent (HospitalId, AdmissionId, DiagnosedAt DESC);
+GO
+
+-- Hospital-wide rate query scans by hospital + date range.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_IE_HospitalTimeline' AND object_id = OBJECT_ID('dbo.InfectionEvent'))
+    CREATE INDEX IX_IE_HospitalTimeline ON dbo.InfectionEvent (HospitalId, DiagnosedAt);
 GO
 
 GO
@@ -8626,6 +8908,74 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PublicApiClient_ApiKeyHash' AND object_id = OBJECT_ID('dbo.PublicApiClient'))
     CREATE UNIQUE INDEX IX_PublicApiClient_ApiKeyHash ON dbo.PublicApiClient (ApiKeyHash);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_rapid_response_activation_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create RapidResponseActivation Table
+-- Description: Tracks a Rapid Response Team call against an admission -- who
+--              called, why, who/when responded, and the outcome. Response time
+--              (ArrivedAt - CalledAt) is a safety KPI; a filtered index on open
+--              (ResolvedAt IS NULL) activations drives a cheap hospital-wide
+--              "open RRT" list for the ICU board and a future Rapid Response
+--              mini-board.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.RapidResponseActivation', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.RapidResponseActivation
+    (
+        ActivationId       UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_RRA_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId         UNIQUEIDENTIFIER NOT NULL,
+        AdmissionId        UNIQUEIDENTIFIER NOT NULL,
+        EncounterId        UNIQUEIDENTIFIER NULL,
+        PatientId          NVARCHAR(50)     NULL,
+
+        TriggerReason      NVARCHAR(30)     NOT NULL,
+        TriggeredEwsScore  INT              NULL,
+
+        CalledBy           NVARCHAR(200)    NOT NULL,
+        CalledAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_RRA_CalledAt DEFAULT (SYSUTCDATETIME()),
+
+        RespondingTeam     NVARCHAR(200)    NULL,
+        ArrivedAt          DATETIME2(3)     NULL,
+
+        Outcome            NVARCHAR(30)     NULL,
+        OutcomeNotes       NVARCHAR(1000)   NULL,
+        ResolvedAt         DATETIME2(3)     NULL,
+
+        CreatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_RRA_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CreatedBy          NVARCHAR(100)    NULL,
+        UpdatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_RRA_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedBy          NVARCHAR(100)    NULL,
+
+        RowVersion         ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_RapidResponseActivation PRIMARY KEY CLUSTERED (ActivationId),
+        CONSTRAINT FK_RRA_Admission FOREIGN KEY (AdmissionId) REFERENCES dbo.Admission(AdmissionId),
+        CONSTRAINT CK_RRA_TriggerReason CHECK (TriggerReason IN ('HIGH_EWS','NURSE_CONCERN','OTHER')),
+        CONSTRAINT CK_RRA_Outcome CHECK (Outcome IS NULL OR Outcome IN ('STABILIZED_ON_WARD','TRANSFERRED_ICU','OTHER'))
+    );
+
+    PRINT 'Created table RapidResponseActivation';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_RRA_AdmissionTimeline' AND object_id = OBJECT_ID('dbo.RapidResponseActivation'))
+    CREATE INDEX IX_RRA_AdmissionTimeline ON dbo.RapidResponseActivation (HospitalId, AdmissionId, CalledAt DESC);
+GO
+
+-- Cheap "open RRT" lookups (board badge, mini-board) without scanning resolved history.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_RRA_Open' AND object_id = OBJECT_ID('dbo.RapidResponseActivation'))
+    CREATE INDEX IX_RRA_Open ON dbo.RapidResponseActivation (HospitalId, CalledAt DESC) WHERE ResolvedAt IS NULL;
 GO
 
 GO
@@ -9429,6 +9779,60 @@ N'<h3>Informed Consent for Blood and Blood Product Transfusion</h3>
 <p>Depending on the clinical situation, alternatives may include iron therapy, erythropoietin, autologous transfusion, intra-operative cell salvage, or refusing transfusion (which carries its own serious risks).</p>
 <p>I confirm that the risks, benefits, and alternatives have been explained to me in a language I understand. I have had the opportunity to ask questions and all my questions have been answered.</p>',
     1, @Now3, N'SEED', @Now3, N'SEED'
+  );
+END
+GO
+
+-- â”€â”€â”€â”€â”€ Discharge advice & consent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+DECLARE @HospitalId4 UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
+DECLARE @Now4 DATETIME2(3) = SYSUTCDATETIME();
+
+IF NOT EXISTS (
+  SELECT 1 FROM dbo.ConsentTemplate
+  WHERE HospitalId = @HospitalId4 AND TypeCode = N'DISCHARGE' AND [Language] = N'EN' AND IsActive = 1
+)
+BEGIN
+  INSERT INTO dbo.ConsentTemplate (HospitalId, TypeCode, Title, [Language], Version, BodyHtml, IsActive, CreatedAt, CreatedBy, UpdatedAt, UpdatedBy)
+  VALUES (
+    @HospitalId4, N'DISCHARGE', N'Discharge Advice & Consent', N'EN', 1,
+N'<h3>Discharge Advice &amp; Consent</h3>
+<p>I confirm that my/the patient''s diagnosis, the treatment given during this admission, and the condition at the time of discharge have been explained to me in a language I understand.</p>
+<ul>
+  <li>I have been given the discharge medications, dosage instructions, diet and activity advice, and follow-up plan in writing.</li>
+  <li>I have been told the warning signs and symptoms for which I should seek immediate medical attention or return to the hospital.</li>
+  <li>I have had the opportunity to ask questions about my/the patient''s condition and ongoing care, and all my questions have been answered satisfactorily.</li>
+  <li>I agree to the patient being discharged from the hospital''s care at this time.</li>
+</ul>
+<p>I understand that continued follow-up as advised is important for a full recovery.</p>',
+    1, @Now4, N'SEED', @Now4, N'SEED'
+  );
+END
+GO
+
+-- â”€â”€â”€â”€â”€ Leave Against Medical Advice (LAMA) consent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+DECLARE @HospitalId5 UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
+DECLARE @Now5 DATETIME2(3) = SYSUTCDATETIME();
+
+IF NOT EXISTS (
+  SELECT 1 FROM dbo.ConsentTemplate
+  WHERE HospitalId = @HospitalId5 AND TypeCode = N'LAMA' AND [Language] = N'EN' AND IsActive = 1
+)
+BEGIN
+  INSERT INTO dbo.ConsentTemplate (HospitalId, TypeCode, Title, [Language], Version, BodyHtml, IsActive, CreatedAt, CreatedBy, UpdatedAt, UpdatedBy)
+  VALUES (
+    @HospitalId5, N'LAMA', N'Leave Against Medical Advice (LAMA) Consent', N'EN', 1,
+N'<h3>Leave Against Medical Advice</h3>
+<p>I am voluntarily choosing to leave the hospital, or to remove the patient from the hospital, before treatment has been completed and against the advice of the treating doctor(s).</p>
+<h4>Acknowledgement of risk</h4>
+<ul>
+  <li>I have been informed of my/the patient''s current diagnosis and the treatment that is still recommended.</li>
+  <li>I have been explained the risks of leaving before treatment is complete, including but not limited to worsening of the condition, complications, permanent disability, or death.</li>
+  <li>I have had the opportunity to ask questions about these risks, and all my questions have been answered.</li>
+  <li>I understand I may return to this hospital for further care at any time, and that a follow-up plan/referral has been offered to me.</li>
+</ul>
+<h4>Release</h4>
+<p>I hereby release the hospital, its doctors, and its staff from all liability for any consequences that may result from my/the patient leaving against medical advice.</p>',
+    1, @Now5, N'SEED', @Now5, N'SEED'
   );
 END
 GO

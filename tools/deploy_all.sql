@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-14 18:33  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-14 19:19  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -6487,6 +6487,28 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_admission_package_type.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Snapshot of the Package Type picked at admit time (if any) â€” kept as plain nullable columns,
+-- not an enforced FK to PackageType, so this migration doesn't need to run after
+-- create_package_types_table.sql. Name is frozen at admit time (not a live join) so editing or
+-- retiring the package type later never changes what an already-admitted patient's record shows.
+-- Idempotent.
+IF OBJECT_ID('dbo.Admission', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Admission', 'PackageTypeId') IS NULL
+        ALTER TABLE dbo.Admission ADD PackageTypeId UNIQUEIDENTIFIER NULL;
+
+    IF COL_LENGTH('dbo.Admission', 'PackageTypeNameSnapshot') IS NULL
+        ALTER TABLE dbo.Admission ADD PackageTypeNameSnapshot NVARCHAR(300) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_admission_referral_package_type.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7611,6 +7633,38 @@ IF OBJECT_ID('dbo.OTPlan', 'U') IS NOT NULL
 BEGIN
     IF COL_LENGTH('dbo.OTPlan', 'PackageTypeId') IS NULL
         ALTER TABLE dbo.OTPlan ADD PackageTypeId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_patientregistrations_add_soundex_index.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: PatientRegistrations â€” indexed Soundex for fast phonetic name search
+-- Description: SearchPatientHandler matches AppDbContext.Soundex(FullName) against
+--              the search term for phonetic variants (e.g. "Steven" vs "Stephen").
+--              Calling SOUNDEX(FullName) inline in a WHERE clause is a scalar
+--              function over a column -- SQL Server can't use the existing
+--              (HospitalID, FullName) index for it, so every search forced a full
+--              scan of the hospital's patient rows. A persisted computed column +
+--              index turns that predicate into a plain indexed equality lookup.
+-- =============================================================================
+
+IF COL_LENGTH('dbo.PatientRegistrations', 'FullNameSoundex') IS NULL
+BEGIN
+    ALTER TABLE dbo.PatientRegistrations ADD FullNameSoundex AS SOUNDEX(FullName) PERSISTED;
+    PRINT 'Added computed column PatientRegistrations.FullNameSoundex';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PatientRegistrations_HospitalID_FullNameSoundex' AND object_id = OBJECT_ID('dbo.PatientRegistrations'))
+BEGIN
+    CREATE INDEX IX_PatientRegistrations_HospitalID_FullNameSoundex
+    ON dbo.PatientRegistrations(HospitalID, FullNameSoundex);
 END
 GO
 

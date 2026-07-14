@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-14 19:53  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-14 20:39  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -7149,6 +7149,41 @@ GO
 
 IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.DischargeSummary') AND name = 'EncounterId' AND is_nullable = 0)
   ALTER TABLE dbo.DischargeSummary ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_doctor_discharge_field_configs_add_hospital.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Scope DoctorDischargeFieldConfigs per (Doctor, Hospital)
+-- Description: The discharge-summary field-layout customization ("Customize"
+--              editor) was global per doctor across every hospital they work
+--              at. Now scoped per hospital, same as DischargeSettings
+--              (letterhead) already is. HospitalId is added NULLABLE and
+--              existing rows are left as HospitalId = NULL -- they become each
+--              doctor's carried-over legacy default (read as a fallback when no
+--              hospital-specific row exists yet) rather than being silently
+--              discarded. New saves always write a hospital-specific row.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DoctorDischargeFieldConfigs', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.DoctorDischargeFieldConfigs', 'HospitalId') IS NULL
+        ALTER TABLE dbo.DoctorDischargeFieldConfigs ADD HospitalId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
+    DROP INDEX UX_DoctorDischargeFieldConfigs_DoctorId ON dbo.DoctorDischargeFieldConfigs;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
+    CREATE UNIQUE INDEX UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId
+    ON dbo.DoctorDischargeFieldConfigs(DoctorId, HospitalId);
 GO
 
 GO

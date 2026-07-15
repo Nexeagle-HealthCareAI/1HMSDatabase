@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-15 15:03  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-15 16:17  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -7270,6 +7270,33 @@ BEGIN
     IF COL_LENGTH('dbo.DoctorReviews', 'IsHospitalResponse') IS NULL
         ALTER TABLE dbo.DoctorReviews ADD IsHospitalResponse BIT NOT NULL
             CONSTRAINT DF_DoctorReviews_IsHospitalResponse DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_doctor_reviews_comment_nullable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Make DoctorReviews.Comment nullable
+-- Description: Supports quick "tap a star and it's saved" ratings with no comment
+--              required -- the doctor-page rating widget and the post-booking
+--              emoji rating both submit rating-only reviews now, with a comment
+--              optionally attached afterward via UpdateReviewCommentHandler.
+--              Guarded ALTER on the already-deployed DoctorReviews table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NOT NULL
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'DoctorReviews'
+              AND COLUMN_NAME = 'Comment' AND IS_NULLABLE = 'NO'
+    )
+        ALTER TABLE dbo.DoctorReviews ALTER COLUMN Comment NVARCHAR(1000) NULL;
 END
 GO
 

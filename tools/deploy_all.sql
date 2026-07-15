@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-15 11:52  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-15 15:03  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -7244,6 +7244,33 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
     CREATE UNIQUE INDEX UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId
     ON dbo.DoctorDischargeFieldConfigs(DoctorId, HospitalId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_doctor_reviews_add_hospital_response.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Doctor review hospital-response flag
+-- Description: Adds DoctorReviews.IsHospitalResponse -- lets a hospital admin post
+--              their own comment against a doctor from the Public Directory
+--              moderation panel, visually tagged as an official "Hospital Response"
+--              rather than blending in as if it were a patient review. Excluded from
+--              the average-rating/review-count aggregates everywhere they're computed
+--              (GetPublicDoctorsHandler, GetPublicDirectoryDoctorsHandler,
+--              GetPublicDoctorReviewsHandler) -- it's not patient sentiment data.
+--              Guarded ALTER on the already-deployed DoctorReviews table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.DoctorReviews', 'IsHospitalResponse') IS NULL
+        ALTER TABLE dbo.DoctorReviews ADD IsHospitalResponse BIT NOT NULL
+            CONSTRAINT DF_DoctorReviews_IsHospitalResponse DEFAULT (0);
+END
 GO
 
 GO

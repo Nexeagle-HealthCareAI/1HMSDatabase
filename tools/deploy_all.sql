@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-14 21:57  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-15 11:52  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -7273,6 +7273,37 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_doctors_add_public_profile_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Doctor public-profile fields (languages, public contact)
+-- Description: Adds Doctors.LanguagesJson (JSON array of spoken languages, following
+--              the same ISJSON()-checked pattern as Appointments.StatusHistoryJson) and
+--              Doctors.PublicContactEmail/PublicContactPhone â€” deliberately separate
+--              from Users.Email/Users.MobileNumber, which are login/OTP credentials,
+--              not meant for public display on the doctor directory. All nullable,
+--              admin-optional. Guarded ALTER on the already-deployed Doctors table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Doctors', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Doctors', 'LanguagesJson') IS NULL
+        ALTER TABLE dbo.Doctors ADD LanguagesJson NVARCHAR(500) NULL
+            CONSTRAINT CK_Doctors_LanguagesJson CHECK (LanguagesJson IS NULL OR ISJSON(LanguagesJson) = 1);
+
+    IF COL_LENGTH('dbo.Doctors', 'PublicContactEmail') IS NULL
+        ALTER TABLE dbo.Doctors ADD PublicContactEmail NVARCHAR(256) NULL;
+
+    IF COL_LENGTH('dbo.Doctors', 'PublicContactPhone') IS NULL
+        ALTER TABLE dbo.Doctors ADD PublicContactPhone NVARCHAR(20) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_hospital_subscriptions_add_payment.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7330,6 +7361,33 @@ BEGIN
     PRINT 'Added NABH_NABL column to Hospitals table';
 END
 ELSE PRINT 'NABH_NABL column already exists';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospitals_add_geolocation.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Hospital GPS coordinates
+-- Description: Adds Hospitals.Latitude/Longitude (nullable) so the public doctor
+--              directory can offer a "get directions" link for every doctor publicly
+--              listed at that hospital. Lives on the hospital, not the doctor â€” a
+--              doctor doesn't have their own address, they practice at a hospital
+--              that already carries City/State/Pincode. Guarded ALTER on the
+--              already-deployed Hospitals table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Hospitals', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Hospitals', 'Latitude') IS NULL
+        ALTER TABLE dbo.Hospitals ADD Latitude DECIMAL(9,6) NULL;
+
+    IF COL_LENGTH('dbo.Hospitals', 'Longitude') IS NULL
+        ALTER TABLE dbo.Hospitals ADD Longitude DECIMAL(9,6) NULL;
+END
 GO
 
 GO
@@ -8726,6 +8784,64 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorPrescriptionFieldConfigs_DoctorId' AND object_id = OBJECT_ID('dbo.DoctorPrescriptionFieldConfigs'))
     CREATE UNIQUE INDEX UX_DoctorPrescriptionFieldConfigs_DoctorId ON dbo.DoctorPrescriptionFieldConfigs(DoctorId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_doctor_review_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create DoctorReviews table
+-- Description: Real backend for the public doctor-directory review/rating UI
+--              (previously localStorage-only on NexEagleWebsite -- never actually
+--              shared across visitors or seen by hospital staff). One row per
+--              submitted review: rating (1-5), comment, optional author name,
+--              lightweight IP capture for abuse-tracking (mirrors
+--              Appointment.BookingIpAddress). IsHidden lets a hospital admin
+--              moderate a review after the fact from Public Directory -- reviews
+--              still go live immediately on submission, per product decision.
+--              HospitalId is denormalized (resolved once at submission via
+--              PublicDirectoryHelpers) so the admin moderation list never needs a
+--              join fan-out through DoctorDepartments.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DoctorReviews (
+        ReviewId      UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_DoctorReviews_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId    UNIQUEIDENTIFIER NOT NULL,
+        DoctorId      UNIQUEIDENTIFIER NOT NULL,
+
+        AuthorName    NVARCHAR(100)    NULL,
+        Rating        TINYINT          NOT NULL,
+        Comment       NVARCHAR(1000)   NOT NULL,
+        HelpfulCount  INT              NOT NULL CONSTRAINT DF_DoctorReviews_Helpful DEFAULT (0),
+        IsHidden      BIT              NOT NULL CONSTRAINT DF_DoctorReviews_Hidden DEFAULT (0),
+        SubmittedIp   NVARCHAR(64)     NULL,
+
+        CreatedAt     DATETIME2(3)     NOT NULL CONSTRAINT DF_DoctorReviews_CreatedAt DEFAULT (SYSUTCDATETIME()),
+
+        CONSTRAINT PK_DoctorReviews PRIMARY KEY CLUSTERED (ReviewId),
+        CONSTRAINT FK_DoctorReviews_Doctor FOREIGN KEY (DoctorId)
+            REFERENCES dbo.Doctors(DoctorID) ON DELETE CASCADE,
+        CONSTRAINT CK_DoctorReviews_Rating CHECK (Rating BETWEEN 1 AND 5)
+    );
+
+    PRINT 'Created table DoctorReviews';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DoctorReviews_Doctor' AND object_id = OBJECT_ID('dbo.DoctorReviews'))
+    CREATE INDEX IX_DoctorReviews_Doctor ON dbo.DoctorReviews (DoctorId, IsHidden, CreatedAt DESC);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DoctorReviews_Hospital' AND object_id = OBJECT_ID('dbo.DoctorReviews'))
+    CREATE INDEX IX_DoctorReviews_Hospital ON dbo.DoctorReviews (HospitalId, CreatedAt DESC);
 GO
 
 GO

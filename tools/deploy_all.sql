@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-18 12:33  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-18 14:17  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -7440,6 +7440,35 @@ END
 ELSE
 BEGIN
     PRINT 'MaxDoctors/MaxBeds fields already exist in HospitalSubscriptions table';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospital_subscriptions_add_rejection.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter HospitalSubscriptions Table (Add Rejection Tracking)
+-- Description: Adds RejectionReason and RejectedAt so a CMS admin can reject a submitted
+--              payment with an explanation, surfaced back to the hospital on the EasyHMS
+--              subscription page.
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptions]') AND name = 'RejectionReason'
+)
+BEGIN
+    ALTER TABLE [dbo].[HospitalSubscriptions]
+    ADD RejectionReason NVARCHAR(500) NULL,
+        RejectedAt DATETIME2(3) NULL;
+
+    PRINT 'Added RejectionReason/RejectedAt fields to HospitalSubscriptions table';
+END
+ELSE
+BEGIN
+    PRINT 'RejectionReason/RejectedAt fields already exist in HospitalSubscriptions table';
 END
 GO
 

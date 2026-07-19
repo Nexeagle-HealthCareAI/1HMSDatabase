@@ -4,6 +4,10 @@
 --              days on their current plan are credited (prorated off what they actually paid)
 --              against the new plan's price. These columns record that breakdown on the payment
 --              row so CMS can see/verify it before approving, instead of just a bare Amount.
+-- Naming: prefixed to match create_hospital_subscription_payments_table.sql (not "alter_...")
+--         so migrations, which apply in alphabetical filename order, run after the table that
+--         creates HospitalSubscriptionPayments instead of before it (see deploy-remote.sh /
+--         deploy.ps1's run_migrations — apply-once, sorted by name).
 
 IF NOT EXISTS (
     SELECT * FROM sys.columns

@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-18 22:02  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-19 12:00  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -7990,6 +7990,40 @@ IF OBJECT_ID('dbo.OTPlan', 'U') IS NOT NULL
 BEGIN
     IF COL_LENGTH('dbo.OTPlan', 'PackageTypeId') IS NULL
         ALTER TABLE dbo.OTPlan ADD PackageTypeId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_patientregistrations_add_mobile_index.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Add PatientRegistrations(Mobile) index
+-- Description: The existing IX_PReg_HospitalID_Mobile index leads with HospitalID, so it can't be
+--              seeked by a bare "WHERE Mobile = @mobile" query. Doctor Dekho's WhatsApp-OTP login
+--              (GetPublicAppointmentsByMobileHandler, GetPublicPatientProfileHandler) deliberately
+--              queries by mobile ALONE across every hospital a patient's visited â€” that's the
+--              whole point of it â€” and does so on effectively every page load (it doubles as the
+--              "am I logged in" check), so a full table scan there is a real, growing hot path,
+--              not a one-off query.
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'IX_PatientRegistrations_Mobile'
+      AND object_id = OBJECT_ID(N'dbo.PatientRegistrations')
+)
+BEGIN
+    CREATE NONCLUSTERED INDEX IX_PatientRegistrations_Mobile
+    ON dbo.PatientRegistrations(Mobile)
+    INCLUDE (PatientId, FullName, Age, AgeUnit, Sex, Email, GuardianName, GuardianRelation, RegisteredAt);
+
+    PRINT 'Created index IX_PatientRegistrations_Mobile';
+END
+ELSE
+BEGIN
+    PRINT 'Index IX_PatientRegistrations_Mobile already exists';
 END
 GO
 

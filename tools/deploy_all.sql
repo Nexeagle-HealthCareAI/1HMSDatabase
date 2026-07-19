@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-16 00:40  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-19 13:15  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -7334,6 +7334,58 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_doctors_add_cms_marketing_controls.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Doctor Dekho CMS marketing controls
+-- Description: Adds Doctors.DiscountPercent/DiscountStartAt/DiscountEndAt (a scheduled
+--              consultation-fee discount, active only when DiscountPercent > 0 and the
+--              current time falls within the start/end window â€” computed at read time,
+--              never stored as a separate bool so it can't drift out of sync with the
+--              dates), Doctors.IsFeatured (top-of-listing placement on Doctor Dekho), and
+--              Doctors.IsDelistedByAdmin (a platform-level override, deliberately SEPARATE
+--              from the existing hospital-owned Doctors.IsPubliclyListed flag â€” CMS delisting
+--              a doctor must not be silently undone by the hospital's own admin toggling
+--              IsPubliclyListed back on, and vice versa). All CMS-controlled via CMSAPI's
+--              direct connection to this database. Guarded ALTER on the already-deployed
+--              Doctors table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Doctors', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Doctors', 'DiscountPercent') IS NULL
+        ALTER TABLE dbo.Doctors ADD DiscountPercent DECIMAL(5,2) NULL
+            CONSTRAINT CK_Doctors_DiscountPercent CHECK (DiscountPercent IS NULL OR (DiscountPercent >= 0 AND DiscountPercent <= 100));
+
+    IF COL_LENGTH('dbo.Doctors', 'DiscountStartAt') IS NULL
+        ALTER TABLE dbo.Doctors ADD DiscountStartAt DATETIME2(3) NULL;
+
+    IF COL_LENGTH('dbo.Doctors', 'DiscountEndAt') IS NULL
+        ALTER TABLE dbo.Doctors ADD DiscountEndAt DATETIME2(3) NULL;
+
+    IF COL_LENGTH('dbo.Doctors', 'IsFeatured') IS NULL
+        ALTER TABLE dbo.Doctors ADD IsFeatured BIT NOT NULL CONSTRAINT DF_Doctors_IsFeatured DEFAULT (0);
+
+    IF COL_LENGTH('dbo.Doctors', 'IsDelistedByAdmin') IS NULL
+        ALTER TABLE dbo.Doctors ADD IsDelistedByAdmin BIT NOT NULL CONSTRAINT DF_Doctors_IsDelistedByAdmin DEFAULT (0);
+END
+GO
+
+-- DiscountEndAt must not precede DiscountStartAt when both are set. Added as a separate
+-- guarded step since CHECK constraints can't be inlined onto ADD COLUMN across three columns.
+IF OBJECT_ID('dbo.Doctors', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_Doctors_DiscountWindow')
+BEGIN
+    ALTER TABLE dbo.Doctors ADD CONSTRAINT CK_Doctors_DiscountWindow
+        CHECK (DiscountStartAt IS NULL OR DiscountEndAt IS NULL OR DiscountEndAt >= DiscountStartAt);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_doctors_add_ispubliclylisted.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7389,6 +7441,39 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospital_subscription_payments_add_proration.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter HospitalSubscriptionPayments Table (Add Proration Fields)
+-- Description: Supports mid-cycle plan switches (upgrade/downgrade) from the EasyHMS
+--              subscription page. When an already-Active hospital switches plans, the unused
+--              days on their current plan are credited (prorated off what they actually paid)
+--              against the new plan's price. These columns record that breakdown on the payment
+--              row so CMS can see/verify it before approving, instead of just a bare Amount.
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptionPayments]') AND name = 'PreviousPlanId'
+)
+BEGIN
+    ALTER TABLE [dbo].[HospitalSubscriptionPayments]
+    ADD PreviousPlanId UNIQUEIDENTIFIER NULL,
+        PreviousPlanName NVARCHAR(200) NULL,
+        ProratedCreditAmount DECIMAL(18,2) NULL,
+        IsProratedSwitch BIT NOT NULL CONSTRAINT DF_HospitalSubscriptionPayments_IsProratedSwitch DEFAULT (0);
+
+    PRINT 'Added proration fields to HospitalSubscriptionPayments table';
+END
+ELSE
+BEGIN
+    PRINT 'Proration fields already exist in HospitalSubscriptionPayments table';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_hospital_subscriptions_add_payment.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7411,6 +7496,92 @@ END
 ELSE
 BEGIN
     PRINT 'Payment fields already exist in HospitalSubscriptions table';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospital_subscriptions_add_payment_mode.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter HospitalSubscriptions Table (Add Payment Mode)
+-- Description: Adds PaymentMode (UPI, Bank Transfer, Cheque, Card, Cash) so the drawer on the
+--              EasyHMS subscription page can capture how a manual payment was made, alongside
+--              the existing Amount/Reference/Date fields.
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptions]') AND name = 'PaymentMode'
+)
+BEGIN
+    ALTER TABLE [dbo].[HospitalSubscriptions]
+    ADD PaymentMode NVARCHAR(50) NULL;
+
+    PRINT 'Added PaymentMode field to HospitalSubscriptions table';
+END
+ELSE
+BEGIN
+    PRINT 'PaymentMode field already exists in HospitalSubscriptions table';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospital_subscriptions_add_plan_limits.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter HospitalSubscriptions Table (Add Plan Limits)
+-- Description: Adds MaxDoctors and MaxBeds, copied from the CMS plan catalog at
+--              approval time, so easyHMSAPI can enforce doctor/bed caps without a
+--              cross-database join. NULL = unlimited (Enterprise tier).
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptions]') AND name = 'MaxDoctors'
+)
+BEGIN
+    ALTER TABLE [dbo].[HospitalSubscriptions]
+    ADD MaxDoctors INT NULL,
+        MaxBeds INT NULL;
+
+    PRINT 'Added MaxDoctors/MaxBeds fields to HospitalSubscriptions table';
+END
+ELSE
+BEGIN
+    PRINT 'MaxDoctors/MaxBeds fields already exist in HospitalSubscriptions table';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospital_subscriptions_add_rejection.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter HospitalSubscriptions Table (Add Rejection Tracking)
+-- Description: Adds RejectionReason and RejectedAt so a CMS admin can reject a submitted
+--              payment with an explanation, surfaced back to the hospital on the EasyHMS
+--              subscription page.
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptions]') AND name = 'RejectionReason'
+)
+BEGIN
+    ALTER TABLE [dbo].[HospitalSubscriptions]
+    ADD RejectionReason NVARCHAR(500) NULL,
+        RejectedAt DATETIME2(3) NULL;
+
+    PRINT 'Added RejectionReason/RejectedAt fields to HospitalSubscriptions table';
+END
+ELSE
+BEGIN
+    PRINT 'RejectionReason/RejectedAt fields already exist in HospitalSubscriptions table';
 END
 GO
 
@@ -7871,6 +8042,40 @@ IF OBJECT_ID('dbo.OTPlan', 'U') IS NOT NULL
 BEGIN
     IF COL_LENGTH('dbo.OTPlan', 'PackageTypeId') IS NULL
         ALTER TABLE dbo.OTPlan ADD PackageTypeId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_patientregistrations_add_mobile_index.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Add PatientRegistrations(Mobile) index
+-- Description: The existing IX_PReg_HospitalID_Mobile index leads with HospitalID, so it can't be
+--              seeked by a bare "WHERE Mobile = @mobile" query. Doctor Dekho's WhatsApp-OTP login
+--              (GetPublicAppointmentsByMobileHandler, GetPublicPatientProfileHandler) deliberately
+--              queries by mobile ALONE across every hospital a patient's visited â€” that's the
+--              whole point of it â€” and does so on effectively every page load (it doubles as the
+--              "am I logged in" check), so a full table scan there is a real, growing hot path,
+--              not a one-off query.
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'IX_PatientRegistrations_Mobile'
+      AND object_id = OBJECT_ID(N'dbo.PatientRegistrations')
+)
+BEGIN
+    CREATE NONCLUSTERED INDEX IX_PatientRegistrations_Mobile
+    ON dbo.PatientRegistrations(Mobile)
+    INCLUDE (PatientId, FullName, Age, AgeUnit, Sex, Email, GuardianName, GuardianRelation, RegisteredAt);
+
+    PRINT 'Created index IX_PatientRegistrations_Mobile';
+END
+ELSE
+BEGIN
+    PRINT 'Index IX_PatientRegistrations_Mobile already exists';
 END
 GO
 
@@ -9008,6 +9213,45 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_hospital_subscription_payments_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create HospitalSubscriptionPayments Table
+-- Description: Append-only log of every payment submission (Select Plan -> Submit Payment on
+--              the EasyHMS subscription page), so the hospital and CMS can see full payment
+--              history instead of only the single most-recent attempt tracked on
+--              HospitalSubscriptions itself.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.HospitalSubscriptionPayments', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HospitalSubscriptionPayments (
+        PaymentId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_HospitalSubscriptionPayments PRIMARY KEY CONSTRAINT DF_HospitalSubscriptionPayments_Id DEFAULT (NEWID()),
+        HospitalId UNIQUEIDENTIFIER NOT NULL CONSTRAINT FK_HospitalSubscriptionPayments_Hospitals FOREIGN KEY REFERENCES dbo.Hospitals(HospitalID),
+        HospitalSubscriptionId UNIQUEIDENTIFIER NOT NULL CONSTRAINT FK_HospitalSubscriptionPayments_HospitalSubscriptions FOREIGN KEY REFERENCES dbo.HospitalSubscriptions(HospitalSubscriptionId),
+        PlanId UNIQUEIDENTIFIER NULL,
+        PlanName NVARCHAR(200) NULL,
+        Amount DECIMAL(18,2) NOT NULL,
+        Reference NVARCHAR(100) NOT NULL,
+        PaymentMode NVARCHAR(50) NULL, -- UPI, Bank Transfer, Cheque, Card, Cash
+        Status NVARCHAR(50) NOT NULL CONSTRAINT DF_HospitalSubscriptionPayments_Status DEFAULT ('PendingApproval'), -- PendingApproval, Approved, Rejected
+        SubmittedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HospitalSubscriptionPayments_SubmittedAt DEFAULT (SYSUTCDATETIME()),
+        ReviewedAt DATETIME2(3) NULL,
+        RejectionReason NVARCHAR(500) NULL,
+        CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HospitalSubscriptionPayments_CreatedAt DEFAULT (SYSUTCDATETIME())
+    );
+
+    CREATE INDEX IX_HospitalSubscriptionPayments_HospitalId ON dbo.HospitalSubscriptionPayments(HospitalId, SubmittedAt DESC);
+
+    PRINT 'Created table HospitalSubscriptionPayments';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_hospital_subscriptions_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -9178,6 +9422,98 @@ ELSE
 BEGIN
     PRINT 'Table already exists: InvoicePrintSettings';
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_medical_specialities_tables.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create MedicalQualificationTypes / MedicalSpecialities / MedicalSpecialityFeeders
+-- Description: NMC (National Medical Commission) qualification-ladder reference data â€”
+--              MD/MS (broad specialities) and DM/MCh (super-specialities), each with the
+--              "common patient-facing name" used for consumer-facing search (e.g. Doctor
+--              Dekho) and a normalized PatientFacingCategory bucket a handful of NMC rows
+--              collapse into (e.g. DM Medical Oncology + MCh Surgical Oncology + MD Radiation
+--              Oncology all -> "Oncologist (Cancer)"). PG Diplomas and PDCC are deliberately
+--              NOT included: NMC is phasing diplomas out (last admission 2026-27) and PDCC is
+--              a rare 1-year add-on after DM/MCh â€” neither maps to a patient search category.
+--              Global reference data only (no HospitalID) â€” unlike dbo.Departments/
+--              dbo.Specializations, which are the hospital-operational department/sub-focus
+--              tables and are deliberately left untouched by this migration.
+--              MedicalSpecialityFeeders is a many-to-many bridge because a DM/MCh super-
+--              speciality can have more than one valid feeder MD/MS (e.g. DM Cardiology
+--              accepts MD Medicine, MD Paediatrics, or MD Respiratory Medicine).
+-- =============================================================================
+
+IF OBJECT_ID('dbo.MedicalQualificationTypes', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.MedicalQualificationTypes (
+        QualificationTypeCode NVARCHAR(10) NOT NULL
+            CONSTRAINT PK_MedQualType PRIMARY KEY,       -- 'MD' | 'MS' | 'DM' | 'MCh'
+        [Name]                 NVARCHAR(100) NOT NULL,   -- 'Doctor of Medicine', etc.
+        Tier                   NVARCHAR(20)  NOT NULL
+            CONSTRAINT CK_MedQualType_Tier CHECK (Tier IN (N'Broad', N'SuperSpeciality')),
+        IsSurgical             BIT           NOT NULL CONSTRAINT DF_MedQualType_Surgical DEFAULT (0),
+        TypicalDurationYears   TINYINT       NOT NULL,
+        IsActive               BIT           NOT NULL CONSTRAINT DF_MedQualType_Active DEFAULT (1),
+        CreatedAt              DATETIME2(3)  NOT NULL CONSTRAINT DF_MedQualType_CreatedAt DEFAULT (SYSUTCDATETIME())
+    );
+
+    PRINT 'Created table MedicalQualificationTypes';
+END
+GO
+
+IF OBJECT_ID('dbo.MedicalSpecialities', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.MedicalSpecialities (
+        SpecialityId                 UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT PK_MedSpec PRIMARY KEY
+            CONSTRAINT DF_MedSpec_Id DEFAULT (NEWID()),
+        QualificationTypeCode        NVARCHAR(10)  NOT NULL,
+        [Name]                       NVARCHAR(150) NOT NULL,   -- NMC speciality name, e.g. 'Cardiology'
+        PatientFacingName            NVARCHAR(150) NULL,       -- e.g. 'Cardiologist / Heart Specialist'
+        PatientFacingCategory        NVARCHAR(100) NULL,       -- normalized search bucket, e.g. 'Cardiologist (Heart)'
+        SixYearDirectRouteAvailable  BIT           NOT NULL CONSTRAINT DF_MedSpec_SixYear DEFAULT (0),
+        SortOrder                    INT           NOT NULL CONSTRAINT DF_MedSpec_Sort DEFAULT (0),
+        IsActive                     BIT           NOT NULL CONSTRAINT DF_MedSpec_Active DEFAULT (1),
+        CreatedAt                    DATETIME2(3)  NOT NULL CONSTRAINT DF_MedSpec_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CONSTRAINT FK_MedSpec_QualType FOREIGN KEY (QualificationTypeCode)
+            REFERENCES dbo.MedicalQualificationTypes (QualificationTypeCode),
+        CONSTRAINT UQ_MedSpec_QualType_Name UNIQUE (QualificationTypeCode, [Name])
+    );
+
+    PRINT 'Created table MedicalSpecialities';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_MedSpec_Category' AND object_id = OBJECT_ID('dbo.MedicalSpecialities'))
+    CREATE INDEX IX_MedSpec_Category ON dbo.MedicalSpecialities (PatientFacingCategory) WHERE PatientFacingCategory IS NOT NULL;
+GO
+
+IF OBJECT_ID('dbo.MedicalSpecialityFeeders', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.MedicalSpecialityFeeders (
+        SpecialityId       UNIQUEIDENTIFIER NOT NULL,   -- the DM/MCh super-speciality
+        FeederSpecialityId UNIQUEIDENTIFIER NOT NULL,   -- the MD/MS broad speciality that qualifies entry
+        CreatedAt          DATETIME2(3) NOT NULL CONSTRAINT DF_MedSpecFeeder_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CONSTRAINT PK_MedSpecFeeder PRIMARY KEY (SpecialityId, FeederSpecialityId),
+        CONSTRAINT FK_MedSpecFeeder_Spec FOREIGN KEY (SpecialityId)
+            REFERENCES dbo.MedicalSpecialities (SpecialityId) ON DELETE NO ACTION,
+        CONSTRAINT FK_MedSpecFeeder_Feeder FOREIGN KEY (FeederSpecialityId)
+            REFERENCES dbo.MedicalSpecialities (SpecialityId) ON DELETE NO ACTION,
+        CONSTRAINT CK_MedSpecFeeder_NotSelf CHECK (SpecialityId <> FeederSpecialityId)
+    );
+
+    PRINT 'Created table MedicalSpecialityFeeders';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_MedSpecFeeder_Feeder' AND object_id = OBJECT_ID('dbo.MedicalSpecialityFeeders'))
+    CREATE INDEX IX_MedSpecFeeder_Feeder ON dbo.MedicalSpecialityFeeders (FeederSpecialityId);
 GO
 
 GO
@@ -9416,6 +9752,50 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_public_patient_auth_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create PublicPatientAuth Table
+-- Description: WhatsApp-OTP login for the NexEagle "Doctor Dekho" public booking portal.
+--              Deliberately separate from UserAuth (which is hospital-STAFF identity, keyed by
+--              Users.UserID) -- a patient isn't a Users row, and a single mobile number can have
+--              PatientRegistrations rows in multiple hospitals (one per hospital they've visited),
+--              so this is keyed by Mobile alone: one row per phone number, hospital-agnostic,
+--              matching how "GET public/appointments/mine" needs to look across every hospital's
+--              PatientRegistrations for that number, not just one.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PublicPatientAuth', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PublicPatientAuth (
+        Mobile NVARCHAR(20) NOT NULL CONSTRAINT PK_PublicPatientAuth PRIMARY KEY,
+        Otp NVARCHAR(20) NULL,
+        OtpSentAt DATETIME2(3) NULL,
+        OtpExpireAt DATETIME2(3) NULL,
+        IsOtpUsed BIT NOT NULL CONSTRAINT DF_PublicPatientAuth_IsOtpUsed DEFAULT (0),
+        FailedAttempts INT NOT NULL CONSTRAINT DF_PublicPatientAuth_FailedAttempts DEFAULT (0),
+        IsLocked BIT NOT NULL CONSTRAINT DF_PublicPatientAuth_IsLocked DEFAULT (0),
+        -- Rolling-window send cap (abuse/cost control -- WhatsApp template sends cost money and an
+        -- unthrottled send endpoint is a spam-harassment vector against whatever number is targeted).
+        OtpSendCount INT NOT NULL CONSTRAINT DF_PublicPatientAuth_OtpSendCount DEFAULT (0),
+        OtpWindowStartAt DATETIME2(3) NULL,
+        -- Bumped on logout so previously issued JWTs for this mobile stop validating even though
+        -- they're not cryptographically expired yet -- lets "sign out" actually revoke, since JWTs
+        -- issued by IJwtAuthService are otherwise stateless/unrevocable for their full 30-day life.
+        SessionEpoch INT NOT NULL CONSTRAINT DF_PublicPatientAuth_SessionEpoch DEFAULT (0),
+        CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_PublicPatientAuth_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_PublicPatientAuth_UpdatedAt DEFAULT (SYSUTCDATETIME())
+    );
+
+    PRINT 'Created table PublicPatientAuth';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_rapid_response_activation_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -9633,6 +10013,48 @@ GO
 -- Idempotent: safe to re-run, only touches rows still carrying the stale 'AUTO' value.
 
 UPDATE dbo.BillingPolicy SET IpdBedChargeMode = 'DAILY_AUTO' WHERE IpdBedChargeMode = 'AUTO';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/link_doctors_to_medical_specialities.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Add Doctors.PrimaryMedicalSpecialityId
+-- Description: Optional link from a doctor to their super/broad-speciality row in
+--              dbo.MedicalSpecialities (the NMC qualification-ladder catalog â€” see
+--              create_medical_specialities_tables.sql). Deliberately additive and
+--              nullable: sits alongside the existing free-text Doctor.Qualification
+--              and the separate Department/Specialization system, replacing neither.
+--              Its only job is to give the public Doctor Dekho listing (see
+--              GetPublicDoctorsHandler) an authoritative PatientFacingCategory to
+--              show instead of fuzzy-matching Department.Name text.
+-- =============================================================================
+
+IF COL_LENGTH('dbo.Doctors', 'PrimaryMedicalSpecialityId') IS NULL
+BEGIN
+    ALTER TABLE dbo.Doctors ADD PrimaryMedicalSpecialityId UNIQUEIDENTIFIER NULL;
+    PRINT 'Added column Doctors.PrimaryMedicalSpecialityId';
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.foreign_keys
+    WHERE name = 'FK_Doctors_PrimaryMedicalSpeciality' AND parent_object_id = OBJECT_ID('dbo.Doctors')
+)
+BEGIN
+    ALTER TABLE dbo.Doctors
+        ADD CONSTRAINT FK_Doctors_PrimaryMedicalSpeciality
+        FOREIGN KEY (PrimaryMedicalSpecialityId) REFERENCES dbo.MedicalSpecialities (SpecialityId);
+    PRINT 'Added FK_Doctors_PrimaryMedicalSpeciality';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Doctors_PrimaryMedicalSpeciality' AND object_id = OBJECT_ID('dbo.Doctors'))
+    CREATE INDEX IX_Doctors_PrimaryMedicalSpeciality ON dbo.Doctors (PrimaryMedicalSpecialityId) WHERE PrimaryMedicalSpecialityId IS NOT NULL;
 GO
 
 GO
@@ -23918,6 +24340,267 @@ BEGIN CATCH
   IF (XACT_STATE()) <> 0 ROLLBACK;
   THROW;
 END CATCH;
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/data/seed/seed_medical_specialities.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+/* =========================================================
+   easyHMS â€“ Medical Specialities Seed (NMC qualification ladder)
+   Idempotent DML â€“ safe to re-run.
+   Source: NMC Post-Graduate Medical Education Regulations (PGMER), 2025 recognised-course
+   list (neetpgexam.com / diginerve.com, Nov 2025). PG Diplomas and PDCC deliberately excluded
+   (diplomas being phased out; PDCC too narrow to matter for patient-facing search).
+
+   One deliberate addition beyond the source's own "patient-facing category" table: MS
+   General Surgery is tagged with PatientFacingCategory = 'General Surgeon'. The source
+   list omits a plain "General Surgeon" row (it only lists surgical sub-specialities like
+   Orthopaedic/Neuro/Plastic/Vascular Surgeon), which would otherwise leave one of the most
+   commonly searched specialist categories unsearchable.
+   ========================================================= */
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+------------------------------------------------------------
+-- 1) Qualification types
+------------------------------------------------------------
+;WITH q(QualificationTypeCode, [Name], Tier, IsSurgical, TypicalDurationYears) AS (
+  SELECT * FROM (VALUES
+    (N'MD',  N'Doctor of Medicine',      N'Broad',           0, 3),
+    (N'MS',  N'Master of Surgery',       N'Broad',           1, 3),
+    (N'DM',  N'Doctorate of Medicine',   N'SuperSpeciality', 0, 3),
+    (N'MCh', N'Master of Chirurgiae',    N'SuperSpeciality', 1, 3)
+  ) v(QualificationTypeCode, [Name], Tier, IsSurgical, TypicalDurationYears)
+)
+MERGE dbo.MedicalQualificationTypes AS t
+USING q AS s
+   ON t.QualificationTypeCode = s.QualificationTypeCode
+WHEN NOT MATCHED BY TARGET THEN
+  INSERT (QualificationTypeCode, [Name], Tier, IsSurgical, TypicalDurationYears, IsActive, CreatedAt)
+  VALUES (s.QualificationTypeCode, s.[Name], s.Tier, s.IsSurgical, s.TypicalDurationYears, 1, SYSUTCDATETIME())
+WHEN MATCHED AND (t.[Name] <> s.[Name] OR t.Tier <> s.Tier OR t.IsSurgical <> s.IsSurgical OR t.TypicalDurationYears <> s.TypicalDurationYears) THEN
+  UPDATE SET t.[Name] = s.[Name], t.Tier = s.Tier, t.IsSurgical = s.IsSurgical, t.TypicalDurationYears = s.TypicalDurationYears;
+
+------------------------------------------------------------
+-- 2) Specialities â€” MD (32), MS (6), DM (32), MCh (16) = 86 rows
+--    Columns: QualCode, Name, PatientFacingName, PatientFacingCategory, SixYearDirect, SortOrder
+------------------------------------------------------------
+;WITH sp(QualCode, [Name], PatientFacingName, PatientFacingCategory, SixYearDirect, SortOrder) AS (
+  SELECT * FROM (VALUES
+    -- â”€â”€ MD (32) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    (N'MD', N'Aerospace Medicine',                          N'Aviation/Aerospace Medicine Specialist',     NULL,                                    0, 1),
+    (N'MD', N'Anatomy',                                     NULL,                                          NULL,                                    0, 2),
+    (N'MD', N'Anaesthesiology',                             N'Anaesthetist',                                N'Anaesthesiologist',                    0, 3),
+    (N'MD', N'Biochemistry',                                NULL,                                          NULL,                                    0, 4),
+    (N'MD', N'Biophysics',                                  NULL,                                          NULL,                                    0, 5),
+    (N'MD', N'Community Medicine',                          N'Public Health Physician',                     NULL,                                    0, 6),
+    (N'MD', N'Dermatology, Venereology and Leprosy',         N'Dermatologist / Skin Doctor',                 N'Dermatologist (Skin)',                 0, 7),
+    (N'MD', N'Emergency Medicine',                           N'Emergency Physician',                         N'Emergency Medicine Specialist',        0, 8),
+    (N'MD', N'Family Medicine',                              N'Family Physician / General Physician',        N'General Physician',                    0, 9),
+    (N'MD', N'Forensic Medicine and Toxicology',             N'Forensic Medicine Specialist',                NULL,                                    0, 10),
+    (N'MD', N'General Medicine',                             N'General Physician / Internist',               N'General Physician',                    0, 11),
+    (N'MD', N'Geriatrics',                                   N'Geriatrician',                                N'Geriatrician',                         0, 12),
+    (N'MD', N'Health Administration',                        NULL,                                          NULL,                                    0, 13),
+    (N'MD', N'Hospital Administration',                      NULL,                                          NULL,                                    0, 14),
+    (N'MD', N'Immuno-Haematology and Blood Transfusion',     N'Transfusion Medicine Specialist',             NULL,                                    0, 15),
+    (N'MD', N'Laboratory Medicine',                          N'Lab/Pathology Specialist',                    NULL,                                    0, 16),
+    (N'MD', N'Marine Medicine',                              N'Marine Medicine Specialist',                  NULL,                                    0, 17),
+    (N'MD', N'Master of Public Health (Epidemiology)',       N'Public Health/Epidemiology Specialist',       NULL,                                    0, 18),
+    (N'MD', N'Microbiology',                                 NULL,                                          NULL,                                    0, 19),
+    (N'MD', N'Nuclear Medicine',                             N'Nuclear Medicine Specialist',                 NULL,                                    0, 20),
+    (N'MD', N'Paediatrics',                                  N'Paediatrician / Child Specialist',            N'Paediatrician',                        0, 21),
+    (N'MD', N'Palliative Medicine',                          N'Palliative Care Specialist',                  NULL,                                    0, 22),
+    (N'MD', N'Pathology',                                    N'Pathologist',                                 N'Pathologist',                          0, 23),
+    (N'MD', N'Pharmacology',                                 NULL,                                          NULL,                                    0, 24),
+    (N'MD', N'Physical Medicine and Rehabilitation',         N'Physiatrist / Rehab Medicine Specialist',     N'Physiotherapist / Rehab',              0, 25),
+    (N'MD', N'Physiology',                                   NULL,                                          NULL,                                    0, 26),
+    (N'MD', N'Psychiatry',                                   N'Psychiatrist',                                N'Psychiatrist',                         0, 27),
+    (N'MD', N'Radiation Oncology',                           N'Radiation Oncologist',                        N'Oncologist (Cancer)',                  0, 28),
+    (N'MD', N'Radio-diagnosis',                              N'Radiologist',                                 N'Radiologist',                          0, 29),
+    (N'MD', N'Respiratory Medicine',                         N'Pulmonologist / Chest Specialist',            N'Pulmonologist (Chest/Lungs)',          0, 30),
+    (N'MD', N'Sports Medicine',                               N'Sports Medicine Specialist',                  N'Sports Medicine Specialist',           0, 31),
+    (N'MD', N'Tropical Medicine',                             N'Tropical Medicine Specialist',                NULL,                                    0, 32),
+
+    -- â”€â”€ MS (6) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    (N'MS', N'General Surgery',                              N'General Surgeon',                             N'General Surgeon',                      0, 1),
+    (N'MS', N'Obstetrics and Gynecology',                     N'Gynaecologist / Obstetrician',                N'Gynaecologist',                        0, 2),
+    (N'MS', N'Ophthalmology',                                 N'Eye Specialist / Ophthalmologist',            N'Ophthalmologist (Eye)',                0, 3),
+    (N'MS', N'Orthopaedics',                                  N'Orthopaedic Surgeon / Bone Doctor',           N'Orthopaedic Surgeon (Bone)',           0, 4),
+    (N'MS', N'Otorhinolaryngology (ENT)',                     N'ENT Specialist',                              N'ENT Specialist',                       0, 5),
+    (N'MS', N'Traumatology and Surgery',                      N'Trauma Surgeon',                              NULL,                                    0, 6),
+
+    -- â”€â”€ DM (32) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    (N'DM', N'Cardiac Anaesthesia',                                        N'Cardiac Anaesthetist',                         NULL,                             0, 1),
+    (N'DM', N'Cardiology',                                                 N'Cardiologist / Heart Specialist',              N'Cardiologist (Heart)',          0, 2),
+    (N'DM', N'Child and Adolescent Psychiatry',                            N'Child Psychiatrist',                           NULL,                             0, 3),
+    (N'DM', N'Clinical Haematology',                                       N'Haematologist',                                NULL,                             0, 4),
+    (N'DM', N'Clinical Immunology and Rheumatology',                       N'Rheumatologist',                               N'Rheumatologist',                0, 5),
+    (N'DM', N'Clinical Pharmacology',                                      N'Clinical Pharmacologist',                      NULL,                             0, 6),
+    (N'DM', N'Critical Care Medicine',                                     N'Critical Care / Intensivist',                  NULL,                             0, 7),
+    (N'DM', N'Endocrinology',                                              N'Endocrinologist / Hormone Specialist',         N'Endocrinologist (Hormones/Diabetes)', 0, 8),
+    (N'DM', N'Geriatric Mental Health',                                    N'Geriatric Psychiatrist',                       NULL,                             0, 9),
+    (N'DM', N'Hepatology',                                                 N'Hepatologist / Liver Specialist',              NULL,                             0, 10),
+    (N'DM', N'Infectious Disease',                                        N'Infectious Disease Specialist',                NULL,                             0, 11),
+    (N'DM', N'Interventional Radiology',                                  N'Interventional Radiologist',                   NULL,                             0, 12),
+    (N'DM', N'Medical Gastroenterology',                                  N'Gastroenterologist',                           N'Gastroenterologist',            0, 13),
+    (N'DM', N'Medical Genetics',                                          N'Medical Geneticist',                           NULL,                             0, 14),
+    (N'DM', N'Medical Oncology',                                          N'Medical Oncologist / Cancer Specialist',       N'Oncologist (Cancer)',           0, 15),
+    (N'DM', N'Neonatology',                                               N'Neonatologist',                                NULL,                             0, 16),
+    (N'DM', N'Nephrology',                                                N'Nephrologist / Kidney Specialist',             N'Nephrologist (Kidney)',         0, 17),
+    (N'DM', N'Neuro-Anaesthesia',                                         N'Neuro-Anaesthetist',                           NULL,                             0, 18),
+    (N'DM', N'Neurology',                                                 N'Neurologist',                                  N'Neurologist',                   1, 19),
+    (N'DM', N'Neuro-Radiology',                                           N'Neuro-Radiologist',                            NULL,                             0, 20),
+    (N'DM', N'Onco-Pathology',                                            N'Onco-Pathologist',                             NULL,                             0, 21),
+    (N'DM', N'Organ Transplant Anaesthesia and Critical Care',            N'Transplant Anaesthetist',                      NULL,                             0, 22),
+    (N'DM', N'Paediatric and Neonatal Anaesthesia',                       N'Paediatric Anaesthetist',                      NULL,                             0, 23),
+    (N'DM', N'Paediatric Cardiology',                                     N'Paediatric Cardiologist',                      NULL,                             0, 24),
+    (N'DM', N'Paediatric Critical Care',                                  N'Paediatric Intensivist',                       NULL,                             0, 25),
+    (N'DM', N'Paediatric Gastroenterology',                               N'Paediatric Gastroenterologist',                NULL,                             0, 26),
+    (N'DM', N'Paediatric Hepatology',                                     N'Paediatric Hepatologist',                      NULL,                             0, 27),
+    (N'DM', N'Paediatric Nephrology',                                     N'Paediatric Nephrologist',                      NULL,                             0, 28),
+    (N'DM', N'Paediatric Neurology',                                      N'Paediatric Neurologist',                       NULL,                             0, 29),
+    (N'DM', N'Paediatric Oncology',                                       N'Paediatric Oncologist',                        NULL,                             0, 30),
+    (N'DM', N'Pulmonary Medicine',                                        N'Pulmonologist',                                N'Pulmonologist (Chest/Lungs)',   0, 31),
+    (N'DM', N'Virology',                                                  N'Virologist',                                   NULL,                             0, 32),
+
+    -- â”€â”€ MCh (16) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    (N'MCh', N'Endocrine Surgery',                            N'Endocrine Surgeon',                                     NULL,                             0, 1),
+    (N'MCh', N'Gynecological Oncology',                       N'Gynaecologic Oncologist',                               NULL,                             0, 2),
+    (N'MCh', N'Hand Surgery',                                 N'Hand Surgeon',                                          N'Orthopaedic Surgeon (Bone)',    0, 3),
+    (N'MCh', N'Head and Neck Surgery',                        N'Head & Neck Surgeon',                                   NULL,                             0, 4),
+    (N'MCh', N'Hepato-Pancreato-Biliary Surgery',              N'HPB Surgeon',                                          NULL,                             0, 5),
+    (N'MCh', N'Neurosurgery',                                  N'Neurosurgeon',                                         N'Neurosurgeon',                  1, 6),
+    (N'MCh', N'Paediatric Cardio Thoracic Vascular Surgery',   N'Paediatric Cardiac Surgeon',                           NULL,                             0, 7),
+    (N'MCh', N'Paediatric Orthopaedics',                       N'Paediatric Orthopaedic Surgeon',                       N'Orthopaedic Surgeon (Bone)',    0, 8),
+    (N'MCh', N'Paediatric Surgery',                            N'Paediatric Surgeon',                                   NULL,                             0, 9),
+    (N'MCh', N'Plastic and Reconstructive Surgery',            N'Plastic Surgeon',                                      N'Plastic Surgeon',               0, 10),
+    (N'MCh', N'Reproductive Medicine and Surgery',             N'Reproductive Medicine Specialist / Fertility Surgeon', NULL,                             0, 11),
+    (N'MCh', N'Surgical Gastroenterology',                     N'GI Surgeon',                                           N'GI/Surgical Gastroenterologist',0, 12),
+    (N'MCh', N'Surgical Oncology',                             N'Surgical Oncologist',                                  N'Oncologist (Cancer)',           0, 13),
+    (N'MCh', N'Urology',                                       N'Urologist',                                            N'Urologist',                     0, 14),
+    (N'MCh', N'Vascular Surgery',                              N'Vascular Surgeon',                                     N'Vascular Surgeon',              0, 15),
+    (N'MCh', N'Cardiovascular and Thoracic Surgery',           N'Cardiothoracic Surgeon (CTVS)',                        N'Cardiothoracic Surgeon',        0, 16)
+  ) v(QualCode, [Name], PatientFacingName, PatientFacingCategory, SixYearDirect, SortOrder)
+)
+MERGE dbo.MedicalSpecialities AS t
+USING sp AS s
+   ON t.QualificationTypeCode = s.QualCode AND t.[Name] = s.[Name]
+WHEN NOT MATCHED BY TARGET THEN
+  INSERT (SpecialityId, QualificationTypeCode, [Name], PatientFacingName, PatientFacingCategory, SixYearDirectRouteAvailable, SortOrder, IsActive, CreatedAt)
+  VALUES (NEWID(), s.QualCode, s.[Name], s.PatientFacingName, s.PatientFacingCategory, s.SixYearDirect, s.SortOrder, 1, SYSUTCDATETIME())
+WHEN MATCHED AND (
+     ISNULL(t.PatientFacingName, N'') <> ISNULL(s.PatientFacingName, N'')
+  OR ISNULL(t.PatientFacingCategory, N'') <> ISNULL(s.PatientFacingCategory, N'')
+  OR t.SixYearDirectRouteAvailable <> s.SixYearDirect
+  OR t.SortOrder <> s.SortOrder
+  OR t.IsActive = 0
+) THEN
+  UPDATE SET t.PatientFacingName = s.PatientFacingName,
+             t.PatientFacingCategory = s.PatientFacingCategory,
+             t.SixYearDirectRouteAvailable = s.SixYearDirect,
+             t.SortOrder = s.SortOrder,
+             t.IsActive = 1;
+
+------------------------------------------------------------
+-- 3) Feeder relationships (DM/MCh -> valid MD/MS entry route), many-to-many.
+--    Medical Genetics (DM) intentionally has no rows here â€” NMC allows "any MD/MS/DNB"
+--    as its feeder, i.e. unconstrained, so no specific link is asserted.
+------------------------------------------------------------
+;WITH f(SuperQual, SuperName, FeederQual, FeederName) AS (
+  SELECT * FROM (VALUES
+    -- DM feeders
+    (N'DM', N'Cardiac Anaesthesia',                             N'MD', N'Anaesthesiology'),
+    (N'DM', N'Cardiology',                                      N'MD', N'General Medicine'),
+    (N'DM', N'Cardiology',                                      N'MD', N'Paediatrics'),
+    (N'DM', N'Cardiology',                                      N'MD', N'Respiratory Medicine'),
+    (N'DM', N'Child and Adolescent Psychiatry',                 N'MD', N'Psychiatry'),
+    (N'DM', N'Clinical Haematology',                            N'MD', N'Biochemistry'),
+    (N'DM', N'Clinical Haematology',                            N'MD', N'General Medicine'),
+    (N'DM', N'Clinical Haematology',                            N'MD', N'Paediatrics'),
+    (N'DM', N'Clinical Haematology',                            N'MD', N'Pathology'),
+    (N'DM', N'Clinical Immunology and Rheumatology',            N'MD', N'General Medicine'),
+    (N'DM', N'Clinical Immunology and Rheumatology',            N'MD', N'Paediatrics'),
+    (N'DM', N'Clinical Pharmacology',                           N'MD', N'Pharmacology'),
+    (N'DM', N'Critical Care Medicine',                          N'MD', N'Anaesthesiology'),
+    (N'DM', N'Critical Care Medicine',                          N'MD', N'General Medicine'),
+    (N'DM', N'Critical Care Medicine',                          N'MD', N'Paediatrics'),
+    (N'DM', N'Critical Care Medicine',                          N'MD', N'Respiratory Medicine'),
+    (N'DM', N'Critical Care Medicine',                          N'MD', N'Emergency Medicine'),
+    (N'DM', N'Endocrinology',                                   N'MD', N'General Medicine'),
+    (N'DM', N'Endocrinology',                                   N'MD', N'Paediatrics'),
+    (N'DM', N'Geriatric Mental Health',                         N'MD', N'Psychiatry'),
+    (N'DM', N'Hepatology',                                      N'MD', N'General Medicine'),
+    (N'DM', N'Hepatology',                                      N'MD', N'Paediatrics'),
+    (N'DM', N'Infectious Disease',                              N'MD', N'General Medicine'),
+    (N'DM', N'Infectious Disease',                              N'MD', N'Paediatrics'),
+    (N'DM', N'Infectious Disease',                              N'MD', N'Microbiology'),
+    (N'DM', N'Infectious Disease',                              N'MD', N'Respiratory Medicine'),
+    (N'DM', N'Infectious Disease',                              N'MD', N'Tropical Medicine'),
+    (N'DM', N'Interventional Radiology',                        N'MD', N'Radio-diagnosis'),
+    (N'DM', N'Medical Gastroenterology',                        N'MD', N'General Medicine'),
+    (N'DM', N'Medical Oncology',                                N'MD', N'General Medicine'),
+    (N'DM', N'Medical Oncology',                                N'MD', N'Paediatrics'),
+    (N'DM', N'Medical Oncology',                                N'MD', N'Radiation Oncology'),
+    (N'DM', N'Neonatology',                                     N'MD', N'Paediatrics'),
+    (N'DM', N'Nephrology',                                      N'MD', N'General Medicine'),
+    (N'DM', N'Nephrology',                                      N'MD', N'Paediatrics'),
+    (N'DM', N'Neuro-Anaesthesia',                               N'MD', N'Anaesthesiology'),
+    (N'DM', N'Neurology',                                       N'MD', N'General Medicine'),
+    (N'DM', N'Neurology',                                       N'MD', N'Paediatrics'),
+    (N'DM', N'Neuro-Radiology',                                 N'MD', N'Radio-diagnosis'),
+    (N'DM', N'Onco-Pathology',                                  N'MD', N'Pathology'),
+    (N'DM', N'Organ Transplant Anaesthesia and Critical Care',  N'MD', N'Anaesthesiology'),
+    (N'DM', N'Paediatric and Neonatal Anaesthesia',             N'MD', N'Anaesthesiology'),
+    (N'DM', N'Paediatric Cardiology',                           N'MD', N'Paediatrics'),
+    (N'DM', N'Paediatric Critical Care',                        N'MD', N'Paediatrics'),
+    (N'DM', N'Paediatric Gastroenterology',                     N'MD', N'Paediatrics'),
+    (N'DM', N'Paediatric Hepatology',                           N'MD', N'Paediatrics'),
+    (N'DM', N'Paediatric Nephrology',                           N'MD', N'Paediatrics'),
+    (N'DM', N'Paediatric Neurology',                            N'MD', N'Paediatrics'),
+    (N'DM', N'Paediatric Oncology',                             N'MD', N'Paediatrics'),
+    (N'DM', N'Pulmonary Medicine',                              N'MD', N'General Medicine'),
+    (N'DM', N'Pulmonary Medicine',                              N'MD', N'Respiratory Medicine'),
+    (N'DM', N'Pulmonary Medicine',                              N'MD', N'Paediatrics'),
+    (N'DM', N'Virology',                                        N'MD', N'Microbiology'),
+
+    -- MCh feeders
+    (N'MCh', N'Endocrine Surgery',                               N'MS', N'General Surgery'),
+    (N'MCh', N'Gynecological Oncology',                          N'MS', N'Obstetrics and Gynecology'),
+    (N'MCh', N'Hand Surgery',                                    N'MS', N'Orthopaedics'),
+    (N'MCh', N'Head and Neck Surgery',                           N'MS', N'Otorhinolaryngology (ENT)'),
+    (N'MCh', N'Head and Neck Surgery',                           N'MS', N'General Surgery'),
+    (N'MCh', N'Hepato-Pancreato-Biliary Surgery',                N'MS', N'General Surgery'),
+    (N'MCh', N'Neurosurgery',                                    N'MS', N'General Surgery'),
+    (N'MCh', N'Neurosurgery',                                    N'MS', N'Otorhinolaryngology (ENT)'),
+    (N'MCh', N'Paediatric Cardio Thoracic Vascular Surgery',     N'MS', N'General Surgery'),
+    (N'MCh', N'Paediatric Orthopaedics',                         N'MS', N'Orthopaedics'),
+    (N'MCh', N'Paediatric Surgery',                              N'MS', N'General Surgery'),
+    (N'MCh', N'Plastic and Reconstructive Surgery',              N'MS', N'General Surgery'),
+    (N'MCh', N'Plastic and Reconstructive Surgery',              N'MS', N'Otorhinolaryngology (ENT)'),
+    (N'MCh', N'Reproductive Medicine and Surgery',               N'MS', N'Obstetrics and Gynecology'),
+    (N'MCh', N'Surgical Gastroenterology',                       N'MS', N'General Surgery'),
+    (N'MCh', N'Surgical Oncology',                               N'MS', N'General Surgery'),
+    (N'MCh', N'Surgical Oncology',                               N'MS', N'Otorhinolaryngology (ENT)'),
+    (N'MCh', N'Surgical Oncology',                               N'MS', N'Orthopaedics'),
+    (N'MCh', N'Urology',                                         N'MS', N'General Surgery'),
+    (N'MCh', N'Vascular Surgery',                                N'MS', N'General Surgery'),
+    (N'MCh', N'Cardiovascular and Thoracic Surgery',             N'MS', N'General Surgery')
+  ) v(SuperQual, SuperName, FeederQual, FeederName)
+)
+INSERT INTO dbo.MedicalSpecialityFeeders (SpecialityId, FeederSpecialityId, CreatedAt)
+SELECT sup.SpecialityId, fed.SpecialityId, SYSUTCDATETIME()
+FROM f
+JOIN dbo.MedicalSpecialities sup ON sup.QualificationTypeCode = f.SuperQual  AND sup.[Name] = f.SuperName
+JOIN dbo.MedicalSpecialities fed ON fed.QualificationTypeCode = f.FeederQual AND fed.[Name] = f.FeederName
+WHERE NOT EXISTS (
+  SELECT 1 FROM dbo.MedicalSpecialityFeeders x
+   WHERE x.SpecialityId = sup.SpecialityId AND x.FeederSpecialityId = fed.SpecialityId
+);
+
+PRINT N'Medical specialities seed executed.';
 
 GO
 

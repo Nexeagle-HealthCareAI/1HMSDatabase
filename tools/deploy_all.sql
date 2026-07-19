@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-19 13:15  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-20 00:02  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -7441,39 +7441,6 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/alter_hospital_subscription_payments_add_proration.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- Migration: Alter HospitalSubscriptionPayments Table (Add Proration Fields)
--- Description: Supports mid-cycle plan switches (upgrade/downgrade) from the EasyHMS
---              subscription page. When an already-Active hospital switches plans, the unused
---              days on their current plan are credited (prorated off what they actually paid)
---              against the new plan's price. These columns record that breakdown on the payment
---              row so CMS can see/verify it before approving, instead of just a bare Amount.
-
-IF NOT EXISTS (
-    SELECT * FROM sys.columns
-    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptionPayments]') AND name = 'PreviousPlanId'
-)
-BEGIN
-    ALTER TABLE [dbo].[HospitalSubscriptionPayments]
-    ADD PreviousPlanId UNIQUEIDENTIFIER NULL,
-        PreviousPlanName NVARCHAR(200) NULL,
-        ProratedCreditAmount DECIMAL(18,2) NULL,
-        IsProratedSwitch BIT NOT NULL CONSTRAINT DF_HospitalSubscriptionPayments_IsProratedSwitch DEFAULT (0);
-
-    PRINT 'Added proration fields to HospitalSubscriptionPayments table';
-END
-ELSE
-BEGIN
-    PRINT 'Proration fields already exist in HospitalSubscriptionPayments table';
-END
-GO
-
-GO
-
--- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_hospital_subscriptions_add_payment.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -9246,6 +9213,43 @@ BEGIN
     CREATE INDEX IX_HospitalSubscriptionPayments_HospitalId ON dbo.HospitalSubscriptionPayments(HospitalId, SubmittedAt DESC);
 
     PRINT 'Created table HospitalSubscriptionPayments';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_hospital_subscription_payments_table__add_proration.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter HospitalSubscriptionPayments Table (Add Proration Fields)
+-- Description: Supports mid-cycle plan switches (upgrade/downgrade) from the EasyHMS
+--              subscription page. When an already-Active hospital switches plans, the unused
+--              days on their current plan are credited (prorated off what they actually paid)
+--              against the new plan's price. These columns record that breakdown on the payment
+--              row so CMS can see/verify it before approving, instead of just a bare Amount.
+-- Naming: prefixed to match create_hospital_subscription_payments_table.sql (not "alter_...")
+--         so migrations, which apply in alphabetical filename order, run after the table that
+--         creates HospitalSubscriptionPayments instead of before it (see deploy-remote.sh /
+--         deploy.ps1's run_migrations â€” apply-once, sorted by name).
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptionPayments]') AND name = 'PreviousPlanId'
+)
+BEGIN
+    ALTER TABLE [dbo].[HospitalSubscriptionPayments]
+    ADD PreviousPlanId UNIQUEIDENTIFIER NULL,
+        PreviousPlanName NVARCHAR(200) NULL,
+        ProratedCreditAmount DECIMAL(18,2) NULL,
+        IsProratedSwitch BIT NOT NULL CONSTRAINT DF_HospitalSubscriptionPayments_IsProratedSwitch DEFAULT (0);
+
+    PRINT 'Added proration fields to HospitalSubscriptionPayments table';
+END
+ELSE
+BEGIN
+    PRINT 'Proration fields already exist in HospitalSubscriptionPayments table';
 END
 GO
 

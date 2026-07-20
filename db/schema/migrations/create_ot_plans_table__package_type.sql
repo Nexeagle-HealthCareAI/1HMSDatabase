@@ -1,6 +1,8 @@
 -- Optional link from an OT Plan to a PackageType — plain nullable column, not an enforced FK
 -- (matches Admission.OtPlanId's precedent), so this migration doesn't need to run after
--- create_package_types_table.sql. Idempotent.
+-- create_package_types_table.sql. Idempotent. Named to sort after create_ot_plans_table.sql
+-- (migrations apply in filename order) instead of alter_..., which sorted before it and
+-- broke on a fresh database.
 IF OBJECT_ID('dbo.OTPlan', 'U') IS NOT NULL
 BEGIN
     IF COL_LENGTH('dbo.OTPlan', 'PackageTypeId') IS NULL

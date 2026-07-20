@@ -8,6 +8,8 @@
 --              verification -- someone could still type a different number. Null for the
 --              anonymous doctor-page quick-rate flow, which never collects a phone number.
 --              Guarded ALTER on the already-deployed DoctorReviews table.
+-- Named to sort after create_doctor_review_table.sql (migrations apply in filename order)
+-- instead of alter_..., which sorted before it and broke on a fresh database.
 -- =============================================================================
 
 IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NOT NULL

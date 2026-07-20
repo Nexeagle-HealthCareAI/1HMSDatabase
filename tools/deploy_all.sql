@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-20 00:02  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-20 10:51  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -6509,23 +6509,6 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/alter_admission_referral_package_type.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- Optional link from an Advise-Admission referral to a PackageType â€” plain nullable column, no
--- enforced FK, so a doctor can tag a package type even when no OT Plan is configured yet.
--- Idempotent.
-IF OBJECT_ID('dbo.AdmissionReferral', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.AdmissionReferral', 'PackageTypeId') IS NULL
-        ALTER TABLE dbo.AdmissionReferral ADD PackageTypeId UNIQUEIDENTIFIER NULL;
-END
-GO
-
-GO
-
--- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_admission_referring_facility.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7214,126 +7197,6 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/alter_doctor_discharge_field_configs_add_hospital.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- =============================================================================
--- Migration: Scope DoctorDischargeFieldConfigs per (Doctor, Hospital)
--- Description: The discharge-summary field-layout customization ("Customize"
---              editor) was global per doctor across every hospital they work
---              at. Now scoped per hospital, same as DischargeSettings
---              (letterhead) already is. HospitalId is added NULLABLE and
---              existing rows are left as HospitalId = NULL -- they become each
---              doctor's carried-over legacy default (read as a fallback when no
---              hospital-specific row exists yet) rather than being silently
---              discarded. New saves always write a hospital-specific row.
--- =============================================================================
-
-IF OBJECT_ID('dbo.DoctorDischargeFieldConfigs', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.DoctorDischargeFieldConfigs', 'HospitalId') IS NULL
-        ALTER TABLE dbo.DoctorDischargeFieldConfigs ADD HospitalId UNIQUEIDENTIFIER NULL;
-END
-GO
-
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
-    DROP INDEX UX_DoctorDischargeFieldConfigs_DoctorId ON dbo.DoctorDischargeFieldConfigs;
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
-    CREATE UNIQUE INDEX UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId
-    ON dbo.DoctorDischargeFieldConfigs(DoctorId, HospitalId);
-GO
-
-GO
-
--- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/alter_doctor_reviews_add_hospital_response.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- =============================================================================
--- Migration: Doctor review hospital-response flag
--- Description: Adds DoctorReviews.IsHospitalResponse -- lets a hospital admin post
---              their own comment against a doctor from the Public Directory
---              moderation panel, visually tagged as an official "Hospital Response"
---              rather than blending in as if it were a patient review. Excluded from
---              the average-rating/review-count aggregates everywhere they're computed
---              (GetPublicDoctorsHandler, GetPublicDirectoryDoctorsHandler,
---              GetPublicDoctorReviewsHandler) -- it's not patient sentiment data.
---              Guarded ALTER on the already-deployed DoctorReviews table.
--- =============================================================================
-
-IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.DoctorReviews', 'IsHospitalResponse') IS NULL
-        ALTER TABLE dbo.DoctorReviews ADD IsHospitalResponse BIT NOT NULL
-            CONSTRAINT DF_DoctorReviews_IsHospitalResponse DEFAULT (0);
-END
-GO
-
-GO
-
--- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/alter_doctor_reviews_add_mobile_hash.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- =============================================================================
--- Migration: Doctor review submitter-mobile hash
--- Description: Adds DoctorReviews.SubmittedMobileHash -- a SHA-256 hash (never the raw
---              number) of the phone number entered during a NexEagle booking, used as a
---              soft one-rating-per-doctor guard for the post-booking emoji rating. The
---              number is NOT OTP-verified at booking time, so this is a defense-in-depth
---              layer alongside client-side (localStorage) de-dupe, not real identity
---              verification -- someone could still type a different number. Null for the
---              anonymous doctor-page quick-rate flow, which never collects a phone number.
---              Guarded ALTER on the already-deployed DoctorReviews table.
--- =============================================================================
-
-IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.DoctorReviews', 'SubmittedMobileHash') IS NULL
-        ALTER TABLE dbo.DoctorReviews ADD SubmittedMobileHash NVARCHAR(64) NULL;
-END
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DoctorReviews_Doctor_MobileHash' AND object_id = OBJECT_ID('dbo.DoctorReviews'))
-    CREATE INDEX IX_DoctorReviews_Doctor_MobileHash ON dbo.DoctorReviews (DoctorId, SubmittedMobileHash)
-        WHERE SubmittedMobileHash IS NOT NULL;
-GO
-
-GO
-
--- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/alter_doctor_reviews_comment_nullable.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- =============================================================================
--- Migration: Make DoctorReviews.Comment nullable
--- Description: Supports quick "tap a star and it's saved" ratings with no comment
---              required -- the doctor-page rating widget and the post-booking
---              emoji rating both submit rating-only reviews now, with a comment
---              optionally attached afterward via UpdateReviewCommentHandler.
---              Guarded ALTER on the already-deployed DoctorReviews table.
--- =============================================================================
-
-IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NOT NULL
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'DoctorReviews'
-              AND COLUMN_NAME = 'Comment' AND IS_NULLABLE = 'NO'
-    )
-        ALTER TABLE dbo.DoctorReviews ALTER COLUMN Comment NVARCHAR(1000) NULL;
-END
-GO
-
-GO
-
--- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_doctors_add_cms_marketing_controls.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7998,23 +7861,6 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/alter_ot_plan_package_type.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- Optional link from an OT Plan to a PackageType â€” plain nullable column, not an enforced FK
--- (matches Admission.OtPlanId's precedent), so this migration doesn't need to run after
--- create_package_types_table.sql. Idempotent.
-IF OBJECT_ID('dbo.OTPlan', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.OTPlan', 'PackageTypeId') IS NULL
-        ALTER TABLE dbo.OTPlan ADD PackageTypeId UNIQUEIDENTIFIER NULL;
-END
-GO
-
-GO
-
--- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_patientregistrations_add_mobile_index.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8291,30 +8137,6 @@ GO
 -- Idempotent: only added if it doesn't already exist.
 IF COL_LENGTH('dbo.Prescription', 'SystemicExamination') IS NULL
     ALTER TABLE dbo.Prescription ADD SystemicExamination NVARCHAR(MAX) NULL;
-GO
-
-GO
-
--- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/alter_publicapiclient_hospitalid_nullable.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- =============================================================================
--- Migration: PublicApiClient becomes a platform-wide key, not per-hospital
--- Description: PublicApiClient.HospitalId was NOT NULL under the old model (one API
---              key = one hospital, scoped by PublicApiKeyFilter). The public API is
---              now a platform-wide, opt-in multi-hospital directory â€” HospitalId is
---              resolved per-request from the doctor being queried/booked (+
---              Hospital.IsPubliclyListed), never from the key. Relax to nullable;
---              existing rows keep whatever HospitalId they have, but it is now
---              purely informational (which hospital's admin, if any, requested the
---              key) and no longer read for authorization. Guarded ALTER, same
---              pattern as alter_nursing_docs_encounterid_nullable.sql.
--- =============================================================================
-
-IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.PublicApiClient') AND name = 'HospitalId' AND is_nullable = 0)
-  ALTER TABLE dbo.PublicApiClient ALTER COLUMN HospitalId UNIQUEIDENTIFIER NULL;
 GO
 
 GO
@@ -8966,6 +8788,43 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_discharge_config_tables__add_hospital.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Scope DoctorDischargeFieldConfigs per (Doctor, Hospital)
+-- Description: The discharge-summary field-layout customization ("Customize"
+--              editor) was global per doctor across every hospital they work
+--              at. Now scoped per hospital, same as DischargeSettings
+--              (letterhead) already is. HospitalId is added NULLABLE and
+--              existing rows are left as HospitalId = NULL -- they become each
+--              doctor's carried-over legacy default (read as a fallback when no
+--              hospital-specific row exists yet) rather than being silently
+--              discarded. New saves always write a hospital-specific row.
+-- Named to sort after create_discharge_config_tables.sql (migrations apply in filename
+-- order) instead of alter_..., which sorted before it and broke on a fresh database.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DoctorDischargeFieldConfigs', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.DoctorDischargeFieldConfigs', 'HospitalId') IS NULL
+        ALTER TABLE dbo.DoctorDischargeFieldConfigs ADD HospitalId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
+    DROP INDEX UX_DoctorDischargeFieldConfigs_DoctorId ON dbo.DoctorDischargeFieldConfigs;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
+    CREATE UNIQUE INDEX UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId
+    ON dbo.DoctorDischargeFieldConfigs(DoctorId, HospitalId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_discharge_medication_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -9099,6 +8958,97 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DoctorReviews_Hospital' AND object_id = OBJECT_ID('dbo.DoctorReviews'))
     CREATE INDEX IX_DoctorReviews_Hospital ON dbo.DoctorReviews (HospitalId, CreatedAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_doctor_review_table__add_hospital_response.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Doctor review hospital-response flag
+-- Description: Adds DoctorReviews.IsHospitalResponse -- lets a hospital admin post
+--              their own comment against a doctor from the Public Directory
+--              moderation panel, visually tagged as an official "Hospital Response"
+--              rather than blending in as if it were a patient review. Excluded from
+--              the average-rating/review-count aggregates everywhere they're computed
+--              (GetPublicDoctorsHandler, GetPublicDirectoryDoctorsHandler,
+--              GetPublicDoctorReviewsHandler) -- it's not patient sentiment data.
+--              Guarded ALTER on the already-deployed DoctorReviews table.
+-- Named to sort after create_doctor_review_table.sql (migrations apply in filename order)
+-- instead of alter_..., which sorted before it and broke on a fresh database.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.DoctorReviews', 'IsHospitalResponse') IS NULL
+        ALTER TABLE dbo.DoctorReviews ADD IsHospitalResponse BIT NOT NULL
+            CONSTRAINT DF_DoctorReviews_IsHospitalResponse DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_doctor_review_table__add_mobile_hash.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Doctor review submitter-mobile hash
+-- Description: Adds DoctorReviews.SubmittedMobileHash -- a SHA-256 hash (never the raw
+--              number) of the phone number entered during a NexEagle booking, used as a
+--              soft one-rating-per-doctor guard for the post-booking emoji rating. The
+--              number is NOT OTP-verified at booking time, so this is a defense-in-depth
+--              layer alongside client-side (localStorage) de-dupe, not real identity
+--              verification -- someone could still type a different number. Null for the
+--              anonymous doctor-page quick-rate flow, which never collects a phone number.
+--              Guarded ALTER on the already-deployed DoctorReviews table.
+-- Named to sort after create_doctor_review_table.sql (migrations apply in filename order)
+-- instead of alter_..., which sorted before it and broke on a fresh database.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.DoctorReviews', 'SubmittedMobileHash') IS NULL
+        ALTER TABLE dbo.DoctorReviews ADD SubmittedMobileHash NVARCHAR(64) NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DoctorReviews_Doctor_MobileHash' AND object_id = OBJECT_ID('dbo.DoctorReviews'))
+    CREATE INDEX IX_DoctorReviews_Doctor_MobileHash ON dbo.DoctorReviews (DoctorId, SubmittedMobileHash)
+        WHERE SubmittedMobileHash IS NOT NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_doctor_review_table__comment_nullable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Make DoctorReviews.Comment nullable
+-- Description: Supports quick "tap a star and it's saved" ratings with no comment
+--              required -- the doctor-page rating widget and the post-booking
+--              emoji rating both submit rating-only reviews now, with a comment
+--              optionally attached afterward via UpdateReviewCommentHandler.
+--              Guarded ALTER on the already-deployed DoctorReviews table.
+-- Named to sort after create_doctor_review_table.sql (migrations apply in filename order)
+-- instead of alter_..., which sorted before it and broke on a fresh database.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NOT NULL
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'DoctorReviews'
+              AND COLUMN_NAME = 'Comment' AND IS_NULLABLE = 'NO'
+    )
+        ALTER TABLE dbo.DoctorReviews ALTER COLUMN Comment NVARCHAR(1000) NULL;
+END
 GO
 
 GO
@@ -9612,6 +9562,25 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_ot_plans_table__package_type.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Optional link from an OT Plan to a PackageType â€” plain nullable column, not an enforced FK
+-- (matches Admission.OtPlanId's precedent), so this migration doesn't need to run after
+-- create_package_types_table.sql. Idempotent. Named to sort after create_ot_plans_table.sql
+-- (migrations apply in filename order) instead of alter_..., which sorted before it and
+-- broke on a fresh database.
+IF OBJECT_ID('dbo.OTPlan', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.OTPlan', 'PackageTypeId') IS NULL
+        ALTER TABLE dbo.OTPlan ADD PackageTypeId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_package_types_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -9751,6 +9720,32 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PublicApiClient_ApiKeyHash' AND object_id = OBJECT_ID('dbo.PublicApiClient'))
     CREATE UNIQUE INDEX IX_PublicApiClient_ApiKeyHash ON dbo.PublicApiClient (ApiKeyHash);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_public_api_client_table__hospitalid_nullable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: PublicApiClient becomes a platform-wide key, not per-hospital
+-- Description: PublicApiClient.HospitalId was NOT NULL under the old model (one API
+--              key = one hospital, scoped by PublicApiKeyFilter). The public API is
+--              now a platform-wide, opt-in multi-hospital directory â€” HospitalId is
+--              resolved per-request from the doctor being queried/booked (+
+--              Hospital.IsPubliclyListed), never from the key. Relax to nullable;
+--              existing rows keep whatever HospitalId they have, but it is now
+--              purely informational (which hospital's admin, if any, requested the
+--              key) and no longer read for authorization. Guarded ALTER, same
+--              pattern as alter_nursing_docs_encounterid_nullable.sql.
+-- Named to sort after create_public_api_client_table.sql (migrations apply in filename
+-- order) instead of alter_..., which sorted before it and broke on a fresh database.
+-- =============================================================================
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.PublicApiClient') AND name = 'HospitalId' AND is_nullable = 0)
+  ALTER TABLE dbo.PublicApiClient ALTER COLUMN HospitalId UNIQUEIDENTIFIER NULL;
 GO
 
 GO
@@ -9949,6 +9944,24 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ARSH_Referral' AND object_id = OBJECT_ID('dbo.AdmissionReferralStatusHistory'))
     CREATE INDEX IX_ARSH_Referral ON dbo.AdmissionReferralStatusHistory (ReferralId, ChangedAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_referred_admission_tables__add_package_type.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Optional link from an Advise-Admission referral to a PackageType â€” plain nullable column, no
+-- enforced FK, so a doctor can tag a package type even when no OT Plan is configured yet.
+-- Idempotent. Named to sort after create_referred_admission_tables.sql (migrations apply in
+-- filename order) instead of alter_..., which sorted before it and broke on a fresh database.
+IF OBJECT_ID('dbo.AdmissionReferral', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.AdmissionReferral', 'PackageTypeId') IS NULL
+        ALTER TABLE dbo.AdmissionReferral ADD PackageTypeId UNIQUEIDENTIFIER NULL;
+END
 GO
 
 GO

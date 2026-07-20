@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-20 10:51  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-20 23:48  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -1262,6 +1262,55 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_Al_HospitalCode' AND obj
 BEGIN
   CREATE INDEX IX_Al_HospitalCode
   ON dbo.Alert(HospitalId, AlertCode);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_analytics_events.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Generic funnel/behavior event log fired by NexEagleWebsite (see /public/track-event) for the CMS
+-- "Insights" tab's Auth Funnel / Booking Funnel / All Searches reports. One table for every event
+-- type (login_initiated, otp_sent, otp_verified, otp_verify_failed, search_performed,
+-- doctor_profile_viewed, booking_step_reached) rather than a bespoke table per metric â€” SessionId
+-- correlates events within one visit (e.g. search -> profile view), Mobile correlates the auth
+-- funnel once a number is known, DoctorId/SpecialtyId are promoted out of MetadataJson into real
+-- columns so specialty-demand/booking-funnel queries can GROUP BY them directly in SQL.
+IF OBJECT_ID('dbo.AnalyticsEvents','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AnalyticsEvents
+  (
+    EventId       UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_AE_Id DEFAULT NEWSEQUENTIALID(),
+
+    EventType     NVARCHAR(50)     NOT NULL,
+    OccurredAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_AE_OccurredAt DEFAULT SYSUTCDATETIME(),
+
+    SessionId     NVARCHAR(64)     NULL,
+    Mobile        NVARCHAR(20)     NULL,
+    DoctorId      UNIQUEIDENTIFIER NULL,
+    -- Frontend-only category slug (e.g. "cardiology") from NexEagleWebsite's static specialty
+    -- catalog â€” NOT MedicalSpecialities.SpecialityId (a different, DB-side GUID concept).
+    SpecialtyId   NVARCHAR(100)    NULL,
+
+    IpAddress     NVARCHAR(64)     NULL,
+    Country       NVARCHAR(100)    NULL,
+    Region        NVARCHAR(100)    NULL,
+    City          NVARCHAR(100)    NULL,
+
+    -- Event-specific extras that don't earn their own column (e.g. search query text, result
+    -- count, AI-fallback flag).
+    MetadataJson  NVARCHAR(MAX)    NULL,
+
+    CONSTRAINT PK_AnalyticsEvents PRIMARY KEY CLUSTERED (EventId)
+  );
+
+  CREATE INDEX IX_AnalyticsEvents_EventType_OccurredAt ON dbo.AnalyticsEvents (EventType, OccurredAt);
+  CREATE INDEX IX_AnalyticsEvents_SessionId ON dbo.AnalyticsEvents (SessionId);
+  CREATE INDEX IX_AnalyticsEvents_Mobile ON dbo.AnalyticsEvents (Mobile);
 END
 GO
 
@@ -6152,6 +6201,49 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_website_visits.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Page-view beacons fired by NexEagleWebsite (see /public/track-visit) for the CMS "Site Visits"
+-- report â€” one row per page view, region resolved server-side from the visitor's real IP
+-- (TrustedProxyIpResolver) via a best-effort GeoIP lookup at write time.
+IF OBJECT_ID('dbo.WebsiteVisits','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.WebsiteVisits
+  (
+    VisitId       UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_WV_Id DEFAULT NEWSEQUENTIALID(),
+
+    VisitedAt     DATETIME2(3)     NOT NULL CONSTRAINT DF_WV_VisitedAt DEFAULT SYSUTCDATETIME(),
+
+    IpAddress     NVARCHAR(64)     NULL,
+    Country       NVARCHAR(100)    NULL,
+    Region        NVARCHAR(100)    NULL,
+    City          NVARCHAR(100)    NULL,
+
+    PagePath      NVARCHAR(500)    NULL,
+    ReferrerUrl   NVARCHAR(500)    NULL,
+    UtmSource     NVARCHAR(100)    NULL,
+    UtmMedium     NVARCHAR(100)    NULL,
+    UtmCampaign   NVARCHAR(100)    NULL,
+
+    UserAgent     NVARCHAR(500)    NULL,
+    -- Client-generated (localStorage-persisted) id grouping page views into one visit/session â€”
+    -- lets the CMS report distinguish unique visitors from raw page-view counts.
+    SessionId     NVARCHAR(64)     NULL,
+
+    CONSTRAINT PK_WebsiteVisits PRIMARY KEY CLUSTERED (VisitId)
+  );
+
+  CREATE INDEX IX_WebsiteVisits_VisitedAt ON dbo.WebsiteVisits (VisitedAt);
+  CREATE INDEX IX_WebsiteVisits_SessionId ON dbo.WebsiteVisits (SessionId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_zz_foreign_keys.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -6727,6 +6819,30 @@ BEGIN
     CREATE UNIQUE INDEX UX_ApptTok_DoctorDateNo
     ON dbo.AppointmentTokens(HospitalID, DoctorID, TokenDate, TokenNo)
     WHERE TokenNo <> 0;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_appointments_booked_by_mobile.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Appointment booked-by-mobile
+-- Description: Adds Appointments.BookedByMobile â€” the OTP-verified patient-session
+--              mobile number active at the moment a NexEagle public booking was made,
+--              NULL when the visitor was a guest (no verified session at booking time).
+--              Distinct from the appointment's own contact mobile (PatientRegistration.Mobile),
+--              which may belong to a dependent the logged-in visitor booked on behalf of.
+--              Guarded ALTER on the already-deployed Appointments table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Appointments', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Appointments', 'BookedByMobile') IS NULL
+        ALTER TABLE dbo.Appointments ADD BookedByMobile NVARCHAR(20) NULL;
 END
 GO
 
@@ -8137,6 +8253,32 @@ GO
 -- Idempotent: only added if it doesn't already exist.
 IF COL_LENGTH('dbo.Prescription', 'SystemicExamination') IS NULL
     ALTER TABLE dbo.Prescription ADD SystemicExamination NVARCHAR(MAX) NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_public_patient_auth_login_tracking.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Public patient auth login tracking
+-- Description: Adds PublicPatientAuth.LastLoginAt / LoginCount for the CMS "Patient
+--              Logins" report. Set ONLY on a successful OTP verify (see
+--              PatientOtpVerifyHandler) â€” UpdatedAt is touched on both success and
+--              failure, so it can't be trusted as "last successful login".
+--              Guarded ALTER on the already-deployed PublicPatientAuth table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PublicPatientAuth', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.PublicPatientAuth', 'LastLoginAt') IS NULL
+        ALTER TABLE dbo.PublicPatientAuth ADD LastLoginAt DATETIME2(3) NULL;
+
+    IF COL_LENGTH('dbo.PublicPatientAuth', 'LoginCount') IS NULL
+        ALTER TABLE dbo.PublicPatientAuth ADD LoginCount INT NOT NULL CONSTRAINT DF_PPA_LoginCount DEFAULT (0);
+END
 GO
 
 GO

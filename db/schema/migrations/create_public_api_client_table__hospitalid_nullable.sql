@@ -9,6 +9,8 @@
 --              purely informational (which hospital's admin, if any, requested the
 --              key) and no longer read for authorization. Guarded ALTER, same
 --              pattern as alter_nursing_docs_encounterid_nullable.sql.
+-- Named to sort after create_public_api_client_table.sql (migrations apply in filename
+-- order) instead of alter_..., which sorted before it and broke on a fresh database.
 -- =============================================================================
 
 IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.PublicApiClient') AND name = 'HospitalId' AND is_nullable = 0)

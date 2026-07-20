@@ -8,6 +8,8 @@
 --              (GetPublicDoctorsHandler, GetPublicDirectoryDoctorsHandler,
 --              GetPublicDoctorReviewsHandler) -- it's not patient sentiment data.
 --              Guarded ALTER on the already-deployed DoctorReviews table.
+-- Named to sort after create_doctor_review_table.sql (migrations apply in filename order)
+-- instead of alter_..., which sorted before it and broke on a fresh database.
 -- =============================================================================
 
 IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NOT NULL

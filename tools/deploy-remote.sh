@@ -17,6 +17,15 @@
 # migrations folder is apply-once: each migration is recorded by name and skipped
 # next time.
 #
+# All `sort` calls below force LC_ALL=C: several migration/table pairs rely on
+# alphabetical filename order to run a dependent script after the one that
+# creates its table (e.g. create_x_table.sql before create_x_table__alter.sql).
+# Under this VM's default locale, plain `sort` collates punctuation differently
+# and silently reordered such a pair (an underscore-prefixed file sorted AFTER
+# a same-prefix file with no underscore), breaking that dependency even though
+# the filenames looked correctly ordered. LC_ALL=C makes sort byte-order/ASCII,
+# matching what the filenames look like, on every machine.
+#
 # Env:
 #   SA_PASSWORD     (required) SQL Server 'sa' password
 #   SQL_CONTAINER   (default: sqlserver) name of the SQL Server docker container
@@ -59,7 +68,7 @@ sql_q -d "$DB_NAME" -Q "
 run_folder() {
   local dir="$1" label="$2" found=0 f
   [ -d "$dir" ] || { echo "SKIP (missing): $label"; return 0; }
-  for f in $(ls "$dir"/*.sql 2>/dev/null | sort); do
+  for f in $(ls "$dir"/*.sql 2>/dev/null | LC_ALL=C sort); do
     found=1; echo "  RUN: ${f#$DEPLOY_DIR/}"; sql_file "$f"
   done
   [ "$found" = 1 ] || echo "SKIP (empty): $label"
@@ -70,7 +79,7 @@ run_migrations() {
   local dir="$DEPLOY_DIR/schema/migrations" f key applied
   [ -d "$dir" ] || { echo "SKIP (missing): MIGRATIONS"; return 0; }
   echo "==> MIGRATIONS (apply-once, tracked)"
-  for f in $(ls "$dir"/*.sql 2>/dev/null | sort); do
+  for f in $(ls "$dir"/*.sql 2>/dev/null | LC_ALL=C sort); do
     key="schema/migrations/$(basename "$f")"
     applied="$(docker exec -i "$SQL_CONTAINER" "$SQLCMD_BIN" -S localhost -U sa -P "$SA_PASSWORD" -C -h -1 -W -d "$DB_NAME" \
       -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM dbo.__MigrationHistory WHERE ScriptName='$key';" 2>/dev/null | tr -d ' \r\n' || true)"
@@ -99,7 +108,7 @@ run_tables_folder() {
   done
 
   # 2. Extended tables — sorted, skip core files and deferred files
-  for f in $(ls "$dir"/*.sql 2>/dev/null | sort); do
+  for f in $(ls "$dir"/*.sql 2>/dev/null | LC_ALL=C sort); do
     local base; base="$(basename "$f")"
     case "$base" in
       create_table_scripts.sql|create_table_nightjob.sql|\

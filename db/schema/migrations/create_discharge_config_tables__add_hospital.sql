@@ -8,6 +8,8 @@
 --              doctor's carried-over legacy default (read as a fallback when no
 --              hospital-specific row exists yet) rather than being silently
 --              discarded. New saves always write a hospital-specific row.
+-- Named to sort after create_discharge_config_tables.sql (migrations apply in filename
+-- order) instead of alter_..., which sorted before it and broke on a fresh database.
 -- =============================================================================
 
 IF OBJECT_ID('dbo.DoctorDischargeFieldConfigs', 'U') IS NOT NULL

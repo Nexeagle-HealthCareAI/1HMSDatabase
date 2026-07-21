@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-20 23:48  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-07-21 11:00  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -7414,6 +7414,41 @@ BEGIN
 
     IF COL_LENGTH('dbo.Doctors', 'PublicContactPhone') IS NULL
         ALTER TABLE dbo.Doctors ADD PublicContactPhone NVARCHAR(20) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_doctors_add_registration_verification.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Doctor Dekho registration verification
+-- Description: Adds Doctors.IsRegistrationVerified/RegistrationVerifiedAt/
+--              RegistrationVerifiedByUserId â€” a CMS-only-controlled flag an admin sets after
+--              manually confirming a doctor's LicenseNumber/MedicalCouncil/RegistrationYear
+--              against the NMC's Indian Medical Register (no automated verification API exists
+--              in India â€” see CMS's "Verify on NMC Register" button, DoctorDetailModal.tsx).
+--              RegistrationVerifiedByUserId is the acting CMS admin's own account id â€” a plain
+--              audit-trail GUID with no FK, same convention as other CreatedByUserId-style
+--              columns, since CMS staff accounts aren't rows in this database's dbo.Users.
+--              Timestamp/verifier are set only when IsRegistrationVerified transitions to true,
+--              and cleared when unmarked, so they never point at a stale confirmation.
+--              Guarded ALTER on the already-deployed Doctors table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Doctors', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Doctors', 'IsRegistrationVerified') IS NULL
+        ALTER TABLE dbo.Doctors ADD IsRegistrationVerified BIT NOT NULL CONSTRAINT DF_Doctors_IsRegistrationVerified DEFAULT (0);
+
+    IF COL_LENGTH('dbo.Doctors', 'RegistrationVerifiedAt') IS NULL
+        ALTER TABLE dbo.Doctors ADD RegistrationVerifiedAt DATETIME2(3) NULL;
+
+    IF COL_LENGTH('dbo.Doctors', 'RegistrationVerifiedByUserId') IS NULL
+        ALTER TABLE dbo.Doctors ADD RegistrationVerifiedByUserId UNIQUEIDENTIFIER NULL;
 END
 GO
 

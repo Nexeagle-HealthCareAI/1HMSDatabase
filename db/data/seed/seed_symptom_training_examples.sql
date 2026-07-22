@@ -1,4 +1,4 @@
-﻿-- One-time seed: loads the NLP router's existing training dataset into
+-- One-time seed: loads the NLP router's existing training dataset into
 -- dbo.SymptomTrainingExamples so CMS's new dataset editor starts from the real, already-tuned
 -- data instead of empty. Guarded to run only once -- this table is CMS-editable from here on,
 -- and this script must never re-seed over manual edits.

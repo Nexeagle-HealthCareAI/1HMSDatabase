@@ -53,7 +53,11 @@ BEGIN
 """
     footer = "END\nGO\n"
 
-    with open(OUT_PATH, "w", encoding="utf-8-sig") as f:
+    # Plain utf-8, NOT utf-8-sig -- this file gets concatenated into deploy_all.sql alongside
+    # every other seed script, and a BOM landing mid-file (not at the very start) breaks T-SQL
+    # batch parsing ("Incorrect syntax near '﻿'"), unlike a BOM at the true start of a
+    # script, which most SQL tooling tolerates.
+    with open(OUT_PATH, "w", encoding="utf-8") as f:
         f.write(header)
         for batch in batches:
             f.write("    INSERT INTO dbo.SymptomTrainingExamples (Text, Specialist, Type, Source)\n")

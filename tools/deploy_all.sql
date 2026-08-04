@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-23 01:29  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-08-04 21:43  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -1163,6 +1163,51 @@ BEGIN
         UpdatedAt           DATETIME2(3) NOT NULL CONSTRAINT DF_InvoicePrintSettings_UpdatedAt DEFAULT SYSUTCDATETIME(),
         CONSTRAINT FK_InvoicePrintSettings_Hospital FOREIGN KEY (HospitalId) REFERENCES dbo.Hospitals(HospitalID) ON DELETE CASCADE
     );
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_abdm.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+IF OBJECT_ID('dbo.AbhaAccount','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AbhaAccount
+  (
+    AbhaAccountId   UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_AbhaAccount_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId      UNIQUEIDENTIFIER NOT NULL,
+
+    AbhaNumber      NVARCHAR(20)     NOT NULL,
+    AbhaAddress     NVARCHAR(200)    NULL,
+    FullName        NVARCHAR(200)    NULL,
+    Gender          NVARCHAR(10)     NULL,
+    DateOfBirth     NVARCHAR(20)     NULL,
+    Mobile          NVARCHAR(20)     NULL,
+
+    -- 'AadhaarEnrol' (new ABHA created here) | 'Login' (existing ABHA linked via OTP login)
+    Source          NVARCHAR(20)     NOT NULL CONSTRAINT DF_AbhaAccount_Source DEFAULT ('AadhaarEnrol'),
+
+    -- Optional, unenforced pointer for manually associating this ABHA with a PatientRegistration
+    -- later; the standalone ABDM module doesn't write PatientRegistrations directly.
+    LinkedPatientId NVARCHAR(50)     NULL,
+
+    CreatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_AbhaAccount_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy       NVARCHAR(100)    NULL,
+
+    CONSTRAINT PK_AbhaAccount PRIMARY KEY CLUSTERED (AbhaAccountId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AbhaAccount_HospitalAbha' AND object_id=OBJECT_ID('dbo.AbhaAccount'))
+BEGIN
+  CREATE UNIQUE INDEX IX_AbhaAccount_HospitalAbha
+  ON dbo.AbhaAccount(HospitalId, AbhaNumber);
 END
 GO
 
@@ -7450,6 +7495,28 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_doctors_add_isonlinenow.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Manual "online now" presence toggle for doctors
+-- Description: Adds Doctors.IsOnlineNow â€” off by default. A simple, self-reported flag a
+--              doctor (or staff on their behalf) flips manually, separate from the
+--              schedule-derived "available today" status (see DoctorAvailabilityResolver).
+--              Guarded ALTER on the already-deployed Doctors table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Doctors', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Doctors', 'IsOnlineNow') IS NULL
+        ALTER TABLE dbo.Doctors ADD IsOnlineNow BIT NOT NULL CONSTRAINT DF_Doctors_IsOnlineNow DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_doctors_add_ispubliclylisted.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7683,6 +7750,36 @@ BEGIN
     PRINT 'Added NABH_NABL column to Hospitals table';
 END
 ELSE PRINT 'NABH_NABL column already exists';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospitals_add_city_state_index.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Hospitals(City, State) index for public directory filtering
+-- Description: The public doctor directory (GetPublicDoctorsHandler) now accepts
+--              City/State query params, pushed into the SQL WHERE clause instead
+--              of filtered in-memory after the fact (see easyHMSAPI's
+--              GetPublicDoctorsHandler.cs). Doctors.PrimaryMedicalSpecialityId
+--              already has an index (link_doctors_to_medical_specialities.sql);
+--              Hospitals(City, State) had none. Filtered on IsPubliclyListed/
+--              IsActive to match exactly the predicate GetPublicDoctorsHandler
+--              already applies before the City/State check, keeping the index
+--              small and matching the real query shape. Guarded ALTER on the
+--              already-deployed Hospitals table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Hospitals', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Hospitals_City_State' AND object_id = OBJECT_ID('dbo.Hospitals'))
+BEGIN
+    CREATE INDEX IX_Hospitals_City_State ON dbo.Hospitals (City, State)
+        WHERE IsPubliclyListed = 1 AND IsActive = 1;
+    PRINT 'Created index IX_Hospitals_City_State';
+END
 GO
 
 GO
@@ -8024,6 +8121,54 @@ BEGIN
   CREATE INDEX IX_MO_InventoryItem
   ON dbo.MedicationOrder(InventoryItemId)
   WHERE InventoryItemId IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_medicinemaster_add_import_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: MedicineMaster bulk-import support fields
+-- Description: Adds fields carried by the Tata 1mg medicine dataset import
+--              (pack size, prescription-required flag, ready-to-print Rx
+--              shorthand e.g. "Tab Dintor 20mg") plus SourceKey â€” a stable
+--              hash of (MedicineName, Manufacturer) used to upsert the bulk
+--              import idempotently so re-imports update existing rows
+--              instead of duplicating them. Guarded ALTER on the
+--              already-deployed MedicineMaster table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.MedicineMaster', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.MedicineMaster', 'PackSize') IS NULL
+        ALTER TABLE dbo.MedicineMaster ADD PackSize VARCHAR(150) NULL;
+
+    IF COL_LENGTH('dbo.MedicineMaster', 'RequiresPrescription') IS NULL
+        ALTER TABLE dbo.MedicineMaster ADD RequiresPrescription BIT NULL;
+
+    IF COL_LENGTH('dbo.MedicineMaster', 'PrescriptionFormat') IS NULL
+        ALTER TABLE dbo.MedicineMaster ADD PrescriptionFormat VARCHAR(300) NULL;
+
+    IF COL_LENGTH('dbo.MedicineMaster', 'SourceKey') IS NULL
+        ALTER TABLE dbo.MedicineMaster ADD SourceKey CHAR(64) NULL;
+END
+GO
+
+IF OBJECT_ID('dbo.MedicineMaster', 'U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'UX_MedicineMaster_SourceKey'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        -- Filtered so hand-curated rows without a SourceKey never collide;
+        -- lets the loader's MERGE match/upsert imported rows by this key.
+        CREATE UNIQUE NONCLUSTERED INDEX UX_MedicineMaster_SourceKey
+        ON dbo.MedicineMaster(SourceKey)
+        WHERE SourceKey IS NOT NULL;
+    END
 END
 GO
 
@@ -10229,6 +10374,23 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_tables_abdm__email_column.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- ABHA holder email, settable via the "Edit ABHA profile" flow (ABDM's profile/account/email
+-- update API). Guarded ALTER since create_tables_abdm.sql may already be deployed. Named to sort
+-- after create_tables_abdm.sql (migrations apply in filename order).
+IF OBJECT_ID('dbo.AbhaAccount', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.AbhaAccount', 'Email') IS NULL
+        ALTER TABLE dbo.AbhaAccount ADD Email NVARCHAR(200) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/dml_inventory_store_backfill.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -10876,6 +11038,36 @@ GO
 
 -- DoctorSectionPreferences already has:
 --   PK(PreferenceId) + UNIQUE(HospitalId, DoctorId)
+
+------------------------------------------------------------
+-- MEDICINE MASTER (prescription autocomplete search)
+------------------------------------------------------------
+IF OBJECT_ID('dbo.MedicineMaster','U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_MedicineName'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_MedicineName
+        ON dbo.MedicineMaster(MedicineName);
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_BrandName'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_BrandName
+        ON dbo.MedicineMaster(BrandName)
+        WHERE BrandName IS NOT NULL;
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_GenericName'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_GenericName
+        ON dbo.MedicineMaster(GenericName)
+        WHERE GenericName IS NOT NULL;
+    END;
+END
+GO
 
 PRINT N'easyHMS index creation completed.';
 

@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-08-04 21:43  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-08-05 08:50  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -8169,6 +8169,30 @@ BEGIN
         ON dbo.MedicineMaster(SourceKey)
         WHERE SourceKey IS NOT NULL;
     END
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_medicinemaster_widen_genericname.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Widen MedicineMaster.GenericName
+-- Description: The Tata 1mg bulk import surfaced real composition strings up
+--              to 322 chars for multi-ingredient fixed-dose combinations
+--              (e.g. "Aspirin (75mg) + Rosuvastatin (20mg) + Clopidogrel
+--              (75mg)"), exceeding the original VARCHAR(200). Widened to
+--              VARCHAR(500) for headroom. Guarded ALTER on the
+--              already-deployed MedicineMaster table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.MedicineMaster', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.MedicineMaster', 'GenericName') < 500
+        ALTER TABLE dbo.MedicineMaster ALTER COLUMN GenericName VARCHAR(500) NULL;
 END
 GO
 

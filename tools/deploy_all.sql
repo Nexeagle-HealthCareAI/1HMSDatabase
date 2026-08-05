@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-08-05 10:06  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-08-05 12:04  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -8649,6 +8649,33 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'UX_ROOM_Floor_RoomNo' AND parent_object_id = OBJECT_ID('dbo.Room'))
   ALTER TABLE dbo.Room ADD CONSTRAINT UX_ROOM_Floor_RoomNo UNIQUE (HospitalId, FloorNo, RoomNo);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_rxnormingredientcache_add_label_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: RxNormIngredientCache label fields
+-- Description: Adds IndicationsText/AdverseReactionsText, populated from the
+--              FDA's openFDA Drug Label API (usage/side-effects content that
+--              neither the 1mg import nor RxNorm carries) and cached
+--              alongside the existing RxNorm fields in the same row, keyed by
+--              the same normalized ingredient name. Guarded ALTER on the
+--              already-deployed RxNormIngredientCache table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.RxNormIngredientCache', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.RxNormIngredientCache', 'IndicationsText') IS NULL
+        ALTER TABLE dbo.RxNormIngredientCache ADD IndicationsText NVARCHAR(MAX) NULL;
+
+    IF COL_LENGTH('dbo.RxNormIngredientCache', 'AdverseReactionsText') IS NULL
+        ALTER TABLE dbo.RxNormIngredientCache ADD AdverseReactionsText NVARCHAR(MAX) NULL;
+END
 GO
 
 GO

@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-08-05 09:12  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-08-05 10:06  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -278,6 +278,39 @@ BEGIN
 
         CreatedOn        DATETIME       NOT NULL 
             CONSTRAINT DF_MedMaster_CreatedOn DEFAULT (GETDATE())
+    );
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_rxnorm_cache_tables.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+/* =========================================================
+   dbo.RxNormIngredientCache
+   Persistent cache of RxNav (RxNorm) lookups, keyed by normalized
+   ingredient/salt name. Populated on demand by the "medicine info"
+   enrichment endpoint - avoids re-querying NLM's public API for every
+   request against a generic name we've already resolved (only a few
+   thousand distinct ingredients exist across the whole medicine catalog).
+   Found=0 rows cache negative lookups too, for the same reason.
+   ========================================================= */
+IF OBJECT_ID('dbo.RxNormIngredientCache', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.RxNormIngredientCache (
+        IngredientName   VARCHAR(200)   NOT NULL,  -- normalized (trimmed, lowercased) lookup key
+        RxCui            VARCHAR(20)    NULL,       -- NULL when RxNorm has no match
+        DisplayName      VARCHAR(200)   NULL,       -- name RxNorm actually matched under (may differ, e.g. "Acetaminophen")
+        RelatedFormsJson NVARCHAR(MAX)  NULL,        -- cached JSON array of available SCD forms/strengths
+        Found            BIT            NOT NULL,
+
+        FetchedAtUtc     DATETIME2(3)   NOT NULL
+            CONSTRAINT DF_RxNormIngredientCache_FetchedAtUtc DEFAULT (SYSUTCDATETIME()),
+
+        CONSTRAINT PK_RxNormIngredientCache PRIMARY KEY CLUSTERED (IngredientName)
     );
 END
 GO

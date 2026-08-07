@@ -519,6 +519,14 @@ BEGIN
         ON dbo.MedicineMaster(GenericName)
         WHERE GenericName IS NOT NULL;
     END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_PrescriptionFormat'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_PrescriptionFormat
+        ON dbo.MedicineMaster(PrescriptionFormat)
+        WHERE PrescriptionFormat IS NOT NULL;
+    END;
 END
 GO
 

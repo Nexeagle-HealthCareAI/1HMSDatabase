@@ -358,6 +358,11 @@ BEGIN
                WHERE name = N'IX_MedicineMaster_GenericName'
                  AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
         DROP INDEX IX_MedicineMaster_GenericName ON dbo.MedicineMaster;
+
+    IF EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = N'IX_MedicineMaster_PrescriptionFormat'
+                 AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+        DROP INDEX IX_MedicineMaster_PrescriptionFormat ON dbo.MedicineMaster;
 END;
 
 PRINT N'easyHMS index rollback completed.';

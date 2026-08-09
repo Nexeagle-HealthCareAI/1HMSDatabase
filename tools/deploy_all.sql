@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-07-23 01:29  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-08-08 17:21  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -278,6 +278,39 @@ BEGIN
 
         CreatedOn        DATETIME       NOT NULL 
             CONSTRAINT DF_MedMaster_CreatedOn DEFAULT (GETDATE())
+    );
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_rxnorm_cache_tables.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+/* =========================================================
+   dbo.RxNormIngredientCache
+   Persistent cache of RxNav (RxNorm) lookups, keyed by normalized
+   ingredient/salt name. Populated on demand by the "medicine info"
+   enrichment endpoint - avoids re-querying NLM's public API for every
+   request against a generic name we've already resolved (only a few
+   thousand distinct ingredients exist across the whole medicine catalog).
+   Found=0 rows cache negative lookups too, for the same reason.
+   ========================================================= */
+IF OBJECT_ID('dbo.RxNormIngredientCache', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.RxNormIngredientCache (
+        IngredientName   VARCHAR(200)   NOT NULL,  -- normalized (trimmed, lowercased) lookup key
+        RxCui            VARCHAR(20)    NULL,       -- NULL when RxNorm has no match
+        DisplayName      VARCHAR(200)   NULL,       -- name RxNorm actually matched under (may differ, e.g. "Acetaminophen")
+        RelatedFormsJson NVARCHAR(MAX)  NULL,        -- cached JSON array of available SCD forms/strengths
+        Found            BIT            NOT NULL,
+
+        FetchedAtUtc     DATETIME2(3)   NOT NULL
+            CONSTRAINT DF_RxNormIngredientCache_FetchedAtUtc DEFAULT (SYSUTCDATETIME()),
+
+        CONSTRAINT PK_RxNormIngredientCache PRIMARY KEY CLUSTERED (IngredientName)
     );
 END
 GO
@@ -1163,6 +1196,51 @@ BEGIN
         UpdatedAt           DATETIME2(3) NOT NULL CONSTRAINT DF_InvoicePrintSettings_UpdatedAt DEFAULT SYSUTCDATETIME(),
         CONSTRAINT FK_InvoicePrintSettings_Hospital FOREIGN KEY (HospitalId) REFERENCES dbo.Hospitals(HospitalID) ON DELETE CASCADE
     );
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_abdm.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+IF OBJECT_ID('dbo.AbhaAccount','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AbhaAccount
+  (
+    AbhaAccountId   UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_AbhaAccount_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId      UNIQUEIDENTIFIER NOT NULL,
+
+    AbhaNumber      NVARCHAR(20)     NOT NULL,
+    AbhaAddress     NVARCHAR(200)    NULL,
+    FullName        NVARCHAR(200)    NULL,
+    Gender          NVARCHAR(10)     NULL,
+    DateOfBirth     NVARCHAR(20)     NULL,
+    Mobile          NVARCHAR(20)     NULL,
+
+    -- 'AadhaarEnrol' (new ABHA created here) | 'Login' (existing ABHA linked via OTP login)
+    Source          NVARCHAR(20)     NOT NULL CONSTRAINT DF_AbhaAccount_Source DEFAULT ('AadhaarEnrol'),
+
+    -- Optional, unenforced pointer for manually associating this ABHA with a PatientRegistration
+    -- later; the standalone ABDM module doesn't write PatientRegistrations directly.
+    LinkedPatientId NVARCHAR(50)     NULL,
+
+    CreatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_AbhaAccount_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy       NVARCHAR(100)    NULL,
+
+    CONSTRAINT PK_AbhaAccount PRIMARY KEY CLUSTERED (AbhaAccountId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AbhaAccount_HospitalAbha' AND object_id=OBJECT_ID('dbo.AbhaAccount'))
+BEGIN
+  CREATE UNIQUE INDEX IX_AbhaAccount_HospitalAbha
+  ON dbo.AbhaAccount(HospitalId, AbhaNumber);
 END
 GO
 
@@ -7450,6 +7528,28 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_doctors_add_isonlinenow.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Manual "online now" presence toggle for doctors
+-- Description: Adds Doctors.IsOnlineNow â€” off by default. A simple, self-reported flag a
+--              doctor (or staff on their behalf) flips manually, separate from the
+--              schedule-derived "available today" status (see DoctorAvailabilityResolver).
+--              Guarded ALTER on the already-deployed Doctors table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Doctors', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Doctors', 'IsOnlineNow') IS NULL
+        ALTER TABLE dbo.Doctors ADD IsOnlineNow BIT NOT NULL CONSTRAINT DF_Doctors_IsOnlineNow DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_doctors_add_ispubliclylisted.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7683,6 +7783,36 @@ BEGIN
     PRINT 'Added NABH_NABL column to Hospitals table';
 END
 ELSE PRINT 'NABH_NABL column already exists';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospitals_add_city_state_index.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Hospitals(City, State) index for public directory filtering
+-- Description: The public doctor directory (GetPublicDoctorsHandler) now accepts
+--              City/State query params, pushed into the SQL WHERE clause instead
+--              of filtered in-memory after the fact (see easyHMSAPI's
+--              GetPublicDoctorsHandler.cs). Doctors.PrimaryMedicalSpecialityId
+--              already has an index (link_doctors_to_medical_specialities.sql);
+--              Hospitals(City, State) had none. Filtered on IsPubliclyListed/
+--              IsActive to match exactly the predicate GetPublicDoctorsHandler
+--              already applies before the City/State check, keeping the index
+--              small and matching the real query shape. Guarded ALTER on the
+--              already-deployed Hospitals table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Hospitals', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Hospitals_City_State' AND object_id = OBJECT_ID('dbo.Hospitals'))
+BEGIN
+    CREATE INDEX IX_Hospitals_City_State ON dbo.Hospitals (City, State)
+        WHERE IsPubliclyListed = 1 AND IsActive = 1;
+    PRINT 'Created index IX_Hospitals_City_State';
+END
 GO
 
 GO
@@ -8024,6 +8154,96 @@ BEGIN
   CREATE INDEX IX_MO_InventoryItem
   ON dbo.MedicationOrder(InventoryItemId)
   WHERE InventoryItemId IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_medicinemaster_add_import_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: MedicineMaster bulk-import support fields
+-- Description: Adds fields carried by the Tata 1mg medicine dataset import
+--              (pack size, prescription-required flag, ready-to-print Rx
+--              shorthand e.g. "Tab Dintor 20mg") plus SourceKey â€” a stable
+--              hash of (MedicineName, Manufacturer) used to upsert the bulk
+--              import idempotently so re-imports update existing rows
+--              instead of duplicating them. Guarded ALTER on the
+--              already-deployed MedicineMaster table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.MedicineMaster', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.MedicineMaster', 'PackSize') IS NULL
+        ALTER TABLE dbo.MedicineMaster ADD PackSize VARCHAR(150) NULL;
+
+    IF COL_LENGTH('dbo.MedicineMaster', 'RequiresPrescription') IS NULL
+        ALTER TABLE dbo.MedicineMaster ADD RequiresPrescription BIT NULL;
+
+    IF COL_LENGTH('dbo.MedicineMaster', 'PrescriptionFormat') IS NULL
+        ALTER TABLE dbo.MedicineMaster ADD PrescriptionFormat VARCHAR(300) NULL;
+
+    IF COL_LENGTH('dbo.MedicineMaster', 'SourceKey') IS NULL
+        ALTER TABLE dbo.MedicineMaster ADD SourceKey CHAR(64) NULL;
+END
+GO
+
+IF OBJECT_ID('dbo.MedicineMaster', 'U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'UX_MedicineMaster_SourceKey'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        -- Filtered so hand-curated rows without a SourceKey never collide;
+        -- lets the loader's MERGE match/upsert imported rows by this key.
+        CREATE UNIQUE NONCLUSTERED INDEX UX_MedicineMaster_SourceKey
+        ON dbo.MedicineMaster(SourceKey)
+        WHERE SourceKey IS NOT NULL;
+    END
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_medicinemaster_widen_genericname.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Widen MedicineMaster.GenericName
+-- Description: The Tata 1mg bulk import surfaced real composition strings up
+--              to 322 chars for multi-ingredient fixed-dose combinations
+--              (e.g. "Aspirin (75mg) + Rosuvastatin (20mg) + Clopidogrel
+--              (75mg)"), exceeding the original VARCHAR(200). Widened to
+--              VARCHAR(500) for headroom. Guarded ALTER on the
+--              already-deployed MedicineMaster table. IX_MedicineMaster_
+--              GenericName (added alongside the earlier import-fields
+--              migration) depends on this column, so SQL Server refuses the
+--              ALTER COLUMN while it exists - drop it first, widen, then
+--              recreate it.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.MedicineMaster', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.MedicineMaster', 'GenericName') < 500
+    BEGIN
+        IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_GenericName'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+            DROP INDEX IX_MedicineMaster_GenericName ON dbo.MedicineMaster;
+
+        ALTER TABLE dbo.MedicineMaster ALTER COLUMN GenericName VARCHAR(500) NULL;
+    END
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_GenericName'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_GenericName
+        ON dbo.MedicineMaster(GenericName)
+        WHERE GenericName IS NOT NULL;
+    END
 END
 GO
 
@@ -8429,6 +8649,33 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'UX_ROOM_Floor_RoomNo' AND parent_object_id = OBJECT_ID('dbo.Room'))
   ALTER TABLE dbo.Room ADD CONSTRAINT UX_ROOM_Floor_RoomNo UNIQUE (HospitalId, FloorNo, RoomNo);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_rxnormingredientcache_add_label_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: RxNormIngredientCache label fields
+-- Description: Adds IndicationsText/AdverseReactionsText, populated from the
+--              FDA's openFDA Drug Label API (usage/side-effects content that
+--              neither the 1mg import nor RxNorm carries) and cached
+--              alongside the existing RxNorm fields in the same row, keyed by
+--              the same normalized ingredient name. Guarded ALTER on the
+--              already-deployed RxNormIngredientCache table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.RxNormIngredientCache', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.RxNormIngredientCache', 'IndicationsText') IS NULL
+        ALTER TABLE dbo.RxNormIngredientCache ADD IndicationsText NVARCHAR(MAX) NULL;
+
+    IF COL_LENGTH('dbo.RxNormIngredientCache', 'AdverseReactionsText') IS NULL
+        ALTER TABLE dbo.RxNormIngredientCache ADD AdverseReactionsText NVARCHAR(MAX) NULL;
+END
 GO
 
 GO
@@ -9735,6 +9982,191 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_nurse_shift_assignment_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create NurseShiftAssignment Table
+-- Description: Roster backbone for the Nursing Station feature -- which nurse
+--              covers which ward for which shift. Span-row ACTIVE/RELEASED
+--              shape mirrors AdmissionDoctorAssignment, but the grain is
+--              ward-level (not per-admission) and team-based: multiple
+--              different nurses can hold their own ACTIVE row for the same
+--              ward+shift at once (real wards run 2-4 nurses per shift), the
+--              unique index only stops the SAME nurse being double-booked.
+--
+--              ShiftDate is nullable by design: NULL = a standing assignment
+--              ("Nurse Priya covers General Ward, MORNING, until released"),
+--              a real date = a one-off cover for that IST calendar date. This
+--              avoids needing someone to re-roster every ward every morning
+--              for the station to show anything.
+--
+--              No dedicated Nurse table exists (unlike Doctor) -- nurses are
+--              Users rows with a "Nurse" role in UserRoles/Roles, so this FKs
+--              straight to Users. WardCode is a soft reference to
+--              BedMaster.WardCode (no separate live Ward table exists).
+-- =============================================================================
+
+IF OBJECT_ID('dbo.NurseShiftAssignment', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.NurseShiftAssignment (
+        NurseShiftAssignmentId UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_NSA_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId     UNIQUEIDENTIFIER NOT NULL,
+        NurseUserId    UNIQUEIDENTIFIER NOT NULL,
+        WardCode       NVARCHAR(30)     NOT NULL,
+        ShiftCode      NVARCHAR(10)     NOT NULL
+            CONSTRAINT CK_NSA_Shift CHECK (ShiftCode IN ('MORNING', 'EVENING', 'NIGHT')),
+        ShiftDate      DATE             NULL,
+            -- NULL = standing assignment; a date = one-off cover for that IST date
+
+        StatusCode     NVARCHAR(20)     NOT NULL
+            CONSTRAINT DF_NSA_Status DEFAULT ('ACTIVE'),
+            -- ACTIVE / RELEASED
+
+        AssignedAt     DATETIME2(3)     NOT NULL CONSTRAINT DF_NSA_AssignedAt DEFAULT (SYSUTCDATETIME()),
+        AssignedBy     NVARCHAR(100)    NULL,
+
+        UnassignedAt   DATETIME2(3)     NULL,
+        UnassignedBy   NVARCHAR(100)    NULL,
+
+        Notes          NVARCHAR(500)    NULL,
+
+        CreatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_NSA_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CreatedBy      NVARCHAR(100)    NULL,
+        UpdatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_NSA_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedBy      NVARCHAR(100)    NULL,
+
+        RowVersion     ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_NurseShiftAssignment PRIMARY KEY CLUSTERED (NurseShiftAssignmentId),
+        CONSTRAINT FK_NSA_Nurse FOREIGN KEY (NurseUserId)
+            REFERENCES dbo.Users(UserID)
+    );
+
+    PRINT 'Created table NurseShiftAssignment';
+END
+GO
+
+-- Team model: scoped per-nurse, so multiple different nurses can each hold their own
+-- ACTIVE row for the same ward+shift+date. Only stops the SAME nurse being double-booked.
+-- SQL Server treats NULLs as equal in unique indexes, which is exactly the semantic we
+-- want for standing (ShiftDate IS NULL) rows.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_NSA_ActiveRoster' AND object_id = OBJECT_ID('dbo.NurseShiftAssignment'))
+    CREATE UNIQUE INDEX UX_NSA_ActiveRoster
+    ON dbo.NurseShiftAssignment(HospitalId, WardCode, ShiftCode, ShiftDate, NurseUserId)
+    WHERE StatusCode = 'ACTIVE';
+GO
+
+-- The station query's driving lookup: "what is this nurse currently rostered to."
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_NSA_NurseActive' AND object_id = OBJECT_ID('dbo.NurseShiftAssignment'))
+    CREATE INDEX IX_NSA_NurseActive ON dbo.NurseShiftAssignment(HospitalId, NurseUserId, StatusCode);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_NSA_WardHistory' AND object_id = OBJECT_ID('dbo.NurseShiftAssignment'))
+    CREATE INDEX IX_NSA_WardHistory ON dbo.NurseShiftAssignment(HospitalId, WardCode, AssignedAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_order_set_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create OrderSet table + link ClinicalOrder to it and to SurgeryCase
+-- Description: OrderSet is a reusable, hospital-scoped bundle of CPOE order-lines
+--              (e.g. "Standard Post-Op Protocol") a doctor can apply in one action
+--              from the Surgery Case panel instead of writing each line manually.
+--              TemplateLinesJson mirrors PackageType.ComponentsJson's manual-JSON
+--              convention -- a template line is only ever read/written as part of
+--              the whole set and expanded into brand-new ClinicalOrderLine rows at
+--              apply time, never queried/joined independently.
+--
+--              ClinicalOrder gets three new nullable columns so an order placed via
+--              the post-op order-set flow is traceable back to the surgery case and
+--              the order set it came from. A manual order placed the normal way
+--              (any other CPOE tab) leaves all three null -- unchanged behavior.
+--              SourceOrderSetNameSnapshot freezes the set's name at apply time, same
+--              pattern as Admission.OtPlanProcedureNameSnapshot, so a later rename of
+--              the OrderSet doesn't retroactively rewrite historical orders.
+--
+--              Both the table create and the ClinicalOrder ALTER live in this one
+--              file (not split across two alphabetically-ordered files) so the FK
+--              to OrderSet is guaranteed to see an already-created table -- see the
+--              "merge order-dependent migrations into one file" convention used
+--              elsewhere in this folder.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.OrderSet', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.OrderSet (
+        OrderSetId       UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_OrderSet_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId       UNIQUEIDENTIFIER NOT NULL,
+        Name             NVARCHAR(200)    NOT NULL,
+        Category         NVARCHAR(30)     NOT NULL CONSTRAINT DF_OrderSet_Category DEFAULT ('POST_OP'),
+        TemplateLinesJson NVARCHAR(MAX)   NULL,
+
+        IsActive         BIT              NOT NULL CONSTRAINT DF_OrderSet_IsActive DEFAULT (1),
+
+        CreatedAt        DATETIME2(3)     NOT NULL CONSTRAINT DF_OrderSet_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        CreatedBy        NVARCHAR(500)    NULL,
+        UpdatedAt        DATETIME2(3)     NOT NULL CONSTRAINT DF_OrderSet_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedBy        NVARCHAR(500)    NULL,
+
+        RowVersion       ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_OrderSet PRIMARY KEY CLUSTERED (OrderSetId)
+    );
+
+    PRINT 'Created table OrderSet';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_OrderSet_Hospital' AND object_id = OBJECT_ID('dbo.OrderSet'))
+    CREATE INDEX IX_OrderSet_Hospital ON dbo.OrderSet (HospitalId, Category, IsActive);
+GO
+
+IF COL_LENGTH('dbo.ClinicalOrder', 'SurgeryCaseId') IS NULL
+    ALTER TABLE dbo.ClinicalOrder ADD SurgeryCaseId UNIQUEIDENTIFIER NULL;
+GO
+
+IF COL_LENGTH('dbo.ClinicalOrder', 'SourceOrderSetId') IS NULL
+    ALTER TABLE dbo.ClinicalOrder ADD SourceOrderSetId UNIQUEIDENTIFIER NULL;
+GO
+
+IF COL_LENGTH('dbo.ClinicalOrder', 'SourceOrderSetNameSnapshot') IS NULL
+    ALTER TABLE dbo.ClinicalOrder ADD SourceOrderSetNameSnapshot NVARCHAR(200) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_ClinicalOrder_SurgeryCase')
+BEGIN
+    ALTER TABLE dbo.ClinicalOrder
+        ADD CONSTRAINT FK_ClinicalOrder_SurgeryCase FOREIGN KEY (SurgeryCaseId)
+        REFERENCES dbo.SurgeryCase(SurgeryCaseId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_ClinicalOrder_OrderSet')
+BEGIN
+    ALTER TABLE dbo.ClinicalOrder
+        ADD CONSTRAINT FK_ClinicalOrder_OrderSet FOREIGN KEY (SourceOrderSetId)
+        REFERENCES dbo.OrderSet(OrderSetId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ClinicalOrder_SurgeryCase' AND object_id = OBJECT_ID('dbo.ClinicalOrder'))
+    CREATE INDEX IX_ClinicalOrder_SurgeryCase ON dbo.ClinicalOrder (SurgeryCaseId) WHERE SurgeryCaseId IS NOT NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_ot_plan_package_types_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -10224,6 +10656,118 @@ BEGIN
     IF COL_LENGTH('dbo.AdmissionReferral', 'PackageTypeId') IS NULL
         ALTER TABLE dbo.AdmissionReferral ADD PackageTypeId UNIQUEIDENTIFIER NULL;
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_tables_abdm__email_column.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- ABHA holder email, settable via the "Edit ABHA profile" flow (ABDM's profile/account/email
+-- update API). Guarded ALTER since create_tables_abdm.sql may already be deployed. Named to sort
+-- after create_tables_abdm.sql (migrations apply in filename order).
+IF OBJECT_ID('dbo.AbhaAccount', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.AbhaAccount', 'Email') IS NULL
+        ALTER TABLE dbo.AbhaAccount ADD Email NVARCHAR(200) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_ventilator_and_weaning_tables.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create VentilatorSettings + WeaningAssessment tables
+-- Description: Structured ventilator/weaning data capture -- the "Phase 3" of the
+--              ICU redesign roadmap that was never built. Raw settings + SAT/SBT
+--              assessment history, mirroring SofaScore's insert-only shape and
+--              FK convention exactly. No clinical decision logic here, just data
+--              capture -- same posture as APACHE/SOFA/EWS.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.VentilatorSettings', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.VentilatorSettings (
+        VentilatorSettingsId    UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_VentSettings_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId              UNIQUEIDENTIFIER NOT NULL,
+        AdmissionId             UNIQUEIDENTIFIER NOT NULL,
+        EncounterId             UNIQUEIDENTIFIER NULL,
+        PatientId               NVARCHAR(50)     NULL,
+
+        Mode                    NVARCHAR(20)     NOT NULL,
+        FiO2Percent             DECIMAL(5,2)     NULL,
+        PeepCmH2o               DECIMAL(5,2)     NULL,
+        TidalVolumeMl           DECIMAL(7,2)     NULL,
+        RespiratoryRateSet      INT              NULL,
+        PeakInspiratoryPressure DECIMAL(5,2)     NULL,
+        PlateauPressure         DECIMAL(5,2)     NULL,
+
+        Notes                   NVARCHAR(1000)   NULL,
+
+        ScoredBy                NVARCHAR(200)    NOT NULL,
+        ScoredAt                DATETIME2(3)     NOT NULL CONSTRAINT DF_VentSettings_ScoredAt DEFAULT SYSUTCDATETIME(),
+
+        CreatedAt               DATETIME2(3)     NOT NULL CONSTRAINT DF_VentSettings_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy               NVARCHAR(100)    NULL,
+
+        RowVersion              ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_VentilatorSettings PRIMARY KEY CLUSTERED (VentilatorSettingsId),
+        CONSTRAINT FK_VentSettings_Admission FOREIGN KEY (AdmissionId) REFERENCES dbo.Admission(AdmissionId)
+    );
+
+    PRINT 'Created table VentilatorSettings';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_VentSettings_Admission' AND object_id = OBJECT_ID('dbo.VentilatorSettings'))
+    CREATE INDEX IX_VentSettings_Admission ON dbo.VentilatorSettings (AdmissionId, ScoredAt DESC);
+GO
+
+IF OBJECT_ID('dbo.WeaningAssessment', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.WeaningAssessment (
+        WeaningAssessmentId     UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_Weaning_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId              UNIQUEIDENTIFIER NOT NULL,
+        AdmissionId             UNIQUEIDENTIFIER NOT NULL,
+        EncounterId             UNIQUEIDENTIFIER NULL,
+        PatientId               NVARCHAR(50)     NULL,
+
+        SatPerformed            BIT              NOT NULL CONSTRAINT DF_Weaning_SatPerformed DEFAULT (0),
+        SatPassed               BIT              NOT NULL CONSTRAINT DF_Weaning_SatPassed DEFAULT (0),
+        SbtPerformed            BIT              NOT NULL CONSTRAINT DF_Weaning_SbtPerformed DEFAULT (0),
+        SbtPassed               BIT              NOT NULL CONSTRAINT DF_Weaning_SbtPassed DEFAULT (0),
+
+        Notes                   NVARCHAR(1000)   NULL,
+
+        AssessedBy              NVARCHAR(200)    NOT NULL,
+        AssessedAt              DATETIME2(3)     NOT NULL CONSTRAINT DF_Weaning_AssessedAt DEFAULT SYSUTCDATETIME(),
+
+        CreatedAt               DATETIME2(3)     NOT NULL CONSTRAINT DF_Weaning_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy               NVARCHAR(100)    NULL,
+
+        RowVersion              ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_WeaningAssessment PRIMARY KEY CLUSTERED (WeaningAssessmentId),
+        CONSTRAINT FK_Weaning_Admission FOREIGN KEY (AdmissionId) REFERENCES dbo.Admission(AdmissionId)
+    );
+
+    PRINT 'Created table WeaningAssessment';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Weaning_Admission' AND object_id = OBJECT_ID('dbo.WeaningAssessment'))
+    CREATE INDEX IX_Weaning_Admission ON dbo.WeaningAssessment (AdmissionId, AssessedAt DESC);
 GO
 
 GO
@@ -10876,6 +11420,44 @@ GO
 
 -- DoctorSectionPreferences already has:
 --   PK(PreferenceId) + UNIQUE(HospitalId, DoctorId)
+
+------------------------------------------------------------
+-- MEDICINE MASTER (prescription autocomplete search)
+------------------------------------------------------------
+IF OBJECT_ID('dbo.MedicineMaster','U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_MedicineName'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_MedicineName
+        ON dbo.MedicineMaster(MedicineName);
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_BrandName'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_BrandName
+        ON dbo.MedicineMaster(BrandName)
+        WHERE BrandName IS NOT NULL;
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_GenericName'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_GenericName
+        ON dbo.MedicineMaster(GenericName)
+        WHERE GenericName IS NOT NULL;
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_PrescriptionFormat'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_PrescriptionFormat
+        ON dbo.MedicineMaster(PrescriptionFormat)
+        WHERE PrescriptionFormat IS NOT NULL;
+    END;
+END
+GO
 
 PRINT N'easyHMS index creation completed.';
 

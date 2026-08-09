@@ -492,4 +492,42 @@ GO
 -- DoctorSectionPreferences already has:
 --   PK(PreferenceId) + UNIQUE(HospitalId, DoctorId)
 
+------------------------------------------------------------
+-- MEDICINE MASTER (prescription autocomplete search)
+------------------------------------------------------------
+IF OBJECT_ID('dbo.MedicineMaster','U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_MedicineName'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_MedicineName
+        ON dbo.MedicineMaster(MedicineName);
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_BrandName'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_BrandName
+        ON dbo.MedicineMaster(BrandName)
+        WHERE BrandName IS NOT NULL;
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_GenericName'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_GenericName
+        ON dbo.MedicineMaster(GenericName)
+        WHERE GenericName IS NOT NULL;
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_MedicineMaster_PrescriptionFormat'
+                   AND object_id = OBJECT_ID(N'dbo.MedicineMaster'))
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_MedicineMaster_PrescriptionFormat
+        ON dbo.MedicineMaster(PrescriptionFormat)
+        WHERE PrescriptionFormat IS NOT NULL;
+    END;
+END
+GO
+
 PRINT N'easyHMS index creation completed.';

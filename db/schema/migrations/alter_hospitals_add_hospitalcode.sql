@@ -12,9 +12,11 @@ BEGIN
     ALTER TABLE [dbo].[Hospitals]
     ADD HospitalCode NVARCHAR(12) NULL;
 
-    CREATE UNIQUE INDEX UX_Hospitals_HospitalCode
-    ON dbo.Hospitals(HospitalCode)
-    WHERE HospitalCode IS NOT NULL;
+    -- EXEC() defers parsing to execution time; a plain CREATE INDEX here would fail with
+    -- "Invalid column name" because this whole IF block's name resolution is compiled as one
+    -- unit, before the ALTER TABLE above has actually run (same issue fixed in
+    -- alter_appointmenttokens_add_queue_state.sql).
+    EXEC('CREATE UNIQUE INDEX UX_Hospitals_HospitalCode ON dbo.Hospitals(HospitalCode) WHERE HospitalCode IS NOT NULL');
 
     PRINT 'Added HospitalCode field to Hospitals table';
 END

@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-08-09 13:47  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-08-10 10:57  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -7088,6 +7088,56 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_appointmenttokens_add_queue_state.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter AppointmentTokens Table (Add OPD Queue State)
+-- Description: Backs the OPD QR check-in/queue feature. A row in this table used to just be "a
+--              token number was allocated"; now it also tracks where the patient is in the live
+--              queue (WAITING/CALLED/DONE/NOSHOW), how they checked in (geofence-verified
+--              self-check-in vs. a reception override), and how many times they've been called-
+--              but-skipped. QueueSequence is the live ordering key (defaults to TokenNo at
+--              issuance) -- separate from TokenNo itself so a skip can push someone back in the
+--              queue without renumbering anyone else's permanent, patient-facing token number.
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[AppointmentTokens]') AND name = 'Status'
+)
+BEGIN
+    ALTER TABLE [dbo].[AppointmentTokens]
+    ADD Status NVARCHAR(20) NOT NULL CONSTRAINT DF_AppointmentTokens_Status DEFAULT ('WAITING'),
+        SkipCount INT NOT NULL CONSTRAINT DF_AppointmentTokens_SkipCount DEFAULT (0),
+        QueueSequence INT NULL,
+        ArrivedAt DATETIME2(3) NULL,
+        ArrivalMethod NVARCHAR(20) NULL,
+        ArrivalLatitude DECIMAL(9,6) NULL,
+        ArrivalLongitude DECIMAL(9,6) NULL,
+        CalledAt DATETIME2(3) NULL;
+
+    ALTER TABLE [dbo].[AppointmentTokens]
+    ADD CONSTRAINT CK_AppointmentTokens_Status CHECK (Status IN ('WAITING', 'CALLED', 'DONE', 'NOSHOW'));
+
+    ALTER TABLE [dbo].[AppointmentTokens]
+    ADD CONSTRAINT CK_AppointmentTokens_ArrivalMethod CHECK (ArrivalMethod IS NULL OR ArrivalMethod IN ('Geofence', 'StaffOverride'));
+
+    -- Existing rows (all allocated before this feature existed) already occupy a token number, so
+    -- treat QueueSequence as equal to TokenNo for them rather than leaving it NULL (which would sort
+    -- ambiguously against newly-issued rows in the same doctor/date queue).
+    UPDATE dbo.AppointmentTokens SET QueueSequence = TokenNo WHERE QueueSequence IS NULL;
+
+    PRINT 'Added OPD queue state fields to AppointmentTokens table';
+END
+ELSE
+BEGIN
+    PRINT 'OPD queue state fields already exist in AppointmentTokens table';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_bedmaster_room_id.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7471,6 +7521,34 @@ GO
 
 IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.DischargeSummary') AND name = 'EncounterId' AND is_nullable = 0)
   ALTER TABLE dbo.DischargeSummary ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_doctorqueues_add_currentserving.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter DoctorQueues Table (Add CurrentServingTokenNo)
+-- Description: Authoritative "who's up now" pointer for the OPD queue feature, set by
+--              queue/{doctorId}/call and queue/{doctorId}/skip. NULL means the doctor hasn't
+--              called anyone yet today.
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[DoctorQueues]') AND name = 'CurrentServingTokenNo'
+)
+BEGIN
+    ALTER TABLE [dbo].[DoctorQueues]
+    ADD CurrentServingTokenNo INT NULL;
+
+    PRINT 'Added CurrentServingTokenNo field to DoctorQueues table';
+END
+ELSE
+BEGIN
+    PRINT 'CurrentServingTokenNo field already exists in DoctorQueues table';
+END
 GO
 
 GO
@@ -7874,6 +7952,39 @@ BEGIN
 
     IF COL_LENGTH('dbo.Hospitals', 'Longitude') IS NULL
         ALTER TABLE dbo.Hospitals ADD Longitude DECIMAL(9,6) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospitals_add_hospitalcode.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter Hospitals Table (Add HospitalCode)
+-- Description: Short, unique, QR-friendly slug that resolves a scanned OPD QR code to a hospital
+--              (GET public/hospitals/by-code/{hospitalCode}) -- distinct from HospitalID (GUID,
+--              never printed on physical signage). NULL until assigned; new hospitals get one
+--              generated at registration, existing hospitals are backfilled separately.
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[Hospitals]') AND name = 'HospitalCode'
+)
+BEGIN
+    ALTER TABLE [dbo].[Hospitals]
+    ADD HospitalCode NVARCHAR(12) NULL;
+
+    CREATE UNIQUE INDEX UX_Hospitals_HospitalCode
+    ON dbo.Hospitals(HospitalCode)
+    WHERE HospitalCode IS NOT NULL;
+
+    PRINT 'Added HospitalCode field to Hospitals table';
+END
+ELSE
+BEGIN
+    PRINT 'HospitalCode field already exists in Hospitals table';
 END
 GO
 

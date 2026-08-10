@@ -22,16 +22,20 @@ BEGIN
         ArrivalLongitude DECIMAL(9,6) NULL,
         CalledAt DATETIME2(3) NULL;
 
-    ALTER TABLE [dbo].[AppointmentTokens]
-    ADD CONSTRAINT CK_AppointmentTokens_Status CHECK (Status IN ('WAITING', 'CALLED', 'DONE', 'NOSHOW'));
+    -- Dynamic SQL below: SQL Server compiles this whole IF block as one unit, so a plain
+    -- (non-EXEC) statement referencing Status/ArrivalMethod/QueueSequence here would fail with
+    -- "Invalid column name" at compile time, before the ALTER TABLE above ever runs -- those
+    -- columns don't exist yet as far as the batch's up-front name resolution is concerned.
+    -- Wrapping in EXEC() defers parsing/resolution to actual execution time, by which point the
+    -- ALTER TABLE has already committed.
+    EXEC('ALTER TABLE [dbo].[AppointmentTokens] ADD CONSTRAINT CK_AppointmentTokens_Status CHECK (Status IN (''WAITING'', ''CALLED'', ''DONE'', ''NOSHOW''))');
 
-    ALTER TABLE [dbo].[AppointmentTokens]
-    ADD CONSTRAINT CK_AppointmentTokens_ArrivalMethod CHECK (ArrivalMethod IS NULL OR ArrivalMethod IN ('Geofence', 'StaffOverride'));
+    EXEC('ALTER TABLE [dbo].[AppointmentTokens] ADD CONSTRAINT CK_AppointmentTokens_ArrivalMethod CHECK (ArrivalMethod IS NULL OR ArrivalMethod IN (''Geofence'', ''StaffOverride''))');
 
     -- Existing rows (all allocated before this feature existed) already occupy a token number, so
     -- treat QueueSequence as equal to TokenNo for them rather than leaving it NULL (which would sort
     -- ambiguously against newly-issued rows in the same doctor/date queue).
-    UPDATE dbo.AppointmentTokens SET QueueSequence = TokenNo WHERE QueueSequence IS NULL;
+    EXEC('UPDATE dbo.AppointmentTokens SET QueueSequence = TokenNo WHERE QueueSequence IS NULL');
 
     PRINT 'Added OPD queue state fields to AppointmentTokens table';
 END

@@ -51,8 +51,8 @@ DECLARE @catTypeId INT = (SELECT LookupTypeId FROM dbo.LookupTypes WHERE LookupT
     (N'TOXICOLOGY',         N'Toxicology',                  N'Drug levels, substance screening, therapeutic drug monitoring')
   ) v(Code, Name, ShortDesc)
 )
-INSERT INTO dbo.LookupMaster (LookupId, LookupTypeId, Code, [Name], NameLower, ShortDesc, IsActive, IsPinned, UsageCount, CreatedAt)
-SELECT NEWID(), @catTypeId, c.Code, c.Name, LOWER(c.Name), c.ShortDesc, 1, 0, 0, SYSUTCDATETIME()
+INSERT INTO dbo.LookupMaster (LookupId, LookupTypeId, Code, [Name], ShortDesc, IsActive, IsPinned, UsageCount, CreatedAt)
+SELECT NEWID(), @catTypeId, c.Code, c.Name, c.ShortDesc, 1, 0, 0, SYSUTCDATETIME()
 FROM cats c
 WHERE NOT EXISTS (
     SELECT 1 FROM dbo.LookupMaster lm
@@ -79,8 +79,8 @@ DECLARE @sampleTypeId INT = (SELECT LookupTypeId FROM dbo.LookupTypes WHERE Look
     (N'BONE_MARROW',  N'Bone Marrow',           N'Aspiration / biopsy — hematology, special stains')
   ) v(Code, Name, ShortDesc)
 )
-INSERT INTO dbo.LookupMaster (LookupId, LookupTypeId, Code, [Name], NameLower, ShortDesc, IsActive, IsPinned, UsageCount, CreatedAt)
-SELECT NEWID(), @sampleTypeId, s.Code, s.Name, LOWER(s.Name), s.ShortDesc, 1, 0, 0, SYSUTCDATETIME()
+INSERT INTO dbo.LookupMaster (LookupId, LookupTypeId, Code, [Name], ShortDesc, IsActive, IsPinned, UsageCount, CreatedAt)
+SELECT NEWID(), @sampleTypeId, s.Code, s.Name, s.ShortDesc, 1, 0, 0, SYSUTCDATETIME()
 FROM samples s
 WHERE NOT EXISTS (
     SELECT 1 FROM dbo.LookupMaster lm

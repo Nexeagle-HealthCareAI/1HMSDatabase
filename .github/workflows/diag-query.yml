@@ -7,7 +7,10 @@
 name: EasyHMS DB — Diagnostic Query (temporary)
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [develop]
+    paths:
+      - '.github/workflows/diag-query.yml'
 
 jobs:
   diag:

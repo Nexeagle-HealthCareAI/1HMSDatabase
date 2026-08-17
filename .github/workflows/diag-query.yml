@@ -1,0 +1,43 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEMPORARY diagnostic workflow -- read-only, no schema/data changes.
+# Checks how many 'AdminDoctor' Role rows exist and how many permissions each has,
+# plus which Role row real users are actually linked to. Deleted after use.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: EasyHMS DB — Diagnostic Query (temporary)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    name: "Read-only diagnostic query"
+    runs-on: ubuntu-latest
+    environment: development
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sshpass
+        run: sudo apt-get update -y && sudo apt-get install -y sshpass
+
+      - name: Copy diagnostic query to Dev VM
+        env:
+          SSHPASS: ${{ secrets.DEV_SSH_PASSWORD }}
+        run: |
+          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              ${{ secrets.DEV_SSH_USER }}@${{ secrets.DEV_SSH_HOST }} \
+              "mkdir -p /tmp/diagq"
+          sshpass -e scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              tools/diag-query.sql \
+              ${{ secrets.DEV_SSH_USER }}@${{ secrets.DEV_SSH_HOST }}:/tmp/diagq/diag-query.sql
+
+      - name: Run diagnostic query on Dev VM
+        env:
+          SSHPASS: ${{ secrets.DEV_SSH_PASSWORD }}
+          SA_PASSWORD: ${{ secrets.DEV_SA_PASSWORD }}
+          SQL_CONTAINER: ${{ vars.SQL_CONTAINER_NAME || 'sqlserver' }}
+        run: |
+          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              ${{ secrets.DEV_SSH_USER }}@${{ secrets.DEV_SSH_HOST }} \
+              "SQLCMD_BIN=\$(docker exec '$SQL_CONTAINER' sh -lc 'for p in \"\$(command -v sqlcmd 2>/dev/null)\" /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd; do [ -n \"\$p\" ] && [ -x \"\$p\" ] && echo \"\$p\" && break; done') && \
+               docker exec -i '$SQL_CONTAINER' \"\$SQLCMD_BIN\" -S localhost -U sa -P '$SA_PASSWORD' -C -b -I -d EasyHMSDatabase < /tmp/diagq/diag-query.sql"

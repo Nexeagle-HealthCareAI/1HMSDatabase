@@ -127,11 +127,18 @@ WHEN NOT MATCHED THEN
 WHEN MATCHED THEN
   UPDATE SET t.[Description] = s.[Description], t.IsSystemDefined = 1, t.IsActive = 1;
 
--- Capture the RoleIDs we will target
+-- Capture the RoleIDs we will target -- EVERY row for these names, not just the global
+-- (HospitalID IS NULL) one. HospitalRegisterHandler.cs has a bug (line ~200) that mutates
+-- a user's already-assigned Role row's HospitalID in place instead of cloning it, which
+-- silently "hijacks" the shared global role for whichever hospital registers first while
+-- it's still global -- leaving that hospital stuck on whatever permission set existed at
+-- hijack time, permanently orphaned from future grants to the (regenerated) global row.
+-- Fanning this seed out to every same-named Role row, regardless of HospitalID, closes
+-- that gap without needing to fix the handler first (see its own comment for the real fix).
 INSERT INTO @Roles(RoleName, RoleID)
 SELECT RoleName, RoleID
 FROM dbo.Roles
-WHERE HospitalID IS NULL AND RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor',N'Accountant');
+WHERE RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor',N'Accountant');
 
 -- Ensure required permissions exist (already merged above)
 
@@ -143,41 +150,49 @@ WHERE HospitalID IS NULL AND RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist
 -- appointment_scheduler, appointment_booking, billing, doc_board).
 -- Admin: everything except doc_board (the one gap vs AdminDoctor)
 MERGE dbo.RolePermissions AS t
-USING (SELECT (SELECT RoleID FROM @Roles WHERE RoleName=N'Admin') AS RoleID, v.PermissionKey
-       FROM (VALUES (N'admin_panel'),(N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'admin_panel'),(N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),
                      (N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),(N'inventory'),
                      (N'pathology'),(N'pharmacy'),(N'patients'),(N'doctor_calendar'),(N'abdm'),
-                     (N'leads'),(N'print_preview')) v(PermissionKey)) AS s
+                     (N'leads'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Admin') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
 
 -- AdminDoctor: every permission key that exists
 MERGE dbo.RolePermissions AS t
-USING (SELECT (SELECT RoleID FROM @Roles WHERE RoleName=N'AdminDoctor') AS RoleID, v.PermissionKey
-       FROM (VALUES (N'admin_panel'),(N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),(N'doc_board'),
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'admin_panel'),(N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),(N'doc_board'),
                      (N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),(N'inventory'),
                      (N'pathology'),(N'pharmacy'),(N'patients'),(N'doctor_calendar'),(N'abdm'),
-                     (N'leads'),(N'print_preview')) v(PermissionKey)) AS s
+                     (N'leads'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'AdminDoctor') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
 
 -- Receptionist
 MERGE dbo.RolePermissions AS t
-USING (SELECT (SELECT RoleID FROM @Roles WHERE RoleName=N'Receptionist') AS RoleID, v.PermissionKey
-       FROM (VALUES (N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),
-                     (N'doctor_calendar'),(N'abdm'),(N'print_preview')) v(PermissionKey)) AS s
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),
+                     (N'doctor_calendar'),(N'abdm'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Receptionist') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
 
 -- Nurse
 MERGE dbo.RolePermissions AS t
-USING (SELECT (SELECT RoleID FROM @Roles WHERE RoleName=N'Nurse') AS RoleID, v.PermissionKey
-       FROM (VALUES (N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),
                      (N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),(N'inventory'),
-                     (N'print_preview')) v(PermissionKey)) AS s
+                     (N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Nurse') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
@@ -185,18 +200,22 @@ WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
 -- Doctor: doc_board plus its current (previously unenforced) frontend reach -- kept
 -- deliberately broad per explicit product decision, not narrowed to doc_board+ipd alone
 MERGE dbo.RolePermissions AS t
-USING (SELECT (SELECT RoleID FROM @Roles WHERE RoleName=N'Doctor') AS RoleID, v.PermissionKey
-       FROM (VALUES (N'doc_board'),(N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'doc_board'),(N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),
                      (N'inventory'),(N'pathology'),(N'pharmacy'),(N'patients'),(N'doctor_calendar'),
-                     (N'billing')) v(PermissionKey)) AS s
+                     (N'billing')) v(PermissionKey)
+       WHERE r.RoleName = N'Doctor') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
 
 -- Accountant: previously had ZERO permissions seeded at all -- pre-existing bug, fixed here
 MERGE dbo.RolePermissions AS t
-USING (SELECT (SELECT RoleID FROM @Roles WHERE RoleName=N'Accountant') AS RoleID, v.PermissionKey
-       FROM (VALUES (N'billing'),(N'print_preview')) v(PermissionKey)) AS s
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'billing'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Accountant') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;

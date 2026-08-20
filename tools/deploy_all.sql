@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-08-10 14:50  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-08-20 09:24  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -3196,6 +3196,57 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_hospital_leads.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Hospital-scoped marketing leads captured from Doctor Dekho (NexEagleWebsite) and the WhatsApp
+-- bot (see /public/leads, RecordLeadHandler) for the "Lead Generation" page in easyHMSWeb.
+-- Deliberately a separate table from AnalyticsEvents (create_tables_analytics_events.sql), which
+-- feeds the platform-wide CMS Insights tab and has no HospitalId column at all -- this table
+-- exists purely to answer "what leads did hospital X get". No FK constraints on
+-- HospitalId/DoctorId, matching AnalyticsEvents/WebsiteVisits' own convention for this class of
+-- lightweight event table.
+IF OBJECT_ID('dbo.HospitalLeads','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.HospitalLeads
+  (
+    LeadId        UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_HL_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId    UNIQUEIDENTIFIER NOT NULL,
+    DoctorId      UNIQUEIDENTIFIER NULL,
+
+    Source        NVARCHAR(20)     NOT NULL,   -- "DoctorDekho" | "WhatsApp"
+    LeadType      NVARCHAR(30)     NOT NULL,   -- "DoctorNameSearch" | "HospitalNameSearch" | "DoctorProfileView" | "HospitalPageView"
+
+    -- Raw typed text -- only set for search-type leads.
+    SearchQuery   NVARCHAR(500)    NULL,
+
+    -- Always known for WhatsApp; only known for web when the visitor is phone-verified.
+    Mobile        NVARCHAR(20)     NULL,
+    PatientName   NVARCHAR(200)    NULL,
+    SessionId     NVARCHAR(64)     NULL,
+
+    -- Web leads only -- resolved server-side the same way AnalyticsEvents' geo fields are.
+    IpAddress     NVARCHAR(64)     NULL,
+    Country       NVARCHAR(100)    NULL,
+    Region        NVARCHAR(100)    NULL,
+    City          NVARCHAR(100)    NULL,
+
+    OccurredAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_HL_OccurredAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_HospitalLeads PRIMARY KEY CLUSTERED (LeadId)
+  );
+
+  CREATE INDEX IX_HospitalLeads_HospitalId_OccurredAt ON dbo.HospitalLeads (HospitalId, OccurredAt);
+  CREATE INDEX IX_HospitalLeads_SessionId ON dbo.HospitalLeads (SessionId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_icu.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -5335,6 +5386,170 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pathology.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pathology Lab Module Tables
+
+IF OBJECT_ID('dbo.LabConfiguration', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.LabConfiguration (
+        ConfigId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_LabConfiguration_Id DEFAULT NEWID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        AutoBillOnOrder BIT NOT NULL CONSTRAINT DF_LabConfig_AutoBill DEFAULT 0,
+        DefaultReportHeaderBlob NVARCHAR(1000) NULL,
+        DefaultReportFooterText NVARCHAR(MAX) NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_LabConfig_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy NVARCHAR(100) NULL,
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_LabConfig_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy NVARCHAR(100) NULL,
+        RowVersion rowversion NOT NULL,
+        CONSTRAINT PK_LabConfiguration PRIMARY KEY CLUSTERED (ConfigId),
+        CONSTRAINT UQ_LabConfiguration_Hospital UNIQUE (HospitalId)
+    );
+END
+GO
+
+IF OBJECT_ID('dbo.PathologyTestMaster', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyTestMaster (
+        TestId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PathologyTestMaster_Id DEFAULT NEWID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        TestCode NVARCHAR(50) NOT NULL,
+        TestName NVARCHAR(200) NOT NULL,
+        Category NVARCHAR(100) NULL,
+        ChargeId UNIQUEIDENTIFIER NULL,
+        SampleType NVARCHAR(50) NULL,
+        ContainerType NVARCHAR(50) NULL,
+        ParameterSchemaJson NVARCHAR(MAX) NULL,
+        DefaultTemplateId UNIQUEIDENTIFIER NULL,
+        IsActive BIT NOT NULL CONSTRAINT DF_PathologyTestMaster_IsActive DEFAULT 1,
+        SortOrder INT NOT NULL CONSTRAINT DF_PathologyTestMaster_SortOrder DEFAULT 0,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyTest_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy NVARCHAR(100) NULL,
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyTest_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy NVARCHAR(100) NULL,
+        RowVersion rowversion NOT NULL,
+        CONSTRAINT PK_PathologyTestMaster PRIMARY KEY CLUSTERED (TestId),
+        CONSTRAINT UQ_PathologyTestMaster_Code UNIQUE (HospitalId, TestCode)
+    );
+END
+GO
+
+IF OBJECT_ID('dbo.PathologyReportTemplate', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyReportTemplate (
+        TemplateId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PathologyReportTemplate_Id DEFAULT NEWID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        TemplateCode NVARCHAR(50) NOT NULL,
+        TemplateName NVARCHAR(200) NOT NULL,
+        HeaderBlobPath NVARCHAR(1000) NULL,
+        LayoutJson NVARCHAR(MAX) NOT NULL CONSTRAINT DF_PathologyTemplate_Layout DEFAULT '{}',
+        FooterText NVARCHAR(MAX) NULL,
+        IsDefault BIT NOT NULL CONSTRAINT DF_PathologyTemplate_IsDefault DEFAULT 0,
+        IsActive BIT NOT NULL CONSTRAINT DF_PathologyTemplate_IsActive DEFAULT 1,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyTemplate_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy NVARCHAR(100) NULL,
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyTemplate_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy NVARCHAR(100) NULL,
+        RowVersion rowversion NOT NULL,
+        CONSTRAINT PK_PathologyReportTemplate PRIMARY KEY CLUSTERED (TemplateId),
+        CONSTRAINT UQ_PathologyReportTemplate_Code UNIQUE (HospitalId, TemplateCode)
+    );
+END
+GO
+
+IF OBJECT_ID('dbo.PathologyOrder', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyOrder (
+        OrderId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PathologyOrder_Id DEFAULT NEWID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        PatientId NVARCHAR(100) NOT NULL,
+        EncounterId UNIQUEIDENTIFIER NULL,
+        AdmissionId UNIQUEIDENTIFIER NULL,
+        OrderNo NVARCHAR(50) NOT NULL,
+        OrderDate DATETIME2 NOT NULL,
+        OrderedByDoctorId UNIQUEIDENTIFIER NULL,
+        Notes NVARCHAR(1000) NULL,
+        Status NVARCHAR(50) NOT NULL CONSTRAINT DF_PathologyOrder_Status DEFAULT 'PLACED',
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyOrder_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy NVARCHAR(100) NULL,
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyOrder_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy NVARCHAR(100) NULL,
+        RowVersion rowversion NOT NULL,
+        CONSTRAINT PK_PathologyOrder PRIMARY KEY CLUSTERED (OrderId)
+    );
+END
+GO
+
+IF OBJECT_ID('dbo.PathologyOrderLine', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyOrderLine (
+        OrderLineId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PathologyOrderLine_Id DEFAULT NEWID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        OrderId UNIQUEIDENTIFIER NOT NULL,
+        TestId UNIQUEIDENTIFIER NOT NULL,
+        Status NVARCHAR(50) NOT NULL CONSTRAINT DF_PathologyOrderLine_Status DEFAULT 'PENDING',
+        SampleBarcode NVARCHAR(100) NULL,
+        SampleCollectedAt DATETIME2 NULL,
+        ReportId UNIQUEIDENTIFIER NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyOrderLine_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy NVARCHAR(100) NULL,
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyOrderLine_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy NVARCHAR(100) NULL,
+        RowVersion rowversion NOT NULL,
+        CONSTRAINT PK_PathologyOrderLine PRIMARY KEY CLUSTERED (OrderLineId)
+    );
+END
+GO
+
+IF OBJECT_ID('dbo.PathologyReport', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyReport (
+        ReportId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PathologyReport_Id DEFAULT NEWID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        OrderId UNIQUEIDENTIFIER NOT NULL,
+        TemplateId UNIQUEIDENTIFIER NULL,
+        ReportNo NVARCHAR(50) NOT NULL,
+        Status NVARCHAR(50) NOT NULL CONSTRAINT DF_PathologyReport_Status DEFAULT 'DRAFT',
+        PdfBlobPath NVARCHAR(1000) NULL,
+        PdfSha256 NVARCHAR(64) NULL,
+        GeneratedAt DATETIME2 NULL,
+        ApprovedAt DATETIME2 NULL,
+        ApprovedByUserId UNIQUEIDENTIFIER NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyReport_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy NVARCHAR(100) NULL,
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyReport_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy NVARCHAR(100) NULL,
+        RowVersion rowversion NOT NULL,
+        CONSTRAINT PK_PathologyReport PRIMARY KEY CLUSTERED (ReportId)
+    );
+END
+GO
+
+IF OBJECT_ID('dbo.PathologyResult', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyResult (
+        ResultId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PathologyResult_Id DEFAULT NEWID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        ReportId UNIQUEIDENTIFIER NULL,
+        OrderLineId UNIQUEIDENTIFIER NOT NULL,
+        ResultValuesJson NVARCHAR(MAX) NOT NULL CONSTRAINT DF_PathologyResult_Values DEFAULT '{}',
+        Interpretation NVARCHAR(MAX) NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyResult_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy NVARCHAR(100) NULL,
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_PathologyResult_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy NVARCHAR(100) NULL,
+        RowVersion rowversion NOT NULL,
+        CONSTRAINT PK_PathologyResult PRIMARY KEY CLUSTERED (ResultId)
+    );
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_patient_health_locker_documents.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -6573,6 +6788,107 @@ BEGIN
     REFERENCES dbo.Store(StoreId);
 END
 GO
+
+ - -   P a t h o l o g y T e s t M a s t e r   - >   C h a r g e M a s t e r 
+ I F   O B J E C T _ I D ( ' d b o . P a t h o l o g y T e s t M a s t e r ' , ' U ' )   I S   N O T   N U L L 
+       A N D   O B J E C T _ I D ( ' d b o . C h a r g e M a s t e r ' , ' U ' )   I S   N O T   N U L L 
+       A N D   N O T   E X I S T S   ( S E L E C T   1   F R O M   s y s . f o r e i g n _ k e y s   W H E R E   n a m e   =   ' F K _ P T M _ C h a r g e M a s t e r ' ) 
+ B E G I N 
+     A L T E R   T A B L E   d b o . P a t h o l o g y T e s t M a s t e r 
+         A D D   C O N S T R A I N T   F K _ P T M _ C h a r g e M a s t e r   F O R E I G N   K E Y   ( C h a r g e I d ) 
+         R E F E R E N C E S   d b o . C h a r g e M a s t e r ( C h a r g e I d ) ; 
+ E N D 
+ G O 
+ 
+ - -   P a t h o l o g y O r d e r   - >   E n c o u n t e r 
+ I F   O B J E C T _ I D ( ' d b o . P a t h o l o g y O r d e r ' , ' U ' )   I S   N O T   N U L L 
+       A N D   O B J E C T _ I D ( ' d b o . E n c o u n t e r ' , ' U ' )   I S   N O T   N U L L 
+       A N D   N O T   E X I S T S   ( S E L E C T   1   F R O M   s y s . f o r e i g n _ k e y s   W H E R E   n a m e   =   ' F K _ P O _ E n c o u n t e r ' ) 
+ B E G I N 
+     A L T E R   T A B L E   d b o . P a t h o l o g y O r d e r 
+         A D D   C O N S T R A I N T   F K _ P O _ E n c o u n t e r   F O R E I G N   K E Y   ( E n c o u n t e r I d ) 
+         R E F E R E N C E S   d b o . E n c o u n t e r ( E n c o u n t e r I d ) ; 
+ E N D 
+ G O 
+ 
+ - -   P a t h o l o g y O r d e r   - >   A d m i s s i o n 
+ I F   O B J E C T _ I D ( ' d b o . P a t h o l o g y O r d e r ' , ' U ' )   I S   N O T   N U L L 
+       A N D   O B J E C T _ I D ( ' d b o . A d m i s s i o n ' , ' U ' )   I S   N O T   N U L L 
+       A N D   N O T   E X I S T S   ( S E L E C T   1   F R O M   s y s . f o r e i g n _ k e y s   W H E R E   n a m e   =   ' F K _ P O _ A d m i s s i o n ' ) 
+ B E G I N 
+     A L T E R   T A B L E   d b o . P a t h o l o g y O r d e r 
+         A D D   C O N S T R A I N T   F K _ P O _ A d m i s s i o n   F O R E I G N   K E Y   ( A d m i s s i o n I d ) 
+         R E F E R E N C E S   d b o . A d m i s s i o n ( A d m i s s i o n I d ) ; 
+ E N D 
+ G O 
+ 
+ - -   P a t h o l o g y O r d e r L i n e   - >   P a t h o l o g y O r d e r 
+ I F   O B J E C T _ I D ( ' d b o . P a t h o l o g y O r d e r L i n e ' , ' U ' )   I S   N O T   N U L L 
+       A N D   O B J E C T _ I D ( ' d b o . P a t h o l o g y O r d e r ' , ' U ' )   I S   N O T   N U L L 
+       A N D   N O T   E X I S T S   ( S E L E C T   1   F R O M   s y s . f o r e i g n _ k e y s   W H E R E   n a m e   =   ' F K _ P O L _ P a t h o l o g y O r d e r ' ) 
+ B E G I N 
+     A L T E R   T A B L E   d b o . P a t h o l o g y O r d e r L i n e 
+         A D D   C O N S T R A I N T   F K _ P O L _ P a t h o l o g y O r d e r   F O R E I G N   K E Y   ( O r d e r I d ) 
+         R E F E R E N C E S   d b o . P a t h o l o g y O r d e r ( O r d e r I d ) ; 
+ E N D 
+ G O 
+ 
+ - -   P a t h o l o g y O r d e r L i n e   - >   P a t h o l o g y T e s t M a s t e r 
+ I F   O B J E C T _ I D ( ' d b o . P a t h o l o g y O r d e r L i n e ' , ' U ' )   I S   N O T   N U L L 
+       A N D   O B J E C T _ I D ( ' d b o . P a t h o l o g y T e s t M a s t e r ' , ' U ' )   I S   N O T   N U L L 
+       A N D   N O T   E X I S T S   ( S E L E C T   1   F R O M   s y s . f o r e i g n _ k e y s   W H E R E   n a m e   =   ' F K _ P O L _ P a t h o l o g y T e s t M a s t e r ' ) 
+ B E G I N 
+     A L T E R   T A B L E   d b o . P a t h o l o g y O r d e r L i n e 
+         A D D   C O N S T R A I N T   F K _ P O L _ P a t h o l o g y T e s t M a s t e r   F O R E I G N   K E Y   ( T e s t I d ) 
+         R E F E R E N C E S   d b o . P a t h o l o g y T e s t M a s t e r ( T e s t I d ) ; 
+ E N D 
+ G O 
+ 
+ - -   P a t h o l o g y R e p o r t   - >   P a t h o l o g y O r d e r 
+ I F   O B J E C T _ I D ( ' d b o . P a t h o l o g y R e p o r t ' , ' U ' )   I S   N O T   N U L L 
+       A N D   O B J E C T _ I D ( ' d b o . P a t h o l o g y O r d e r ' , ' U ' )   I S   N O T   N U L L 
+       A N D   N O T   E X I S T S   ( S E L E C T   1   F R O M   s y s . f o r e i g n _ k e y s   W H E R E   n a m e   =   ' F K _ P R _ P a t h o l o g y O r d e r ' ) 
+ B E G I N 
+     A L T E R   T A B L E   d b o . P a t h o l o g y R e p o r t 
+         A D D   C O N S T R A I N T   F K _ P R _ P a t h o l o g y O r d e r   F O R E I G N   K E Y   ( O r d e r I d ) 
+         R E F E R E N C E S   d b o . P a t h o l o g y O r d e r ( O r d e r I d ) ; 
+ E N D 
+ G O 
+ 
+ - -   P a t h o l o g y R e p o r t   - >   P a t h o l o g y R e p o r t T e m p l a t e 
+ I F   O B J E C T _ I D ( ' d b o . P a t h o l o g y R e p o r t ' , ' U ' )   I S   N O T   N U L L 
+       A N D   O B J E C T _ I D ( ' d b o . P a t h o l o g y R e p o r t T e m p l a t e ' , ' U ' )   I S   N O T   N U L L 
+       A N D   N O T   E X I S T S   ( S E L E C T   1   F R O M   s y s . f o r e i g n _ k e y s   W H E R E   n a m e   =   ' F K _ P R _ P a t h o l o g y R e p o r t T e m p l a t e ' ) 
+ B E G I N 
+     A L T E R   T A B L E   d b o . P a t h o l o g y R e p o r t 
+         A D D   C O N S T R A I N T   F K _ P R _ P a t h o l o g y R e p o r t T e m p l a t e   F O R E I G N   K E Y   ( T e m p l a t e I d ) 
+         R E F E R E N C E S   d b o . P a t h o l o g y R e p o r t T e m p l a t e ( T e m p l a t e I d ) ; 
+ E N D 
+ G O 
+ 
+ - -   P a t h o l o g y R e s u l t   - >   P a t h o l o g y R e p o r t 
+ I F   O B J E C T _ I D ( ' d b o . P a t h o l o g y R e s u l t ' , ' U ' )   I S   N O T   N U L L 
+       A N D   O B J E C T _ I D ( ' d b o . P a t h o l o g y R e p o r t ' , ' U ' )   I S   N O T   N U L L 
+       A N D   N O T   E X I S T S   ( S E L E C T   1   F R O M   s y s . f o r e i g n _ k e y s   W H E R E   n a m e   =   ' F K _ P R E S _ P a t h o l o g y R e p o r t ' ) 
+ B E G I N 
+     A L T E R   T A B L E   d b o . P a t h o l o g y R e s u l t 
+         A D D   C O N S T R A I N T   F K _ P R E S _ P a t h o l o g y R e p o r t   F O R E I G N   K E Y   ( R e p o r t I d ) 
+         R E F E R E N C E S   d b o . P a t h o l o g y R e p o r t ( R e p o r t I d ) ; 
+ E N D 
+ G O 
+ 
+ - -   P a t h o l o g y R e s u l t   - >   P a t h o l o g y O r d e r L i n e 
+ I F   O B J E C T _ I D ( ' d b o . P a t h o l o g y R e s u l t ' , ' U ' )   I S   N O T   N U L L 
+       A N D   O B J E C T _ I D ( ' d b o . P a t h o l o g y O r d e r L i n e ' , ' U ' )   I S   N O T   N U L L 
+       A N D   N O T   E X I S T S   ( S E L E C T   1   F R O M   s y s . f o r e i g n _ k e y s   W H E R E   n a m e   =   ' F K _ P R E S _ P a t h o l o g y O r d e r L i n e ' ) 
+ B E G I N 
+     A L T E R   T A B L E   d b o . P a t h o l o g y R e s u l t 
+         A D D   C O N S T R A I N T   F K _ P R E S _ P a t h o l o g y O r d e r L i n e   F O R E I G N   K E Y   ( O r d e r L i n e I d ) 
+         R E F E R E N C E S   d b o . P a t h o l o g y O r d e r L i n e ( O r d e r L i n e I d ) ; 
+ E N D 
+ G O 
+  
+ 
 
 GO
 
@@ -12089,51 +12405,95 @@ WHEN NOT MATCHED THEN
 WHEN MATCHED THEN
   UPDATE SET t.[Description] = s.[Description], t.IsSystemDefined = 1, t.IsActive = 1;
 
--- Capture the RoleIDs we will target
+-- Capture the RoleIDs we will target -- EVERY row for these names, not just the global
+-- (HospitalID IS NULL) one. HospitalRegisterHandler.cs has a bug (line ~200) that mutates
+-- a user's already-assigned Role row's HospitalID in place instead of cloning it, which
+-- silently "hijacks" the shared global role for whichever hospital registers first while
+-- it's still global -- leaving that hospital stuck on whatever permission set existed at
+-- hijack time, permanently orphaned from future grants to the (regenerated) global row.
+-- Fanning this seed out to every same-named Role row, regardless of HospitalID, closes
+-- that gap without needing to fix the handler first (see its own comment for the real fix).
 INSERT INTO @Roles(RoleName, RoleID)
 SELECT RoleName, RoleID
 FROM dbo.Roles
-WHERE HospitalID IS NULL AND RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor',N'Accountant');
+WHERE RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor',N'Accountant');
 
 -- Ensure required permissions exist (already merged above)
 
--- Upsert RolePermissions per role
--- Admin
+-- Upsert RolePermissions per role. PermissionKey is free-text nvarchar (no lookup table),
+-- so extending this list is a data change, not a schema change -- see
+-- EasyHMSAPI.Api/Common/PermissionAuthorizationFilter.cs for what enforces these, and
+-- EasyHMSWeb/src/config/boardAccess.ts for the frontend board -> key mapping. One key per
+-- board; 12 new keys added alongside the 5 pre-existing ones (admin_panel,
+-- appointment_scheduler, appointment_booking, billing, doc_board).
+-- Admin: everything except doc_board (the one gap vs AdminDoctor)
 MERGE dbo.RolePermissions AS t
-USING (SELECT (SELECT RoleID FROM @Roles WHERE RoleName=N'Admin') AS RoleID, v.PermissionKey
-       FROM (VALUES (N'admin_panel'),(N'appointment_scheduler'),(N'appointment_booking'),(N'billing')) v(PermissionKey)) AS s
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'admin_panel'),(N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),
+                     (N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),(N'inventory'),
+                     (N'pathology'),(N'pharmacy'),(N'patients'),(N'doctor_calendar'),(N'abdm'),
+                     (N'leads'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Admin') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
 
--- AdminDoctor
+-- AdminDoctor: every permission key that exists
 MERGE dbo.RolePermissions AS t
-USING (SELECT (SELECT RoleID FROM @Roles WHERE RoleName=N'AdminDoctor') AS RoleID, v.PermissionKey
-       FROM (VALUES (N'admin_panel'),(N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),(N'doc_board')) v(PermissionKey)) AS s
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'admin_panel'),(N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),(N'doc_board'),
+                     (N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),(N'inventory'),
+                     (N'pathology'),(N'pharmacy'),(N'patients'),(N'doctor_calendar'),(N'abdm'),
+                     (N'leads'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'AdminDoctor') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
 
 -- Receptionist
 MERGE dbo.RolePermissions AS t
-USING (SELECT (SELECT RoleID FROM @Roles WHERE RoleName=N'Receptionist') AS RoleID, v.PermissionKey
-       FROM (VALUES (N'appointment_scheduler'),(N'appointment_booking')) v(PermissionKey)) AS s
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),
+                     (N'doctor_calendar'),(N'abdm'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Receptionist') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
 
 -- Nurse
 MERGE dbo.RolePermissions AS t
-USING (SELECT (SELECT RoleID FROM @Roles WHERE RoleName=N'Nurse') AS RoleID, v.PermissionKey
-       FROM (VALUES (N'appointment_scheduler')) v(PermissionKey)) AS s
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),
+                     (N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),(N'inventory'),
+                     (N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Nurse') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
 
--- Doctor
+-- Doctor: doc_board plus its current (previously unenforced) frontend reach -- kept
+-- deliberately broad per explicit product decision, not narrowed to doc_board+ipd alone
 MERGE dbo.RolePermissions AS t
-USING (SELECT (SELECT RoleID FROM @Roles WHERE RoleName=N'Doctor') AS RoleID, v.PermissionKey
-       FROM (VALUES (N'doc_board')) v(PermissionKey)) AS s
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'doc_board'),(N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),
+                     (N'inventory'),(N'pathology'),(N'pharmacy'),(N'patients'),(N'doctor_calendar'),
+                     (N'billing')) v(PermissionKey)
+       WHERE r.RoleName = N'Doctor') AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- Accountant: previously had ZERO permissions seeded at all -- pre-existing bug, fixed here
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'billing'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Accountant') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
@@ -25734,6 +26094,381 @@ PRINT N'Medical specialities seed executed.';
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/data/seed/seed_pathology_default_tests.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+/* =========================================================
+   easyHMS â€“ Seed: Default Pathology Tests with Parameter Schemas
+   Hospital-scoped â€” run ONCE per new hospital during onboarding.
+   Replace @HospitalId with the target hospital GUID.
+
+   These are TEMPLATE tests. Each hospital gets its own copy
+   so they can customize codes, normal ranges, and pricing.
+   ========================================================= */
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+-- !! Replace with actual hospital ID during onboarding !!
+DECLARE @HospitalId UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
+DECLARE @User NVARCHAR(100) = N'System';
+DECLARE @Now DATETIME2 = SYSUTCDATETIME();
+
+BEGIN TRY
+  BEGIN TRAN;
+
+  -- Staging table
+  DECLARE @Tests TABLE (
+      TestCode            NVARCHAR(50)  NOT NULL,
+      TestName            NVARCHAR(200) NOT NULL,
+      Category            NVARCHAR(100) NOT NULL,
+      SampleType          NVARCHAR(50)  NULL,
+      ContainerType       NVARCHAR(50)  NULL,
+      ParameterSchemaJson NVARCHAR(MAX) NULL,
+      SortOrder           INT           NOT NULL
+  );
+
+  /* ===== HEMATOLOGY ===== */
+  INSERT INTO @Tests VALUES
+  (N'HEM-CBC', N'Complete Blood Count (CBC)', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
+   N'{"params":[{"name":"Hemoglobin","unit":"g/dL","min":12.0,"max":17.5},{"name":"RBC","unit":"mil/ÂµL","min":4.5,"max":5.5},{"name":"WBC","unit":"cells/ÂµL","min":4000,"max":11000},{"name":"Platelets","unit":"lakh/ÂµL","min":1.5,"max":4.0},{"name":"PCV/HCT","unit":"%","min":36,"max":54},{"name":"MCV","unit":"fL","min":80,"max":100},{"name":"MCH","unit":"pg","min":27,"max":32},{"name":"MCHC","unit":"g/dL","min":32,"max":36},{"name":"Neutrophils","unit":"%","min":40,"max":70},{"name":"Lymphocytes","unit":"%","min":20,"max":40},{"name":"Monocytes","unit":"%","min":2,"max":8},{"name":"Eosinophils","unit":"%","min":1,"max":6},{"name":"Basophils","unit":"%","min":0,"max":1}]}', 10),
+
+  (N'HEM-ESR', N'Erythrocyte Sedimentation Rate (ESR)', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
+   N'{"params":[{"name":"ESR","unit":"mm/hr","min":0,"max":20}]}', 20),
+
+  (N'HEM-BT-CT', N'Bleeding Time & Clotting Time', N'HEMATOLOGY', N'Whole Blood', N'Plain',
+   N'{"params":[{"name":"Bleeding Time","unit":"min","min":1,"max":6},{"name":"Clotting Time","unit":"min","min":4,"max":9}]}', 30),
+
+  (N'HEM-RETIC', N'Reticulocyte Count', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
+   N'{"params":[{"name":"Reticulocyte Count","unit":"%","min":0.5,"max":2.5}]}', 40);
+
+  /* ===== COAGULATION ===== */
+  INSERT INTO @Tests VALUES
+  (N'COAG-PT', N'Prothrombin Time (PT/INR)', N'COAGULATION', N'Plasma', N'Citrate',
+   N'{"params":[{"name":"PT","unit":"sec","min":11,"max":13.5},{"name":"INR","unit":"ratio","min":0.8,"max":1.2}]}', 50),
+
+  (N'COAG-APTT', N'Activated Partial Thromboplastin Time', N'COAGULATION', N'Plasma', N'Citrate',
+   N'{"params":[{"name":"APTT","unit":"sec","min":25,"max":35}]}', 60);
+
+  /* ===== BIOCHEMISTRY ===== */
+  INSERT INTO @Tests VALUES
+  (N'BIO-FBS', N'Fasting Blood Sugar', N'BIOCHEMISTRY', N'Serum', N'Fluoride',
+   N'{"params":[{"name":"Fasting Glucose","unit":"mg/dL","min":70,"max":100}]}', 100),
+
+  (N'BIO-PPBS', N'Post-Prandial Blood Sugar', N'BIOCHEMISTRY', N'Serum', N'Fluoride',
+   N'{"params":[{"name":"PP Glucose","unit":"mg/dL","min":70,"max":140}]}', 110),
+
+  (N'BIO-RBS', N'Random Blood Sugar', N'BIOCHEMISTRY', N'Serum', N'Fluoride',
+   N'{"params":[{"name":"Random Glucose","unit":"mg/dL","min":70,"max":200}]}', 115),
+
+  (N'BIO-HBA1C', N'HbA1c (Glycated Hemoglobin)', N'BIOCHEMISTRY', N'Whole Blood', N'EDTA',
+   N'{"params":[{"name":"HbA1c","unit":"%","min":4.0,"max":5.6}]}', 120),
+
+  (N'BIO-LIPID', N'Lipid Profile', N'BIOCHEMISTRY', N'Serum', N'Plain',
+   N'{"params":[{"name":"Total Cholesterol","unit":"mg/dL","min":0,"max":200},{"name":"HDL Cholesterol","unit":"mg/dL","min":40,"max":60},{"name":"LDL Cholesterol","unit":"mg/dL","min":0,"max":100},{"name":"VLDL","unit":"mg/dL","min":5,"max":40},{"name":"Triglycerides","unit":"mg/dL","min":0,"max":150},{"name":"Total/HDL Ratio","unit":"ratio","min":0,"max":5}]}', 130),
+
+  (N'BIO-LFT', N'Liver Function Test (LFT)', N'BIOCHEMISTRY', N'Serum', N'Plain',
+   N'{"params":[{"name":"Total Bilirubin","unit":"mg/dL","min":0.1,"max":1.2},{"name":"Direct Bilirubin","unit":"mg/dL","min":0,"max":0.3},{"name":"SGOT (AST)","unit":"U/L","min":0,"max":40},{"name":"SGPT (ALT)","unit":"U/L","min":0,"max":40},{"name":"Alkaline Phosphatase","unit":"U/L","min":44,"max":147},{"name":"GGT","unit":"U/L","min":0,"max":55},{"name":"Total Protein","unit":"g/dL","min":6.0,"max":8.3},{"name":"Albumin","unit":"g/dL","min":3.5,"max":5.5},{"name":"Globulin","unit":"g/dL","min":2.0,"max":3.5},{"name":"A/G Ratio","unit":"ratio","min":1.2,"max":2.2}]}', 140),
+
+  (N'BIO-KFT', N'Kidney Function Test (KFT/RFT)', N'BIOCHEMISTRY', N'Serum', N'Plain',
+   N'{"params":[{"name":"Blood Urea","unit":"mg/dL","min":15,"max":40},{"name":"Serum Creatinine","unit":"mg/dL","min":0.7,"max":1.3},{"name":"Uric Acid","unit":"mg/dL","min":3.5,"max":7.2},{"name":"BUN","unit":"mg/dL","min":7,"max":20},{"name":"Sodium","unit":"mEq/L","min":136,"max":145},{"name":"Potassium","unit":"mEq/L","min":3.5,"max":5.1},{"name":"Chloride","unit":"mEq/L","min":98,"max":106},{"name":"Calcium","unit":"mg/dL","min":8.5,"max":10.5}]}', 150),
+
+  (N'BIO-URIC', N'Serum Uric Acid', N'BIOCHEMISTRY', N'Serum', N'Plain',
+   N'{"params":[{"name":"Uric Acid","unit":"mg/dL","min":3.5,"max":7.2}]}', 155),
+
+  (N'BIO-CARDIAC', N'Cardiac Markers', N'BIOCHEMISTRY', N'Serum', N'Plain',
+   N'{"params":[{"name":"Troponin I","unit":"ng/mL","min":0,"max":0.04},{"name":"CPK-MB","unit":"U/L","min":0,"max":25},{"name":"CPK Total","unit":"U/L","min":30,"max":200}]}', 160);
+
+  /* ===== CLINICAL PATHOLOGY ===== */
+  INSERT INTO @Tests VALUES
+  (N'CP-URINE-R', N'Urine Routine & Microscopy', N'CLINICAL_PATHOLOGY', N'Urine', N'Container',
+   N'{"params":[{"name":"Color","unit":""},{"name":"Appearance","unit":""},{"name":"pH","unit":"","min":4.5,"max":8.0},{"name":"Specific Gravity","unit":"","min":1.005,"max":1.030},{"name":"Protein","unit":""},{"name":"Glucose","unit":""},{"name":"Ketones","unit":""},{"name":"Bilirubin","unit":""},{"name":"Urobilinogen","unit":""},{"name":"RBCs","unit":"/hpf","min":0,"max":2},{"name":"WBCs","unit":"/hpf","min":0,"max":5},{"name":"Epithelial Cells","unit":""},{"name":"Casts","unit":""},{"name":"Crystals","unit":""},{"name":"Bacteria","unit":""}]}', 200),
+
+  (N'CP-STOOL-R', N'Stool Routine & Microscopy', N'CLINICAL_PATHOLOGY', N'Stool', N'Container',
+   N'{"params":[{"name":"Color","unit":""},{"name":"Consistency","unit":""},{"name":"Occult Blood","unit":""},{"name":"Ova","unit":""},{"name":"Cysts","unit":""},{"name":"RBCs","unit":""},{"name":"WBCs","unit":""},{"name":"Mucus","unit":""}]}', 210),
+
+  (N'CP-UPT', N'Urine Pregnancy Test', N'CLINICAL_PATHOLOGY', N'Urine', N'Container',
+   N'{"params":[{"name":"Î²-hCG (Qualitative)","unit":""}]}', 220);
+
+  /* ===== SEROLOGY / IMMUNOLOGY ===== */
+  INSERT INTO @Tests VALUES
+  (N'SER-WIDAL', N'Widal Test', N'SEROLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"S. Typhi O","unit":"titre"},{"name":"S. Typhi H","unit":"titre"},{"name":"S. Paratyphi AO","unit":"titre"},{"name":"S. Paratyphi AH","unit":"titre"}]}', 300),
+
+  (N'SER-CRP', N'C-Reactive Protein (CRP)', N'SEROLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"CRP","unit":"mg/L","min":0,"max":6}]}', 310),
+
+  (N'SER-RA', N'Rheumatoid Factor (RA)', N'SEROLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"RA Factor","unit":"IU/mL","min":0,"max":14}]}', 320),
+
+  (N'SER-HIV', N'HIV I & II Antibody', N'SEROLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"HIV I & II","unit":""}]}', 330),
+
+  (N'SER-HBSAG', N'Hepatitis B Surface Antigen (HBsAg)', N'SEROLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"HBsAg","unit":""}]}', 340),
+
+  (N'SER-HCV', N'Hepatitis C Antibody (Anti-HCV)', N'SEROLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"Anti-HCV","unit":""}]}', 345),
+
+  (N'SER-DENGUE', N'Dengue NS1 / IgM / IgG', N'SEROLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"NS1 Antigen","unit":""},{"name":"Dengue IgM","unit":""},{"name":"Dengue IgG","unit":""}]}', 350);
+
+  /* ===== ENDOCRINOLOGY ===== */
+  INSERT INTO @Tests VALUES
+  (N'ENDO-THYROID', N'Thyroid Profile (T3, T4, TSH)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"T3","unit":"ng/dL","min":80,"max":200},{"name":"T4","unit":"Âµg/dL","min":5.1,"max":14.1},{"name":"TSH","unit":"ÂµIU/mL","min":0.27,"max":4.20}]}', 400),
+
+  (N'ENDO-PROLACTIN', N'Serum Prolactin', N'ENDOCRINOLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"Prolactin","unit":"ng/mL","min":2,"max":18}]}', 410),
+
+  (N'ENDO-CORTISOL', N'Serum Cortisol (Morning)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"Cortisol (AM)","unit":"Âµg/dL","min":6.2,"max":19.4}]}', 420),
+
+  (N'ENDO-VITD', N'Vitamin D (25-OH)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"25-OH Vitamin D","unit":"ng/mL","min":30,"max":100}]}', 430),
+
+  (N'ENDO-VITB12', N'Vitamin B12', N'ENDOCRINOLOGY', N'Serum', N'Plain',
+   N'{"params":[{"name":"Vitamin B12","unit":"pg/mL","min":200,"max":900}]}', 440);
+
+
+  /* ===== Insert only missing tests ===== */
+  INSERT INTO dbo.PathologyTestMaster (
+      TestId, HospitalId, TestCode, TestName, Category, SampleType, ContainerType,
+      ParameterSchemaJson, IsActive, SortOrder, CreatedAt, CreatedBy, UpdatedAt, UpdatedBy
+  )
+  SELECT
+      NEWID(), @HospitalId, t.TestCode, t.TestName, t.Category, t.SampleType, t.ContainerType,
+      t.ParameterSchemaJson, 1, t.SortOrder, @Now, @User, @Now, @User
+  FROM @Tests t
+  WHERE NOT EXISTS (
+      SELECT 1 FROM dbo.PathologyTestMaster pm
+      WHERE pm.HospitalId = @HospitalId AND pm.TestCode = t.TestCode
+  );
+
+  COMMIT TRAN;
+  PRINT N'Default pathology tests seeded successfully.';
+END TRY
+BEGIN CATCH
+  IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+  THROW;
+END CATCH;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/data/seed/seed_pathology_lab_categories.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+/* =========================================================
+   easyHMS â€“ Seed: Pathology Lab Test Categories + Sample Types + Default Report Templates
+   Idempotent DML â€“ safe to re-run.
+
+   This script seeds:
+   1. LookupType: LAB_TEST_CATEGORY, LAB_SAMPLE_TYPE
+   2. LookupMaster: Standard lab test categories (11) and sample types (11)
+   3. PathologyTestMaster: Commonly ordered tests with parameter schemas (per-hospital, seeded on first deploy)
+   ========================================================= */
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+BEGIN TRY
+  BEGIN TRAN;
+
+------------------------------------------------------------
+-- 1) LookupTypes for Lab Module
+------------------------------------------------------------
+;WITH lt(LookupTypeCode, [Description]) AS (
+  SELECT * FROM (VALUES
+    (N'LAB_TEST_CATEGORY', N'Pathology lab test categories (e.g. Biochemistry, Hematology)'),
+    (N'LAB_SAMPLE_TYPE',   N'Specimen/sample types used in the lab (e.g. Blood, Urine)')
+  ) a(LookupTypeCode, [Description])
+)
+MERGE dbo.LookupTypes AS t
+USING lt AS s
+  ON t.LookupTypeCode = s.LookupTypeCode
+WHEN NOT MATCHED THEN
+  INSERT (LookupTypeCode, [Description], IsActive, CreatedAt, ModifiedAt)
+  VALUES (s.LookupTypeCode, s.[Description], 1, SYSUTCDATETIME(), SYSUTCDATETIME())
+WHEN MATCHED AND (ISNULL(t.[Description],N'') <> s.[Description] OR t.IsActive = 0) THEN
+  UPDATE SET [Description] = s.[Description], IsActive = 1, ModifiedAt = SYSUTCDATETIME();
+
+------------------------------------------------------------
+-- 2) Lab Test Categories (LookupMaster)
+------------------------------------------------------------
+DECLARE @catTypeId INT = (SELECT LookupTypeId FROM dbo.LookupTypes WHERE LookupTypeCode = N'LAB_TEST_CATEGORY');
+
+;WITH cats(Code, Name, ShortDesc) AS (
+  SELECT * FROM (VALUES
+    (N'BIOCHEMISTRY',       N'Biochemistry',                N'Blood chemistry â€” glucose, lipids, enzymes, electrolytes, renal & liver function'),
+    (N'HEMATOLOGY',         N'Hematology',                  N'Blood cell analysis â€” CBC, ESR, blood film, reticulocyte count'),
+    (N'COAGULATION',        N'Coagulation',                 N'Clotting studies â€” PT/INR, APTT, fibrinogen, D-dimer'),
+    (N'CLINICAL_PATHOLOGY', N'Clinical Pathology',          N'Routine urine, stool, and body fluid analysis'),
+    (N'MICROBIOLOGY',       N'Microbiology',                N'Culture & sensitivity, Gram stain, AFB, fungal culture'),
+    (N'SEROLOGY',           N'Serology / Immunology',       N'Antibody/antigen testing â€” HIV, HBsAg, HCV, Widal, Dengue, RA factor, CRP'),
+    (N'HISTOPATHOLOGY',     N'Histopathology',              N'Microscopic tissue examination â€” biopsy, IHC, frozen section'),
+    (N'CYTOPATHOLOGY',      N'Cytopathology',               N'Cell-level analysis â€” PAP smear, FNAC, body fluid cytology'),
+    (N'ENDOCRINOLOGY',      N'Endocrinology / Hormones',    N'Hormone assays â€” thyroid (T3/T4/TSH), fertility, cortisol, insulin'),
+    (N'MOLECULAR',          N'Molecular Diagnostics',       N'DNA/RNA analysis â€” PCR, NGS, gene panels, viral loads'),
+    (N'TOXICOLOGY',         N'Toxicology',                  N'Drug levels, substance screening, therapeutic drug monitoring')
+  ) v(Code, Name, ShortDesc)
+)
+INSERT INTO dbo.LookupMaster (LookupId, LookupTypeId, Code, [Name], ShortDesc, IsActive, IsPinned, UsageCount, CreatedAt)
+SELECT NEWID(), @catTypeId, c.Code, c.Name, c.ShortDesc, 1, 0, 0, SYSUTCDATETIME()
+FROM cats c
+WHERE NOT EXISTS (
+    SELECT 1 FROM dbo.LookupMaster lm
+    WHERE lm.LookupTypeId = @catTypeId AND lm.Code = c.Code
+);
+
+------------------------------------------------------------
+-- 3) Lab Sample Types (LookupMaster)
+------------------------------------------------------------
+DECLARE @sampleTypeId INT = (SELECT LookupTypeId FROM dbo.LookupTypes WHERE LookupTypeCode = N'LAB_SAMPLE_TYPE');
+
+;WITH samples(Code, Name, ShortDesc) AS (
+  SELECT * FROM (VALUES
+    (N'WHOLE_BLOOD',  N'Whole Blood',           N'EDTA/Heparin tube â€” hematology, CBC'),
+    (N'SERUM',        N'Serum',                 N'Plain/SST tube, clotted â†’ centrifuge â€” biochemistry, serology'),
+    (N'PLASMA',       N'Plasma',                N'Anticoagulant tube â†’ centrifuge â€” coagulation, some chemistry'),
+    (N'URINE',        N'Urine',                 N'Random / mid-stream / 24-hour â€” routine, culture, biochemistry'),
+    (N'STOOL',        N'Stool',                 N'Container â€” routine, occult blood, ova & cysts'),
+    (N'CSF',          N'Cerebrospinal Fluid',   N'Lumbar puncture â€” microbiology, biochemistry, cytology'),
+    (N'TISSUE',       N'Tissue / Biopsy',       N'Formalin-fixed â€” histopathology, IHC'),
+    (N'SWAB',         N'Swab',                  N'Throat, nasal, wound, vaginal â€” microbiology culture'),
+    (N'SPUTUM',       N'Sputum',                N'Expectoration â€” AFB, culture, Gram stain'),
+    (N'BODY_FLUID',   N'Body Fluid',            N'Pleural, peritoneal, synovial â€” cytology, biochemistry'),
+    (N'BONE_MARROW',  N'Bone Marrow',           N'Aspiration / biopsy â€” hematology, special stains')
+  ) v(Code, Name, ShortDesc)
+)
+INSERT INTO dbo.LookupMaster (LookupId, LookupTypeId, Code, [Name], ShortDesc, IsActive, IsPinned, UsageCount, CreatedAt)
+SELECT NEWID(), @sampleTypeId, s.Code, s.Name, s.ShortDesc, 1, 0, 0, SYSUTCDATETIME()
+FROM samples s
+WHERE NOT EXISTS (
+    SELECT 1 FROM dbo.LookupMaster lm
+    WHERE lm.LookupTypeId = @sampleTypeId AND lm.Code = s.Code
+);
+
+  COMMIT TRAN;
+  PRINT N'Pathology lab categories & sample types seeded successfully.';
+END TRY
+BEGIN CATCH
+  IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+  THROW;
+END CATCH;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/data/seed/seed_pathology_report_templates.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+/* =========================================================
+   easyHMS â€“ Seed: Default Pathology Report Templates
+   Hospital-scoped â€” run ONCE per new hospital during onboarding.
+   Replace @HospitalId with the target hospital GUID.
+
+   Creates one report template per lab department/category.
+   The LayoutJson defines the visual structure of each report type.
+   ========================================================= */
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+-- !! Replace with actual hospital ID during onboarding !!
+DECLARE @HospitalId UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
+DECLARE @User NVARCHAR(100) = N'System';
+DECLARE @Now DATETIME2 = SYSUTCDATETIME();
+
+BEGIN TRY
+  BEGIN TRAN;
+
+  DECLARE @Templates TABLE (
+      TemplateCode  NVARCHAR(50)  NOT NULL,
+      TemplateName  NVARCHAR(200) NOT NULL,
+      LayoutJson    NVARCHAR(MAX) NOT NULL,
+      FooterText    NVARCHAR(MAX) NULL,
+      IsDefault     BIT           NOT NULL
+  );
+
+  INSERT INTO @Templates VALUES
+
+  -- 1. Standard Biochemistry Report
+  (N'TPL-BIOCHEM', N'Biochemistry Report',
+   N'{"reportTitle":"BIOCHEMISTRY REPORT","sections":[{"type":"patient_info","fields":["patientName","age","gender","patientId","referringDoctor","orderDate","reportDate","sampleType"]},{"type":"results_table","columns":["Parameter","Result","Unit","Reference Range","Flag"],"flagRules":{"low":"L","high":"H","normal":""}},{"type":"interpretation","label":"Interpretation / Comments"},{"type":"signature_block","fields":["pathologistName","qualification","signature"]}],"pageSize":"A4","orientation":"portrait"}',
+   N'* This report is electronically generated. Values marked H/L are outside the reference range. Clinical correlation is advised.', 1),
+
+  -- 2. Hematology Report
+  (N'TPL-HEMA', N'Hematology Report',
+   N'{"reportTitle":"HEMATOLOGY REPORT","sections":[{"type":"patient_info","fields":["patientName","age","gender","patientId","referringDoctor","orderDate","reportDate","sampleType"]},{"type":"results_table","columns":["Parameter","Result","Unit","Reference Range","Flag"],"flagRules":{"low":"L","high":"H","normal":""}},{"type":"wbc_differential","layout":"inline","params":["Neutrophils","Lymphocytes","Monocytes","Eosinophils","Basophils"]},{"type":"interpretation","label":"Interpretation / Comments"},{"type":"signature_block","fields":["pathologistName","qualification","signature"]}],"pageSize":"A4","orientation":"portrait"}',
+   N'* This report is electronically generated. Clinical correlation is recommended.', 0),
+
+  -- 3. Coagulation Report
+  (N'TPL-COAG', N'Coagulation Report',
+   N'{"reportTitle":"COAGULATION REPORT","sections":[{"type":"patient_info","fields":["patientName","age","gender","patientId","referringDoctor","orderDate","reportDate","sampleType"]},{"type":"results_table","columns":["Parameter","Result","Unit","Reference Range","Flag"],"flagRules":{"low":"L","high":"H","normal":""}},{"type":"clinical_note","label":"Note","defaultText":"Patient on anticoagulant therapy: ___"},{"type":"interpretation","label":"Interpretation"},{"type":"signature_block","fields":["pathologistName","qualification","signature"]}],"pageSize":"A4","orientation":"portrait"}',
+   N'* Please correlate with clinical history and medication.', 0),
+
+  -- 4. Clinical Pathology (Urine/Stool) Report
+  (N'TPL-CLINPATH', N'Clinical Pathology Report',
+   N'{"reportTitle":"CLINICAL PATHOLOGY REPORT","sections":[{"type":"patient_info","fields":["patientName","age","gender","patientId","referringDoctor","orderDate","reportDate","sampleType"]},{"type":"physical_exam","label":"Physical Examination","params":["Color","Appearance","pH","Specific Gravity"]},{"type":"chemical_exam","label":"Chemical Examination","params":["Protein","Glucose","Ketones","Bilirubin","Urobilinogen"]},{"type":"microscopy","label":"Microscopic Examination","params":["RBCs","WBCs","Epithelial Cells","Casts","Crystals","Bacteria"]},{"type":"interpretation","label":"Comments"},{"type":"signature_block","fields":["pathologistName","qualification","signature"]}],"pageSize":"A4","orientation":"portrait"}',
+   N'* Abnormal findings should be correlated clinically. Repeat testing may be advised.', 0),
+
+  -- 5. Microbiology (Culture & Sensitivity) Report
+  (N'TPL-MICRO', N'Microbiology Report',
+   N'{"reportTitle":"MICROBIOLOGY REPORT","sections":[{"type":"patient_info","fields":["patientName","age","gender","patientId","referringDoctor","orderDate","reportDate","sampleType"]},{"type":"specimen_info","fields":["sampleType","collectionDate","receivedDate"]},{"type":"gram_stain","label":"Direct Smear / Gram Stain"},{"type":"culture_result","label":"Culture Result","fields":["organism","colonyCount","incubationPeriod"]},{"type":"sensitivity_table","label":"Antibiotic Sensitivity","columns":["Antibiotic","MIC","Interpretation"],"interpretations":["S","I","R"]},{"type":"interpretation","label":"Comments"},{"type":"signature_block","fields":["pathologistName","qualification","signature"]}],"pageSize":"A4","orientation":"portrait"}',
+   N'* S = Sensitive, I = Intermediate, R = Resistant. Antibiotic susceptibility results are based on in-vitro testing.', 0),
+
+  -- 6. Serology / Immunology Report
+  (N'TPL-SERO', N'Serology / Immunology Report',
+   N'{"reportTitle":"SEROLOGY REPORT","sections":[{"type":"patient_info","fields":["patientName","age","gender","patientId","referringDoctor","orderDate","reportDate","sampleType"]},{"type":"results_table","columns":["Test","Result","Method","Cut-Off","Interpretation"]},{"type":"note","label":"Note","defaultText":"Results should be interpreted in conjunction with clinical findings."},{"type":"interpretation","label":"Comments"},{"type":"signature_block","fields":["pathologistName","qualification","signature"]}],"pageSize":"A4","orientation":"portrait"}',
+   N'* Reactive results require confirmatory testing as per NACO/NABL guidelines.', 0),
+
+  -- 7. Histopathology Report
+  (N'TPL-HISTO', N'Histopathology Report',
+   N'{"reportTitle":"HISTOPATHOLOGY REPORT","sections":[{"type":"patient_info","fields":["patientName","age","gender","patientId","referringDoctor","orderDate","reportDate"]},{"type":"clinical_info","label":"Clinical History & Indication"},{"type":"gross_description","label":"Gross Description"},{"type":"microscopic_description","label":"Microscopic Description"},{"type":"special_stains","label":"Special Stains / IHC","optional":true},{"type":"diagnosis","label":"Histopathological Diagnosis"},{"type":"tnm_staging","label":"TNM Staging","optional":true},{"type":"interpretation","label":"Comments"},{"type":"signature_block","fields":["pathologistName","qualification","signature"]}],"pageSize":"A4","orientation":"portrait"}',
+   N'* This report is based on the tissue specimen(s) received. Clinical correlation is essential.', 0),
+
+  -- 8. Cytopathology Report
+  (N'TPL-CYTO', N'Cytopathology Report',
+   N'{"reportTitle":"CYTOPATHOLOGY REPORT","sections":[{"type":"patient_info","fields":["patientName","age","gender","patientId","referringDoctor","orderDate","reportDate"]},{"type":"clinical_info","label":"Clinical History"},{"type":"specimen_adequacy","label":"Specimen Adequacy"},{"type":"cytological_findings","label":"Cytological Findings"},{"type":"bethesda_classification","label":"Bethesda Classification","optional":true},{"type":"diagnosis","label":"Cytological Diagnosis"},{"type":"interpretation","label":"Comments / Recommendations"},{"type":"signature_block","fields":["pathologistName","qualification","signature"]}],"pageSize":"A4","orientation":"portrait"}',
+   N'* Cytological examination cannot replace histopathological diagnosis. Biopsy may be recommended.', 0),
+
+  -- 9. Endocrinology / Hormones Report
+  (N'TPL-ENDO', N'Endocrinology / Hormone Report',
+   N'{"reportTitle":"HORMONE ASSAY REPORT","sections":[{"type":"patient_info","fields":["patientName","age","gender","patientId","referringDoctor","orderDate","reportDate","sampleType"]},{"type":"results_table","columns":["Parameter","Result","Unit","Reference Range","Flag"],"flagRules":{"low":"L","high":"H","normal":""}},{"type":"reference_note","label":"Note","defaultText":"Reference ranges may vary based on age, gender, and clinical context."},{"type":"interpretation","label":"Interpretation"},{"type":"signature_block","fields":["pathologistName","qualification","signature"]}],"pageSize":"A4","orientation":"portrait"}',
+   N'* Hormone levels can fluctuate with time of day, menstrual cycle, and medications. Clinical correlation is advised.', 0);
+
+
+  /* ===== Insert only missing templates ===== */
+  INSERT INTO dbo.PathologyReportTemplate (
+      TemplateId, HospitalId, TemplateCode, TemplateName,
+      LayoutJson, FooterText, IsDefault, IsActive,
+      CreatedAt, CreatedBy, UpdatedAt, UpdatedBy
+  )
+  SELECT
+      NEWID(), @HospitalId, t.TemplateCode, t.TemplateName,
+      t.LayoutJson, t.FooterText, t.IsDefault, 1,
+      @Now, @User, @Now, @User
+  FROM @Templates t
+  WHERE NOT EXISTS (
+      SELECT 1 FROM dbo.PathologyReportTemplate pt
+      WHERE pt.HospitalId = @HospitalId AND pt.TemplateCode = t.TemplateCode
+  );
+
+  COMMIT TRAN;
+  PRINT N'Default pathology report templates seeded successfully.';
+END TRY
+BEGIN CATCH
+  IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+  THROW;
+END CATCH;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/data/seed/seed_symptom_training_examples.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -26771,6 +27506,60 @@ BEGIN
 
 END
 GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/data/seed/seed_vita_service_role.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+/* =========================================================
+   easyHMS - Vita service-account role
+   Idempotent DML - safe to re-run.
+
+   Backs the Vita voice-assistant orchestrator's staff-equivalent credential
+   (a real, per-hospital User provisioned via the existing
+   POST admin/users/quick-add flow, assigned this role). Deliberately its own
+   bespoke role, not a reuse/broadening of Receptionist/Nurse/etc: this keeps
+   the role's RolePermissions rows the single, surgical revocation lever for
+   that credential -- see EasyHMSAPI.Api/Common/PermissionAuthorizationFilter.cs,
+   which re-resolves UserRoles -> Roles -> RolePermissions live (60s cache),
+   so deleting/disabling this role's grants neutralizes an already-issued,
+   unexpired JWT within 60 seconds without touching any other role.
+
+   Permission set is deliberately minimal: exactly the two keys needed for the
+   voice-assistant's staff-facing actions (queue check-in today; appointment
+   booking/reschedule/cancel/confirm-pre-appointment and patient-profile
+   editing as later fast-follow phases) -- appointment_scheduler,
+   appointment_booking, patients. Everything else (billing, admin_panel, ipd,
+   inventory, pharmacy, icu_board, ot_board, ...) is intentionally excluded.
+   ========================================================= */
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+DECLARE @VitaRoleID uniqueidentifier;
+DECLARE @now datetime2(3) = SYSUTCDATETIME();
+
+MERGE dbo.Roles AS t
+USING (SELECT N'VitaServiceAccount' AS RoleName, N'Voice-assistant service account -- staff-equivalent credential for Vita, scoped to queue/appointment/patient actions only' AS [Description]) AS s
+   ON t.HospitalID IS NULL AND t.RoleName = s.RoleName
+WHEN NOT MATCHED THEN
+  INSERT (RoleID, HospitalID, RoleName, [Description], IsSystemDefined, IsActive, CreatedByUserID, CreatedAt)
+  VALUES (NEWID(), NULL, s.RoleName, s.[Description], 1, 1, NULL, @now)
+WHEN MATCHED THEN
+  UPDATE SET t.[Description] = s.[Description], t.IsSystemDefined = 1, t.IsActive = 1;
+
+SELECT @VitaRoleID = RoleID FROM dbo.Roles WHERE HospitalID IS NULL AND RoleName = N'VitaServiceAccount';
+
+MERGE dbo.RolePermissions AS t
+USING (SELECT @VitaRoleID AS RoleID, v.PermissionKey
+       FROM (VALUES (N'appointment_scheduler'), (N'patients')) v(PermissionKey)) AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+PRINT N'Vita service-account role seed executed.';
 
 GO
 

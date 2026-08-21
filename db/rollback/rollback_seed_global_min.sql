@@ -100,9 +100,15 @@ WHERE R.HospitalID IS NULL
   );
 
 -- 4b) Roles themselves (global, system-defined)
+-- NOTE: 4a above was already out of sync with the forward seed's full permission-key list
+-- before this edit (missing ipd/ot_board/icu_board/etc, and Lab Technician/Pharmacist/
+-- Coordinator's pathology/pharmacy/print_preview) -- pre-existing drift, left as-is here;
+-- only the role-name list below (which this script's own DELETE actually depends on) is
+-- kept in sync.
 DELETE FROM dbo.Roles
 WHERE HospitalID IS NULL
-  AND RoleName IN (N'Admin', N'AdminDoctor', N'Receptionist', N'Nurse', N'Doctor', N'Accountant')
+  AND RoleName IN (N'Admin', N'AdminDoctor', N'Receptionist', N'Nurse', N'Doctor', N'Accountant',
+                   N'Lab Technician', N'Pharmacist', N'Coordinator')
   AND IsSystemDefined = 1;
 
 

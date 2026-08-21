@@ -115,7 +115,10 @@ DECLARE @now datetime2(3) = SYSUTCDATETIME();
     (N'Receptionist',N'Limited access to appointment related features'),
     (N'Nurse',       N'Can view and manage scheduling'),
     (N'Doctor',      N'Access limited to doctor board only'),
-    (N'Accountant',  N'Access to billing and financial features')
+    (N'Accountant',  N'Access to billing and financial features'),
+    (N'Lab Technician',N'Access limited to the pathology lab board only'),
+    (N'Pharmacist',  N'Access limited to the pharmacy retail board only'),
+    (N'Coordinator', N'Access to OT, ICU, inventory, and IPD boards only')
   ) s(RoleName,[Description])
 )
 MERGE dbo.Roles AS t
@@ -138,7 +141,8 @@ WHEN MATCHED THEN
 INSERT INTO @Roles(RoleName, RoleID)
 SELECT RoleName, RoleID
 FROM dbo.Roles
-WHERE RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor',N'Accountant');
+WHERE RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor',N'Accountant',
+                   N'Lab Technician',N'Pharmacist',N'Coordinator');
 
 -- Ensure required permissions exist (already merged above)
 
@@ -216,6 +220,38 @@ USING (SELECT r.RoleID, v.PermissionKey
        FROM @Roles r
        CROSS JOIN (VALUES (N'billing'),(N'print_preview')) v(PermissionKey)
        WHERE r.RoleName = N'Accountant') AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- Lab Technician: pathology board only (plus print_preview, same as every other
+-- non-admin/non-doctor operational role, for printing lab reports)
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'pathology'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Lab Technician') AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- Pharmacist: pharmacy retail board only (plus print_preview, for medication labels)
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'pharmacy'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Pharmacist') AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- Coordinator: OT, ICU, inventory, and IPD boards only (plus print_preview, e.g. OT
+-- consent forms / discharge summaries)
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'ot_board'),(N'icu_board'),(N'inventory'),(N'ipd'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Coordinator') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;

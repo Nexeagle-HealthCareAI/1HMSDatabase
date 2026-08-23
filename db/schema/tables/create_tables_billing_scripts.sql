@@ -194,6 +194,16 @@ CREATE TABLE dbo.Encounter
     CONSTRAINT PK_Encounter PRIMARY KEY CLUSTERED (EncounterId)
 );
 END
+GO
+
+-- Existing DBs: optional visit-date override, chosen once at visit creation. NULL means every
+-- charge/invoice on this encounter uses the real current time, unchanged from before this column
+-- existed. When set, AddChargeEventHandler/CreateDraftInvoiceHandler use it instead.
+IF COL_LENGTH('dbo.Encounter','ServiceDate') IS NULL
+BEGIN
+  ALTER TABLE dbo.Encounter ADD ServiceDate DATETIME2(3) NULL;
+END
+GO
 
 IF OBJECT_ID('dbo.BillingChargeEvent','U') IS NULL
 BEGIN

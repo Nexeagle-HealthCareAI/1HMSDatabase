@@ -194,6 +194,16 @@ CREATE TABLE dbo.Encounter
     CONSTRAINT PK_Encounter PRIMARY KEY CLUSTERED (EncounterId)
 );
 END
+GO
+
+-- Existing DBs: optional visit-date override, chosen once at visit creation. NULL means every
+-- charge/invoice on this encounter uses the real current time, unchanged from before this column
+-- existed. When set, AddChargeEventHandler/CreateDraftInvoiceHandler use it instead.
+IF COL_LENGTH('dbo.Encounter','ServiceDate') IS NULL
+BEGIN
+  ALTER TABLE dbo.Encounter ADD ServiceDate DATETIME2(3) NULL;
+END
+GO
 
 IF OBJECT_ID('dbo.BillingChargeEvent','U') IS NULL
 BEGIN
@@ -265,6 +275,19 @@ BEGIN
 END
 GO
 
+-- Existing DBs: add backdated-billing audit columns to BillingChargeEvent if not already present.
+IF COL_LENGTH('dbo.BillingChargeEvent','IsBackdated') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingChargeEvent ADD IsBackdated BIT NOT NULL CONSTRAINT DF_BCE_IsBackdated DEFAULT (0);
+END
+GO
+
+IF COL_LENGTH('dbo.BillingChargeEvent','BackdateReason') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingChargeEvent ADD BackdateReason NVARCHAR(500) NULL;
+END
+GO
+
 
 IF OBJECT_ID('dbo.BillingInvoice','U') IS NULL
 BEGIN
@@ -305,6 +328,20 @@ BEGIN
     CONSTRAINT PK_BillingInvoice PRIMARY KEY CLUSTERED (InvoiceId)
   );
 END
+GO
+
+-- Existing DBs: add backdated-billing audit columns to BillingInvoice if not already present.
+IF COL_LENGTH('dbo.BillingInvoice','IsBackdated') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingInvoice ADD IsBackdated BIT NOT NULL CONSTRAINT DF_INV_IsBackdated DEFAULT (0);
+END
+GO
+
+IF COL_LENGTH('dbo.BillingInvoice','BackdateReason') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingInvoice ADD BackdateReason NVARCHAR(500) NULL;
+END
+GO
 
 
 IF OBJECT_ID('dbo.BillingInvoiceChargeEvent','U') IS NULL

@@ -265,6 +265,19 @@ BEGIN
 END
 GO
 
+-- Existing DBs: add backdated-billing audit columns to BillingChargeEvent if not already present.
+IF COL_LENGTH('dbo.BillingChargeEvent','IsBackdated') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingChargeEvent ADD IsBackdated BIT NOT NULL CONSTRAINT DF_BCE_IsBackdated DEFAULT (0);
+END
+GO
+
+IF COL_LENGTH('dbo.BillingChargeEvent','BackdateReason') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingChargeEvent ADD BackdateReason NVARCHAR(500) NULL;
+END
+GO
+
 
 IF OBJECT_ID('dbo.BillingInvoice','U') IS NULL
 BEGIN

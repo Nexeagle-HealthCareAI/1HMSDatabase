@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-08-20 12:25  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-08-27 15:42  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -1709,6 +1709,16 @@ CREATE TABLE dbo.Encounter
     CONSTRAINT PK_Encounter PRIMARY KEY CLUSTERED (EncounterId)
 );
 END
+GO
+
+-- Existing DBs: optional visit-date override, chosen once at visit creation. NULL means every
+-- charge/invoice on this encounter uses the real current time, unchanged from before this column
+-- existed. When set, AddChargeEventHandler/CreateDraftInvoiceHandler use it instead.
+IF COL_LENGTH('dbo.Encounter','ServiceDate') IS NULL
+BEGIN
+  ALTER TABLE dbo.Encounter ADD ServiceDate DATETIME2(3) NULL;
+END
+GO
 
 IF OBJECT_ID('dbo.BillingChargeEvent','U') IS NULL
 BEGIN
@@ -1780,6 +1790,19 @@ BEGIN
 END
 GO
 
+-- Existing DBs: add backdated-billing audit columns to BillingChargeEvent if not already present.
+IF COL_LENGTH('dbo.BillingChargeEvent','IsBackdated') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingChargeEvent ADD IsBackdated BIT NOT NULL CONSTRAINT DF_BCE_IsBackdated DEFAULT (0);
+END
+GO
+
+IF COL_LENGTH('dbo.BillingChargeEvent','BackdateReason') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingChargeEvent ADD BackdateReason NVARCHAR(500) NULL;
+END
+GO
+
 
 IF OBJECT_ID('dbo.BillingInvoice','U') IS NULL
 BEGIN
@@ -1820,6 +1843,20 @@ BEGIN
     CONSTRAINT PK_BillingInvoice PRIMARY KEY CLUSTERED (InvoiceId)
   );
 END
+GO
+
+-- Existing DBs: add backdated-billing audit columns to BillingInvoice if not already present.
+IF COL_LENGTH('dbo.BillingInvoice','IsBackdated') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingInvoice ADD IsBackdated BIT NOT NULL CONSTRAINT DF_INV_IsBackdated DEFAULT (0);
+END
+GO
+
+IF COL_LENGTH('dbo.BillingInvoice','BackdateReason') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingInvoice ADD BackdateReason NVARCHAR(500) NULL;
+END
+GO
 
 
 IF OBJECT_ID('dbo.BillingInvoiceChargeEvent','U') IS NULL
@@ -8814,6 +8851,22 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathology_result_reportid_nullable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Make PathologyResult.ReportId nullable
+-- Results are entered before a report is generated, so ReportId must allow NULL.
+
+IF COL_LENGTH('dbo.PathologyResult', 'ReportId') IS NOT NULL
+BEGIN
+    ALTER TABLE dbo.PathologyResult ALTER COLUMN ReportId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_patientregistrations_add_mobile_index.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -9826,6 +9879,46 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
     CREATE UNIQUE INDEX UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId
     ON dbo.DoctorDischargeFieldConfigs(DoctorId, HospitalId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_discharge_config_tables__add_system_default_letterhead.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: System-generated default letterhead as an explicit, selectable choice
+-- Description: Adds UseSystemDefaultLetterhead to PrescriptionSettings and
+--              DischargeSettings. Previously the system-generated default
+--              letterhead only ever appeared as a silent runtime fallback when
+--              no template happened to be uploaded -- there was no way for an
+--              admin to deliberately choose it. Kept as its own flag rather
+--              than inferred from URI being NULL so switching to the default
+--              doesn't destroy an already-uploaded template: flipping the flag
+--              back off restores it without re-uploading. Defaults to 0 --
+--              every existing row keeps today's exact behavior.
+-- Named to sort after create_discharge_config_tables.sql (migrations apply in
+-- filename order) since it adds a column to a table that file creates.
+-- PrescriptionSettings itself lives in db/schema/tables (applied before every
+-- migration), so no ordering concern there.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PrescriptionSettings', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.PrescriptionSettings', 'UseSystemDefaultLetterhead') IS NULL
+        ALTER TABLE dbo.PrescriptionSettings ADD UseSystemDefaultLetterhead BIT NOT NULL
+            CONSTRAINT DF_PrescriptionSettings_UseSystemDefault DEFAULT (0);
+END
+GO
+
+IF OBJECT_ID('dbo.DischargeSettings', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.DischargeSettings', 'UseSystemDefaultLetterhead') IS NULL
+        ALTER TABLE dbo.DischargeSettings ADD UseSystemDefaultLetterhead BIT NOT NULL
+            CONSTRAINT DF_DischargeSettings_UseSystemDefault DEFAULT (0);
+END
 GO
 
 GO
@@ -12393,7 +12486,10 @@ DECLARE @now datetime2(3) = SYSUTCDATETIME();
     (N'Receptionist',N'Limited access to appointment related features'),
     (N'Nurse',       N'Can view and manage scheduling'),
     (N'Doctor',      N'Access limited to doctor board only'),
-    (N'Accountant',  N'Access to billing and financial features')
+    (N'Accountant',  N'Access to billing and financial features'),
+    (N'Lab Technician',N'Access limited to the pathology lab board only'),
+    (N'Pharmacist',  N'Access limited to the pharmacy retail board only'),
+    (N'Coordinator', N'Access to OT, ICU, inventory, and IPD boards only')
   ) s(RoleName,[Description])
 )
 MERGE dbo.Roles AS t
@@ -12416,7 +12512,8 @@ WHEN MATCHED THEN
 INSERT INTO @Roles(RoleName, RoleID)
 SELECT RoleName, RoleID
 FROM dbo.Roles
-WHERE RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor',N'Accountant');
+WHERE RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor',N'Accountant',
+                   N'Lab Technician',N'Pharmacist',N'Coordinator');
 
 -- Ensure required permissions exist (already merged above)
 
@@ -12494,6 +12591,38 @@ USING (SELECT r.RoleID, v.PermissionKey
        FROM @Roles r
        CROSS JOIN (VALUES (N'billing'),(N'print_preview')) v(PermissionKey)
        WHERE r.RoleName = N'Accountant') AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- Lab Technician: pathology board only (plus print_preview, same as every other
+-- non-admin/non-doctor operational role, for printing lab reports)
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'pathology'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Lab Technician') AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- Pharmacist: pharmacy retail board only (plus print_preview, for medication labels)
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'pharmacy'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Pharmacist') AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- Coordinator: OT, ICU, inventory, and IPD boards only (plus print_preview, e.g. OT
+-- consent forms / discharge summaries)
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'ot_board'),(N'icu_board'),(N'inventory'),(N'ipd'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Coordinator') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;

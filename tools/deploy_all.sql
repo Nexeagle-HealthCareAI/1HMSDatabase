@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-08-27 15:42  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-08-28 12:53  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -11349,6 +11349,24 @@ IF OBJECT_ID('dbo.AbhaAccount', 'U') IS NOT NULL
 BEGIN
     IF COL_LENGTH('dbo.AbhaAccount', 'Email') IS NULL
         ALTER TABLE dbo.AbhaAccount ADD Email NVARCHAR(200) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_tables_doctor_fee__add_free_follow_up_days.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds the per-doctor free-follow-up window (in days) used by AppointmentTypeResolver to
+-- decide New / Old-Fee / Old-No-Fee. 0 = no free window at all (every visit is chargeable) --
+-- this is the opposite polarity of PrescriptionSetting.ValidDuration's "0 = never expires",
+-- so it is deliberately its own column rather than reusing that field.
+IF COL_LENGTH('dbo.DoctorFee', 'FreeFollowUpDays') IS NULL
+BEGIN
+  ALTER TABLE dbo.DoctorFee
+    ADD FreeFollowUpDays INT NOT NULL CONSTRAINT DF_DF_FreeFollowUpDays DEFAULT (0);
 END
 GO
 

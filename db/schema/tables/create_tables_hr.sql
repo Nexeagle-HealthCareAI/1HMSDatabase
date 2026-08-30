@@ -9,6 +9,7 @@ BEGIN
         EmployeeCode NVARCHAR(50) NOT NULL,
         FirstName NVARCHAR(100) NOT NULL,
         LastName NVARCHAR(100) NOT NULL,
+        UserId UNIQUEIDENTIFIER NULL,
         Gender NVARCHAR(20) NOT NULL,
         DateOfBirth DATE NOT NULL,
         BloodGroup NVARCHAR(10) NULL,

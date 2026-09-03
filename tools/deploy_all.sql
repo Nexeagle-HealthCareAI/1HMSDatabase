@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-09-03 19:54  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-09-03 23:58  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -6021,6 +6021,97 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pharmacy_return.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3d: patient return/restock ledger. Deliberately separate from
+-- BillingInvoice/BillingChargeEvent â€” no partial-qty adjustment primitive exists on a charge event
+-- today, and voiding+reposting the whole line was rejected, so the return and its refund amount
+-- live entirely here. The original invoice rows are never touched by this workflow.
+
+IF OBJECT_ID('dbo.PharmacyReturn','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PharmacyReturn
+  (
+    ReturnId           UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PHRET_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
+    InvoiceId          UNIQUEIDENTIFIER NOT NULL,
+    InvoiceNo          NVARCHAR(30)     NULL,
+    PatientId          NVARCHAR(50)     NULL,
+    EncounterId        UNIQUEIDENTIFIER NOT NULL,
+
+    ReturnNo           NVARCHAR(30)     NOT NULL,
+    TotalRefundAmount  DECIMAL(18,2)    NOT NULL CONSTRAINT DF_PHRET_TotalRefund DEFAULT (0),
+    RefundMode         NVARCHAR(20)     NULL,
+    Notes              NVARCHAR(500)    NULL,
+
+    ReturnedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PHRET_ReturnedAt DEFAULT SYSUTCDATETIME(),
+    ReturnedBy         NVARCHAR(200)    NULL,
+    ReturnedByUserId   UNIQUEIDENTIFIER NULL,
+
+    CreatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_PHRET_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_PharmacyReturn PRIMARY KEY CLUSTERED (ReturnId),
+    CONSTRAINT UX_PHRET_Number UNIQUE (HospitalId, ReturnNo),
+    CONSTRAINT FK_PHRET_Invoice FOREIGN KEY (InvoiceId) REFERENCES dbo.BillingInvoice(InvoiceId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PHRET_HospitalTime' AND object_id=OBJECT_ID('dbo.PharmacyReturn'))
+BEGIN
+  CREATE INDEX IX_PHRET_HospitalTime
+  ON dbo.PharmacyReturn(HospitalId, ReturnedAt DESC);
+END
+GO
+
+IF OBJECT_ID('dbo.PharmacyReturnLine','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PharmacyReturnLine
+  (
+    ReturnLineId    UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PHRETL_Id DEFAULT NEWSEQUENTIALID(),
+
+    ReturnId        UNIQUEIDENTIFIER NOT NULL,
+    ChargeEventId   UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId UNIQUEIDENTIFIER NOT NULL,
+    BatchId         UNIQUEIDENTIFIER NOT NULL,
+    ReturnedQty     DECIMAL(18,3)    NOT NULL,
+    UnitPrice       DECIMAL(18,2)    NOT NULL,
+    RefundAmount    DECIMAL(18,2)    NOT NULL,
+
+    CONSTRAINT PK_PharmacyReturnLine PRIMARY KEY CLUSTERED (ReturnLineId),
+    CONSTRAINT FK_PHRETL_Return FOREIGN KEY (ReturnId) REFERENCES dbo.PharmacyReturn(ReturnId) ON DELETE CASCADE,
+    CONSTRAINT FK_PHRETL_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT FK_PHRETL_Batch FOREIGN KEY (BatchId) REFERENCES dbo.Batch(BatchId),
+    CONSTRAINT CK_PHRETL_Qty CHECK (ReturnedQty > 0),
+    CONSTRAINT CK_PHRETL_UnitPrice CHECK (UnitPrice >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PHRETL_Return' AND object_id=OBJECT_ID('dbo.PharmacyReturnLine'))
+BEGIN
+  CREATE INDEX IX_PHRETL_Return
+  ON dbo.PharmacyReturnLine(ReturnId);
+END
+GO
+
+-- Re-validation of the returnable ceiling (dispensed minus already-returned) filters on
+-- (ChargeEventId, BatchId) on every call â€” see GetReturnableInvoiceLinesHandler / CreatePharmacyReturnHandler.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PHRETL_ChargeEventBatch' AND object_id=OBJECT_ID('dbo.PharmacyReturnLine'))
+BEGIN
+  CREATE INDEX IX_PHRETL_ChargeEventBatch
+  ON dbo.PharmacyReturnLine(ChargeEventId, BatchId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_pharmacy_salt_composition.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -6121,6 +6212,85 @@ BEGIN
 
   CREATE INDEX IX_DSRE_Hospital_RecordedAt ON dbo.DrugScheduleRegisterEntry (HospitalId, RecordedAt DESC);
   CREATE INDEX IX_DSRE_Item ON dbo.DrugScheduleRegisterEntry (InventoryItemId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pharmacy_vendor_return.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3d: return-to-vendor (RTV) debit note. Stock is deducted for real via the shared
+-- InventoryMovement handler (ADJUST_OUT) before this note is written â€” these two tables are the
+-- vendor-facing paper trail, not the source of truth for stock.
+
+IF OBJECT_ID('dbo.VendorReturnNote','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.VendorReturnNote
+  (
+    VendorReturnId    UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_RTV_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+    VendorId          UNIQUEIDENTIFIER NOT NULL,
+
+    ReturnNoteNo      NVARCHAR(30)     NOT NULL,
+    TotalQty          DECIMAL(18,3)    NOT NULL CONSTRAINT DF_RTV_TotalQty DEFAULT (0),
+    TotalValue        DECIMAL(18,2)    NOT NULL CONSTRAINT DF_RTV_TotalValue DEFAULT (0),
+    Notes             NVARCHAR(500)    NULL,
+
+    GeneratedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_RTV_GeneratedAt DEFAULT SYSUTCDATETIME(),
+    GeneratedBy       NVARCHAR(200)    NULL,
+    GeneratedByUserId UNIQUEIDENTIFIER NULL,
+
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_RTV_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_VendorReturnNote PRIMARY KEY CLUSTERED (VendorReturnId),
+    CONSTRAINT UX_RTV_Number UNIQUE (HospitalId, ReturnNoteNo),
+    CONSTRAINT FK_RTV_Vendor FOREIGN KEY (VendorId) REFERENCES dbo.Vendor(VendorId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_RTV_HospitalVendor' AND object_id=OBJECT_ID('dbo.VendorReturnNote'))
+BEGIN
+  CREATE INDEX IX_RTV_HospitalVendor
+  ON dbo.VendorReturnNote(HospitalId, VendorId, GeneratedAt DESC);
+END
+GO
+
+IF OBJECT_ID('dbo.VendorReturnLine','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.VendorReturnLine
+  (
+    VendorReturnLineId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_RTVL_Id DEFAULT NEWSEQUENTIALID(),
+
+    VendorReturnId      UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId      UNIQUEIDENTIFIER NOT NULL,
+    BatchId              UNIQUEIDENTIFIER NOT NULL,
+    BatchNumber          NVARCHAR(50)     NULL,
+    ExpiryDate           DATETIME2(3)     NULL,
+    Qty                  DECIMAL(18,3)    NOT NULL,
+    UnitCost             DECIMAL(18,2)    NOT NULL,
+    LineValue            DECIMAL(18,2)    NOT NULL,
+
+    CONSTRAINT PK_VendorReturnLine PRIMARY KEY CLUSTERED (VendorReturnLineId),
+    CONSTRAINT FK_RTVL_Return FOREIGN KEY (VendorReturnId) REFERENCES dbo.VendorReturnNote(VendorReturnId) ON DELETE CASCADE,
+    CONSTRAINT FK_RTVL_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT FK_RTVL_Batch FOREIGN KEY (BatchId) REFERENCES dbo.Batch(BatchId),
+    CONSTRAINT CK_RTVL_Qty CHECK (Qty > 0),
+    CONSTRAINT CK_RTVL_UnitCost CHECK (UnitCost >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_RTVL_Return' AND object_id=OBJECT_ID('dbo.VendorReturnLine'))
+BEGIN
+  CREATE INDEX IX_RTVL_Return
+  ON dbo.VendorReturnLine(VendorReturnId);
 END
 GO
 

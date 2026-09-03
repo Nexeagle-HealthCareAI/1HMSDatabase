@@ -5754,7 +5754,7 @@ BEGIN
     UpdatedBy                NVARCHAR(100)    NULL,
 
     CONSTRAINT PK_PharmacyPrintSettings PRIMARY KEY CLUSTERED (PharmacyPrintSettingsId),
-    CONSTRAINT FK_PPS_Hospital FOREIGN KEY (HospitalId) REFERENCES dbo.Hospital(HospitalID)
+    CONSTRAINT FK_PPS_Hospital FOREIGN KEY (HospitalId) REFERENCES dbo.Hospitals(HospitalID)
   );
 
   CREATE UNIQUE INDEX UX_PPS_Hospital ON dbo.PharmacyPrintSettings (HospitalId);

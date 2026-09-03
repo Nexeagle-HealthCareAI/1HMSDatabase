@@ -7495,6 +7495,35 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_batch_add_mrp_and_barcode.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3a: Batch.MRP (retail price at batch level, since MRP can differ per batch)
+-- and Batch.BarcodeValue (keyboard-wedge scan lookup key) for POS dispensing.
+IF COL_LENGTH('dbo.Batch', 'MRP') IS NULL
+BEGIN
+  ALTER TABLE dbo.Batch
+    ADD MRP DECIMAL(18,2) NULL;
+END
+GO
+
+IF COL_LENGTH('dbo.Batch', 'BarcodeValue') IS NULL
+BEGIN
+  ALTER TABLE dbo.Batch
+    ADD BarcodeValue NVARCHAR(100) NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_BATCH_BarcodeValue' AND object_id = OBJECT_ID('dbo.Batch'))
+BEGIN
+  CREATE INDEX IX_BATCH_BarcodeValue ON dbo.Batch (BarcodeValue) WHERE BarcodeValue IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_bedmaster_room_id.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8759,6 +8788,35 @@ BEGIN
         ON dbo.MedicineMaster(SourceKey)
         WHERE SourceKey IS NOT NULL;
     END
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_medicinemaster_add_inventoryitem_link.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3a: links the prescription-side MedicineMaster catalog to the stock-side
+-- InventoryItem catalog, so POS search can join both without merging the two tables.
+IF COL_LENGTH('dbo.MedicineMaster', 'InventoryItemId') IS NULL
+BEGIN
+  ALTER TABLE dbo.MedicineMaster
+    ADD InventoryItemId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_MedicineMaster_InventoryItem')
+BEGIN
+  ALTER TABLE dbo.MedicineMaster
+    ADD CONSTRAINT FK_MedicineMaster_InventoryItem FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_MedicineMaster_InventoryItemId' AND object_id = OBJECT_ID('dbo.MedicineMaster'))
+BEGIN
+  CREATE INDEX IX_MedicineMaster_InventoryItemId ON dbo.MedicineMaster (InventoryItemId) WHERE InventoryItemId IS NOT NULL;
 END
 GO
 

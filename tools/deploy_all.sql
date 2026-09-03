@@ -5727,6 +5727,85 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pharmacy_print_settings.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+IF OBJECT_ID('dbo.PharmacyPrintSettings','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PharmacyPrintSettings
+  (
+    PharmacyPrintSettingsId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PPS_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId              UNIQUEIDENTIFIER NOT NULL,
+
+    TradeName               NVARCHAR(200)    NULL,
+    Dl20BNumber              NVARCHAR(100)    NULL,
+    Dl21BNumber              NVARCHAR(100)    NULL,
+    FssaiNumber              NVARCHAR(50)     NULL,
+    PharmacistName           NVARCHAR(150)    NULL,
+    PharmacistRegNo          NVARCHAR(100)    NULL,
+    ReturnPolicyText         NVARCHAR(1000)   NULL,
+    ShowVerificationQr       BIT              NOT NULL CONSTRAINT DF_PPS_ShowQr DEFAULT (1),
+
+    CreatedAt                DATETIME2(3)     NOT NULL CONSTRAINT DF_PPS_CreatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedAt                DATETIME2(3)     NOT NULL CONSTRAINT DF_PPS_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy                NVARCHAR(100)    NULL,
+
+    CONSTRAINT PK_PharmacyPrintSettings PRIMARY KEY CLUSTERED (PharmacyPrintSettingsId),
+    CONSTRAINT FK_PPS_Hospital FOREIGN KEY (HospitalId) REFERENCES dbo.Hospital(HospitalID)
+  );
+
+  CREATE UNIQUE INDEX UX_PPS_Hospital ON dbo.PharmacyPrintSettings (HospitalId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pharmacy_schedule_register.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+IF OBJECT_ID('dbo.DrugScheduleRegisterEntry','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.DrugScheduleRegisterEntry
+  (
+    RegisterEntryId   UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_DSRE_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId   UNIQUEIDENTIFIER NOT NULL,
+    BatchId           UNIQUEIDENTIFIER NOT NULL,
+    StoreId           UNIQUEIDENTIFIER NOT NULL,
+
+    ScheduleClass     NVARCHAR(20)     NOT NULL,
+    Qty               DECIMAL(18,3)    NOT NULL,
+
+    PatientId         NVARCHAR(50)     NULL,
+    EncounterId       UNIQUEIDENTIFIER NULL,
+    PrescriberRef     NVARCHAR(200)    NULL,
+
+    DispensedBy       NVARCHAR(100)    NULL,
+    DispensedByUserId UNIQUEIDENTIFIER NULL,
+
+    RecordedAt        DATETIME2(3)     NOT NULL CONSTRAINT DF_DSRE_RecordedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_DrugScheduleRegisterEntry PRIMARY KEY CLUSTERED (RegisterEntryId),
+    CONSTRAINT FK_DSRE_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT FK_DSRE_Batch FOREIGN KEY (BatchId) REFERENCES dbo.Batch(BatchId),
+    CONSTRAINT FK_DSRE_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId)
+  );
+
+  CREATE INDEX IX_DSRE_Hospital_RecordedAt ON dbo.DrugScheduleRegisterEntry (HospitalId, RecordedAt DESC);
+  CREATE INDEX IX_DSRE_Item ON dbo.DrugScheduleRegisterEntry (InventoryItemId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_rate_card.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;

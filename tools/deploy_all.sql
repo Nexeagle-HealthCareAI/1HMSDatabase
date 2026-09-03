@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-08-29 16:07  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-09-03 19:00  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -3284,6 +3284,258 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_hr.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- HR Suite Tables: Employee Management, Roster, Attendance, Leaves, and Payroll
+
+-- 1. HrEmployees
+IF OBJECT_ID('dbo.HrEmployees', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrEmployees (
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrEmployee_Id DEFAULT NEWSEQUENTIALID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        EmployeeCode NVARCHAR(50) NOT NULL,
+        FirstName NVARCHAR(100) NOT NULL,
+        LastName NVARCHAR(100) NOT NULL,
+        UserId UNIQUEIDENTIFIER NULL,
+        Gender NVARCHAR(20) NOT NULL,
+        DateOfBirth DATE NOT NULL,
+        BloodGroup NVARCHAR(10) NULL,
+        ContactNumber NVARCHAR(20) NOT NULL,
+        Email NVARCHAR(150) NULL,
+        PhotoObjectUrl NVARCHAR(500) NULL,
+        EmploymentType NVARCHAR(50) NOT NULL,
+        DepartmentId UNIQUEIDENTIFIER NOT NULL,
+        Designation NVARCHAR(100) NOT NULL,
+        ReportingManagerId UNIQUEIDENTIFIER NULL,
+        DateOfJoining DATE NOT NULL,
+        ProbationEndDate DATE NULL,
+        PanNumber NVARCHAR(20) NOT NULL,
+        AadhaarNumberHash NVARCHAR(128) NULL,
+        UanNumber NVARCHAR(30) NULL,
+        EsiNumber NVARCHAR(30) NULL,
+        BankName NVARCHAR(100) NULL,
+        BankAccountNumber NVARCHAR(50) NULL,
+        BankIfsc NVARCHAR(20) NULL,
+        PayrollTrack NVARCHAR(30) NOT NULL CONSTRAINT DF_HrEmployee_PayrollTrack DEFAULT 'TRACK_A_SALARIED',
+        IsActive BIT NOT NULL CONSTRAINT DF_HrEmployee_IsActive DEFAULT 1,
+        Status NVARCHAR(20) NOT NULL CONSTRAINT DF_HrEmployee_Status DEFAULT 'ACTIVE',
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrEmployee_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy NVARCHAR(100) NULL,
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrEmployee_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy NVARCHAR(100) NULL,
+        RowVersion ROWVERSION NULL,
+        CONSTRAINT PK_HrEmployees PRIMARY KEY CLUSTERED (HrEmployeeId)
+    );
+END
+GO
+
+-- 2. HrEmployeeCredentials
+IF OBJECT_ID('dbo.HrEmployeeCredentials', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrEmployeeCredentials (
+        HrEmployeeCredentialId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrEmployeeCredential_Id DEFAULT NEWSEQUENTIALID(),
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        CouncilName NVARCHAR(150) NOT NULL,
+        RegistrationNumber NVARCHAR(100) NOT NULL,
+        QualificationDegree NVARCHAR(100) NOT NULL,
+        DegreeCompletionYear INT NOT NULL,
+        LicenseValidUntil DATE NOT NULL,
+        DocumentScanUrl NVARCHAR(500) NULL,
+        IsVerified BIT NOT NULL CONSTRAINT DF_HrEmployeeCredential_IsVerified DEFAULT 0,
+        VerifiedByUserId UNIQUEIDENTIFIER NULL,
+        VerifiedAt DATETIME2 NULL,
+        BlsExpiryDate DATE NULL,
+        AclsExpiryDate DATE NULL,
+        CONSTRAINT PK_HrEmployeeCredentials PRIMARY KEY CLUSTERED (HrEmployeeCredentialId)
+    );
+END
+GO
+
+-- 3. HrHospitalShifts
+IF OBJECT_ID('dbo.HrHospitalShifts', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrHospitalShifts (
+        HrHospitalShiftId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrHospitalShift_Id DEFAULT NEWSEQUENTIALID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        ShiftCode NVARCHAR(20) NOT NULL,
+        ShiftName NVARCHAR(100) NOT NULL,
+        StartTime TIME NOT NULL,
+        EndTime TIME NOT NULL,
+        GracePeriodMinutes INT NOT NULL CONSTRAINT DF_HrHospitalShift_GracePeriod DEFAULT 15,
+        HandoverBufferMinutes INT NOT NULL CONSTRAINT DF_HrHospitalShift_HandoverBuffer DEFAULT 15,
+        NightAllowanceAmount DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrHospitalShift_NightAllowance DEFAULT 0,
+        CalloutFeeAmount DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrHospitalShift_CalloutFee DEFAULT 0,
+        IsActive BIT NOT NULL CONSTRAINT DF_HrHospitalShift_IsActive DEFAULT 1,
+        ApplicableRolesJson NVARCHAR(500) NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrHospitalShift_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HrHospitalShifts PRIMARY KEY CLUSTERED (HrHospitalShiftId)
+    );
+END
+GO
+
+-- 4. HrDutyRosters
+IF OBJECT_ID('dbo.HrDutyRosters', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrDutyRosters (
+        HrDutyRosterId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrDutyRoster_Id DEFAULT NEWSEQUENTIALID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        HrHospitalShiftId UNIQUEIDENTIFIER NOT NULL,
+        RosterDate DATE NOT NULL,
+        IsOnCall BIT NOT NULL CONSTRAINT DF_HrDutyRoster_IsOnCall DEFAULT 0,
+        WardId UNIQUEIDENTIFIER NULL,
+        Status NVARCHAR(30) NOT NULL CONSTRAINT DF_HrDutyRoster_Status DEFAULT 'SCHEDULED',
+        RestPeriodViolation BIT NOT NULL CONSTRAINT DF_HrDutyRoster_RestPeriodViolation DEFAULT 0,
+        ViolationMessage NVARCHAR(300) NULL,
+        SwappedWithRosterId UNIQUEIDENTIFIER NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrDutyRoster_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy NVARCHAR(100) NULL,
+        CONSTRAINT PK_HrDutyRosters PRIMARY KEY CLUSTERED (HrDutyRosterId)
+    );
+END
+GO
+
+-- 5. HrAttendanceLogs
+IF OBJECT_ID('dbo.HrAttendanceLogs', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrAttendanceLogs (
+        HrAttendanceLogId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrAttendanceLog_Id DEFAULT NEWSEQUENTIALID(),
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        AttendanceDate DATE NOT NULL,
+        PunchIn DATETIME2 NULL,
+        PunchOut DATETIME2 NULL,
+        TotalHoursWorked DECIMAL(5,2) NULL,
+        OvertimeHours DECIMAL(5,2) NOT NULL CONSTRAINT DF_HrAttendanceLog_Overtime DEFAULT 0,
+        PunchSource NVARCHAR(50) NOT NULL CONSTRAINT DF_HrAttendanceLog_PunchSource DEFAULT 'BIOMETRIC',
+        BiometricDeviceId NVARCHAR(100) NULL,
+        GeoLocation NVARCHAR(100) NULL,
+        Status NVARCHAR(30) NOT NULL CONSTRAINT DF_HrAttendanceLog_Status DEFAULT 'PRESENT',
+        Notes NVARCHAR(300) NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrAttendanceLog_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HrAttendanceLogs PRIMARY KEY CLUSTERED (HrAttendanceLogId)
+    );
+END
+GO
+
+-- 6. HrLeaveBalances
+IF OBJECT_ID('dbo.HrLeaveBalances', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrLeaveBalances (
+        HrLeaveBalanceId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrLeaveBalance_Id DEFAULT NEWSEQUENTIALID(),
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        Year INT NOT NULL,
+        CasualLeaveBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_CL DEFAULT 12.0,
+        SickLeaveBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_SL DEFAULT 12.0,
+        EarnedLeaveBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_EL DEFAULT 15.0,
+        CompOffBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_CompOff DEFAULT 0.0,
+        MaternityLeaveBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_Maternity DEFAULT 0.0,
+        CmeLeaveBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_CME DEFAULT 5.0,
+        CasualLeaveUsed DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_CLUsed DEFAULT 0.0,
+        SickLeaveUsed DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_SLUsed DEFAULT 0.0,
+        EarnedLeaveUsed DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_ELUsed DEFAULT 0.0,
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrLeaveBalance_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HrLeaveBalances PRIMARY KEY CLUSTERED (HrLeaveBalanceId)
+    );
+END
+GO
+
+-- 7. HrLeaveRequests
+IF OBJECT_ID('dbo.HrLeaveRequests', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrLeaveRequests (
+        HrLeaveRequestId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrLeaveRequest_Id DEFAULT NEWSEQUENTIALID(),
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        LeaveType NVARCHAR(30) NOT NULL,
+        StartDate DATE NOT NULL,
+        EndDate DATE NOT NULL,
+        TotalDays DECIMAL(4,1) NOT NULL,
+        Reason NVARCHAR(500) NOT NULL,
+        Status NVARCHAR(30) NOT NULL CONSTRAINT DF_HrLeaveRequest_Status DEFAULT 'PENDING',
+        ApprovedByUserId UNIQUEIDENTIFIER NULL,
+        ApprovedAt DATETIME2 NULL,
+        MedicalCertificateUrl NVARCHAR(500) NULL,
+        RejectionReason NVARCHAR(300) NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrLeaveRequest_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HrLeaveRequests PRIMARY KEY CLUSTERED (HrLeaveRequestId)
+    );
+END
+GO
+
+-- 8. HrPayrollRuns
+IF OBJECT_ID('dbo.HrPayrollRuns', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrPayrollRuns (
+        HrPayrollRunId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrPayrollRun_Id DEFAULT NEWSEQUENTIALID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        RunName NVARCHAR(100) NOT NULL,
+        Month INT NOT NULL,
+        Year INT NOT NULL,
+        Status NVARCHAR(30) NOT NULL CONSTRAINT DF_HrPayrollRun_Status DEFAULT 'DRAFT',
+        TotalGrossPayroll DECIMAL(15,2) NOT NULL,
+        TotalNetDisbursement DECIMAL(15,2) NOT NULL,
+        TotalPfContribution DECIMAL(12,2) NOT NULL,
+        TotalEsiContribution DECIMAL(12,2) NOT NULL,
+        TotalTdsDeducted DECIMAL(12,2) NOT NULL,
+        EmployeeCount INT NOT NULL,
+        ProcessedByUserId UNIQUEIDENTIFIER NULL,
+        ApprovedByUserId UNIQUEIDENTIFIER NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrPayrollRun_CreatedAt DEFAULT SYSUTCDATETIME(),
+        ApprovedAt DATETIME2 NULL,
+        DisbursedAt DATETIME2 NULL,
+        BankExportFileUrl NVARCHAR(500) NULL,
+        CONSTRAINT PK_HrPayrollRuns PRIMARY KEY CLUSTERED (HrPayrollRunId)
+    );
+END
+GO
+
+-- 9. HrPayslips
+IF OBJECT_ID('dbo.HrPayslips', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrPayslips (
+        HrPayslipId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrPayslip_Id DEFAULT NEWSEQUENTIALID(),
+        HrPayrollRunId UNIQUEIDENTIFIER NOT NULL,
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        PayslipNumber NVARCHAR(50) NOT NULL,
+        PayrollTrack NVARCHAR(30) NOT NULL,
+        TotalDaysInMonth INT NOT NULL,
+        PayableDays DECIMAL(4,1) NOT NULL,
+        OvertimeDays DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrPayslip_Overtime DEFAULT 0,
+        NightShiftCount INT NOT NULL CONSTRAINT DF_HrPayslip_NightShift DEFAULT 0,
+        BasicEarned DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Basic DEFAULT 0,
+        HraEarned DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_HRA DEFAULT 0,
+        AllowancesEarned DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Allowances DEFAULT 0,
+        OvertimeAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_OvertimeAmt DEFAULT 0,
+        NightAllowanceAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_NightAmt DEFAULT 0,
+        IncentivesAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Incentives DEFAULT 0,
+        RetainerAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Retainer DEFAULT 0,
+        OpdShareAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Opd DEFAULT 0,
+        IpdVisitAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Ipd DEFAULT 0,
+        SurgeryShareAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Surgery DEFAULT 0,
+        GrossEarnings DECIMAL(12,2) NOT NULL,
+        PfEmployee DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_Pf DEFAULT 0,
+        EsiEmployee DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_Esi DEFAULT 0,
+        ProfTax DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_ProfTax DEFAULT 0,
+        TdsDeducted DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_Tds DEFAULT 0,
+        LoanInstallment DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_Loan DEFAULT 0,
+        TotalDeductions DECIMAL(12,2) NOT NULL,
+        NetSalary DECIMAL(12,2) NOT NULL,
+        PfEmployer DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_PfEmp DEFAULT 0,
+        EsiEmployer DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_EsiEmp DEFAULT 0,
+        PdfUrl NVARCHAR(500) NULL,
+        IsSentWhatsapp BIT NOT NULL CONSTRAINT DF_HrPayslip_SentWhatsapp DEFAULT 0,
+        WhatsappSentAt DATETIME2 NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrPayslip_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HrPayslips PRIMARY KEY CLUSTERED (HrPayslipId)
+    );
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_icu.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -5731,6 +5983,11 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
+-- Pharmacy Phase 3b: statutory/print fields for pharmacy bills (Drug License numbers, FSSAI,
+-- registered pharmacist, return policy). Separate from InvoicePrintSettings (generic font/margin
+-- config for the hospital's general invoice) â€” pharmacy bills carry Drugs & Cosmetics Act-mandated
+-- fields no other bill type needs. One row per hospital.
+
 IF OBJECT_ID('dbo.PharmacyPrintSettings','U') IS NULL
 BEGIN
   CREATE TABLE dbo.PharmacyPrintSettings
@@ -5764,10 +6021,74 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pharmacy_salt_composition.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3c: normalized Molecule/SaltComposition catalog driving 1-click generic
+-- substitution. Global (not per-hospital) â€” a composition like "Amoxicillin 500mg + Clavulanic
+-- Acid 125mg" is the same everywhere, only which brands/items a hospital stocks differs.
+
+IF OBJECT_ID('dbo.Molecule','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Molecule
+  (
+    MoleculeId  UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_Molecule_Id DEFAULT NEWSEQUENTIALID(),
+    Name        NVARCHAR(150)    NOT NULL,
+    CreatedAt   DATETIME2(3)     NOT NULL CONSTRAINT DF_Molecule_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_Molecule PRIMARY KEY CLUSTERED (MoleculeId)
+  );
+
+  CREATE UNIQUE INDEX UX_Molecule_Name ON dbo.Molecule (Name);
+END
+GO
+
+IF OBJECT_ID('dbo.SaltComposition','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.SaltComposition
+  (
+    SaltCompositionId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SC_Id DEFAULT NEWSEQUENTIALID(),
+    DisplayName       NVARCHAR(300)    NOT NULL,
+    DosageForm        NVARCHAR(50)     NULL,
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_SC_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_SaltComposition PRIMARY KEY CLUSTERED (SaltCompositionId)
+  );
+END
+GO
+
+IF OBJECT_ID('dbo.SaltCompositionComponent','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.SaltCompositionComponent
+  (
+    SaltCompositionComponentId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SCC_Id DEFAULT NEWSEQUENTIALID(),
+    SaltCompositionId          UNIQUEIDENTIFIER NOT NULL,
+    MoleculeId                 UNIQUEIDENTIFIER NOT NULL,
+    StrengthValue              DECIMAL(10,3)    NOT NULL,
+    StrengthUnit               NVARCHAR(10)     NOT NULL,
+
+    CONSTRAINT PK_SaltCompositionComponent PRIMARY KEY CLUSTERED (SaltCompositionComponentId),
+    CONSTRAINT FK_SCC_Composition FOREIGN KEY (SaltCompositionId) REFERENCES dbo.SaltComposition(SaltCompositionId),
+    CONSTRAINT FK_SCC_Molecule FOREIGN KEY (MoleculeId) REFERENCES dbo.Molecule(MoleculeId)
+  );
+
+  CREATE INDEX IX_SCC_Composition ON dbo.SaltCompositionComponent (SaltCompositionId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_pharmacy_schedule_register.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
+-- Pharmacy Phase 3b: statutory register for regulated-but-non-narcotic drug schedules (Schedule H1
+-- today). One row per dispense of a ScheduleClass=H1 item. Separate from NarcoticRegisterEntry
+-- (which tracks 3D/3E/3H forms and mandates a witness under NDPS rules) since the Drugs &
+-- Cosmetics Rules H1 register only needs date/patient/prescriber/qty.
+
 IF OBJECT_ID('dbo.DrugScheduleRegisterEntry','U') IS NULL
 BEGIN
   CREATE TABLE dbo.DrugScheduleRegisterEntry
@@ -7009,6 +7330,160 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_zz_hr_foreign_keys.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- HR Foreign Keys (Deferred)
+
+-- HrEmployee -> Hospital
+IF OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Hospital','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrEmployee_Hospital')
+BEGIN
+  ALTER TABLE dbo.HrEmployees
+    ADD CONSTRAINT FK_HrEmployee_Hospital FOREIGN KEY (HospitalId)
+    REFERENCES dbo.Hospital(HospitalId);
+END
+GO
+
+-- HrEmployee -> Department
+IF OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Department','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrEmployee_Department')
+BEGIN
+  ALTER TABLE dbo.HrEmployees
+    ADD CONSTRAINT FK_HrEmployee_Department FOREIGN KEY (DepartmentId)
+    REFERENCES dbo.Department(DepartmentId);
+END
+GO
+
+-- HrEmployeeCredential -> HrEmployee
+IF OBJECT_ID('dbo.HrEmployeeCredentials','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrEmployeeCredential_Employee')
+BEGIN
+  ALTER TABLE dbo.HrEmployeeCredentials
+    ADD CONSTRAINT FK_HrEmployeeCredential_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+-- HrHospitalShift -> Hospital
+IF OBJECT_ID('dbo.HrHospitalShifts','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Hospital','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrHospitalShift_Hospital')
+BEGIN
+  ALTER TABLE dbo.HrHospitalShifts
+    ADD CONSTRAINT FK_HrHospitalShift_Hospital FOREIGN KEY (HospitalId)
+    REFERENCES dbo.Hospital(HospitalId);
+END
+GO
+
+-- HrDutyRoster -> HrEmployee
+IF OBJECT_ID('dbo.HrDutyRosters','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrDutyRoster_Employee')
+BEGIN
+  ALTER TABLE dbo.HrDutyRosters
+    ADD CONSTRAINT FK_HrDutyRoster_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+-- HrDutyRoster -> HrHospitalShift
+IF OBJECT_ID('dbo.HrDutyRosters','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrHospitalShifts','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrDutyRoster_Shift')
+BEGIN
+  ALTER TABLE dbo.HrDutyRosters
+    ADD CONSTRAINT FK_HrDutyRoster_Shift FOREIGN KEY (HrHospitalShiftId)
+    REFERENCES dbo.HrHospitalShifts(HrHospitalShiftId);
+END
+GO
+
+-- HrAttendanceLog -> HrEmployee
+IF OBJECT_ID('dbo.HrAttendanceLogs','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrAttendanceLog_Employee')
+BEGIN
+  ALTER TABLE dbo.HrAttendanceLogs
+    ADD CONSTRAINT FK_HrAttendanceLog_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+-- HrLeaveBalance -> HrEmployee
+IF OBJECT_ID('dbo.HrLeaveBalances','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrLeaveBalance_Employee')
+BEGIN
+  ALTER TABLE dbo.HrLeaveBalances
+    ADD CONSTRAINT FK_HrLeaveBalance_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+-- HrLeaveRequest -> HrEmployee
+IF OBJECT_ID('dbo.HrLeaveRequests','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrLeaveRequest_Employee')
+BEGIN
+  ALTER TABLE dbo.HrLeaveRequests
+    ADD CONSTRAINT FK_HrLeaveRequest_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+-- HrPayrollRun -> Hospital
+IF OBJECT_ID('dbo.HrPayrollRuns','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Hospital','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrPayrollRun_Hospital')
+BEGIN
+  ALTER TABLE dbo.HrPayrollRuns
+    ADD CONSTRAINT FK_HrPayrollRun_Hospital FOREIGN KEY (HospitalId)
+    REFERENCES dbo.Hospital(HospitalId);
+END
+GO
+
+-- HrPayslip -> HrPayrollRun
+IF OBJECT_ID('dbo.HrPayslips','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrPayrollRuns','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrPayslip_PayrollRun')
+BEGIN
+  ALTER TABLE dbo.HrPayslips
+    ADD CONSTRAINT FK_HrPayslip_PayrollRun FOREIGN KEY (HrPayrollRunId)
+    REFERENCES dbo.HrPayrollRuns(HrPayrollRunId);
+END
+GO
+
+-- HrPayslip -> HrEmployee
+IF OBJECT_ID('dbo.HrPayslips','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrPayslip_Employee')
+BEGIN
+  ALTER TABLE dbo.HrPayslips
+    ADD CONSTRAINT FK_HrPayslip_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+ - -   H r E m p l o y e e   - >   U s e r 
+ I F   O B J E C T _ I D ( ' d b o . H r E m p l o y e e s ' , ' U ' )   I S   N O T   N U L L 
+       A N D   O B J E C T _ I D ( ' d b o . U s e r s ' , ' U ' )   I S   N O T   N U L L 
+       A N D   N O T   E X I S T S   ( S E L E C T   1   F R O M   s y s . f o r e i g n _ k e y s   W H E R E   n a m e   =   ' F K _ H r E m p l o y e e _ U s e r ' ) 
+ B E G I N 
+     A L T E R   T A B L E   d b o . H r E m p l o y e e s 
+         A D D   C O N S T R A I N T   F K _ H r E m p l o y e e _ U s e r   F O R E I G N   K E Y   ( U s e r I d ) 
+         R E F E R E N C E S   d b o . U s e r s ( U s e r I D ) ; 
+ E N D 
+ G O 
+  
+ 
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/dml_nightJob_scripts.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7831,6 +8306,25 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_clinicalorderline_add_linked_pathology_order_line.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Links an IPD ClinicalOrderLine (OrderType = LAB) to the structured PathologyOrderLine created
+-- alongside it, so the Pathology Lab workspace's results/report pipeline can pick up IPD lab
+-- orders too, not just OPD ones. Set once, at order-placement time, when the line's ChargeId
+-- resolves to a PathologyTestMaster row for this hospital; left NULL for lines that don't
+-- resolve to a catalogued test (free-text lab items, or a charge with no catalog test behind it).
+IF COL_LENGTH('dbo.ClinicalOrderLine', 'LinkedPathologyOrderLineId') IS NULL
+BEGIN
+  ALTER TABLE dbo.ClinicalOrderLine
+    ADD LinkedPathologyOrderLineId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_clinicalorderline_daily_recurring.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8177,6 +8671,21 @@ BEGIN
 
     IF COL_LENGTH('dbo.Doctors', 'RegistrationVerifiedByUserId') IS NULL
         ALTER TABLE dbo.Doctors ADD RegistrationVerifiedByUserId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_goodsreceiptnoteline_add_free_qty.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3c: trade-scheme free units ("10+1") on a GRN line, on top of the billed Qty.
+IF COL_LENGTH('dbo.GoodsReceiptNoteLine', 'FreeQty') IS NULL
+BEGIN
+  ALTER TABLE dbo.GoodsReceiptNoteLine
+    ADD FreeQty DECIMAL(18,3) NOT NULL CONSTRAINT DF_GRNLine_FreeQty DEFAULT (0);
 END
 GO
 
@@ -8698,6 +9207,35 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_inventoryitem_add_salt_composition.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3c: links an InventoryItem to its normalized SaltComposition â€” items sharing a
+-- SaltCompositionId (with live stock) are generic substitutes for each other.
+IF COL_LENGTH('dbo.InventoryItem', 'SaltCompositionId') IS NULL
+BEGIN
+  ALTER TABLE dbo.InventoryItem
+    ADD SaltCompositionId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_InventoryItem_SaltComposition')
+BEGIN
+  ALTER TABLE dbo.InventoryItem
+    ADD CONSTRAINT FK_InventoryItem_SaltComposition FOREIGN KEY (SaltCompositionId) REFERENCES dbo.SaltComposition(SaltCompositionId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_InventoryItem_SaltCompositionId' AND object_id = OBJECT_ID('dbo.InventoryItem'))
+BEGIN
+  CREATE INDEX IX_InventoryItem_SaltCompositionId ON dbo.InventoryItem (SaltCompositionId) WHERE SaltCompositionId IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_labconfiguration_add_accreditation_fields.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8715,6 +9253,51 @@ BEGIN
         Iso15189Number NVARCHAR(100) NULL,
         IcmrRegistrationId NVARCHAR(100) NULL,
         IsPreprintedStationery BIT NOT NULL CONSTRAINT DF_LabConfiguration_IsPreprintedStationery DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_labconfiguration_add_letterhead_mode.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds LabConfiguration.LetterheadMode -- which source the pathology report PDF draws its
+-- header/footer from: CUSTOM_TEMPLATE (the hospital's default PathologyReportTemplate),
+-- BLANK_PREPRINTED (leave the margin band empty, for physical pre-printed stationery), or
+-- SYSTEM_DEFAULT (an auto-generated hospital-branded header, same idea as billing invoices).
+-- A 3-state string rather than a bool -- IsPreprintedStationery (added by
+-- alter_labconfiguration_add_accreditation_fields.sql) can't cleanly distinguish "nothing
+-- configured" from "deliberately blank" from "deliberately default," so this supersedes its
+-- intent rather than building on top of it. Existing hospitals default to SYSTEM_DEFAULT --
+-- an upgrade from today's hardcoded plain-text header, not a regression.
+IF COL_LENGTH('dbo.LabConfiguration', 'LetterheadMode') IS NULL
+BEGIN
+  ALTER TABLE dbo.LabConfiguration
+    ADD LetterheadMode NVARCHAR(30) NOT NULL CONSTRAINT DF_LabConfiguration_LetterheadMode DEFAULT ('SYSTEM_DEFAULT');
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_labconfiguration_add_report_field_layout.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds LabConfiguration.ReportFieldLayoutJson -- the hospital-wide pathology report field layout:
+-- { "reportFields": [...], "lineFields": [...] }, each an ordered list of
+-- {key, label, type, builtIn, showInPad, showInPrint, order, options} items (see
+-- pathologyFieldLayoutApi.ts). reportFields fill in once per report (Clinical History, Comments,
+-- ...); lineFields repeat on every test line alongside the built-in Interpretation / Notes field.
+-- Null/empty means "use the built-in defaults," merged client-side -- same evolvable-JSON-blob
+-- trick as LetterheadMode (see alter_labconfiguration_add_letterhead_mode.sql), so no default value
+-- and no backfill is needed for existing hospitals.
+IF COL_LENGTH('dbo.LabConfiguration', 'ReportFieldLayoutJson') IS NULL
+BEGIN
+  ALTER TABLE dbo.LabConfiguration
+    ADD ReportFieldLayoutJson NVARCHAR(MAX) NULL;
 END
 GO
 
@@ -9027,6 +9610,26 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathologyorder_add_report_field_values.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds PathologyOrder.ReportFieldValuesJson -- the values a pathologist has typed for the
+-- hospital's configured report-level fields (LabConfiguration.ReportFieldLayoutJson's
+-- "reportFields" list) on this specific order: { key: value }. Lives on the order rather than
+-- PathologyReport so it's fillable/editable before a report is ever generated and survives freely
+-- regenerating the report, the same way per-line values already live on PathologyResult rather
+-- than being copied into PathologyReport.
+IF COL_LENGTH('dbo.PathologyOrder', 'ReportFieldValuesJson') IS NULL
+BEGIN
+  ALTER TABLE dbo.PathologyOrder
+    ADD ReportFieldValuesJson NVARCHAR(MAX) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_pathologyorder_add_source_and_stat.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -9040,6 +9643,26 @@ BEGIN
   ALTER TABLE dbo.PathologyOrder
     ADD SourceType NVARCHAR(20) NULL,
         IsStat BIT NOT NULL CONSTRAINT DF_PathologyOrder_IsStat DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathologyorder_add_token_number.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds PathologyOrder.TokenNumber -- a daily, per-hospital sequential token (1, 2, 3... resetting
+-- every day) assigned at order creation and printed on a thermal receipt for the patient, same
+-- idea as Appointments' token feature but hospital-scoped instead of per-doctor (pathology has no
+-- doctor-queue concept). Separate from OrderNo, which keeps its existing lab-accession format and
+-- meaning everywhere it's already used (reports, billing, detail page). See
+-- create_pathology_token_queue_table.sql for the counter table that allocates this value.
+IF COL_LENGTH('dbo.PathologyOrder', 'TokenNumber') IS NULL
+BEGIN
+  ALTER TABLE dbo.PathologyOrder
+    ADD TokenNumber INT NULL;
 END
 GO
 
@@ -11128,6 +11751,41 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PkgType_Hospital' AND object_id = OBJECT_ID('dbo.PackageType'))
     CREATE INDEX IX_PkgType_Hospital ON dbo.PackageType (HospitalId, IsActive);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_pathology_token_queue_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create PathologyTokenQueue Table
+-- Description: Backs PathologyOrder.TokenNumber's daily counter -- one row per
+--              (hospital, day), mirroring DoctorQueues' locking-with-retry shape
+--              (see AppointmentBookingHelpers.AllocateTokenWithLockingAsync) but
+--              scoped to the hospital only, since pathology orders aren't tied to
+--              one doctor's queue the way appointments are.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PathologyTokenQueue', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyTokenQueue
+    (
+        HospitalId   UNIQUEIDENTIFIER NOT NULL,
+        TokenDate    DATE             NOT NULL,
+        NextTokenNo  INT              NOT NULL CONSTRAINT DF_PTQ_NextTokenNo DEFAULT (1),
+
+        UpdatedAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_PTQ_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+
+        RowVersion   ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_PathologyTokenQueue PRIMARY KEY CLUSTERED (HospitalId, TokenDate)
+    );
+
+    PRINT 'Created table PathologyTokenQueue';
+END
 GO
 
 GO

@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-09-03 19:00  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-09-03 19:54  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -6048,10 +6048,10 @@ IF OBJECT_ID('dbo.SaltComposition','U') IS NULL
 BEGIN
   CREATE TABLE dbo.SaltComposition
   (
-    SaltCompositionId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SC_Id DEFAULT NEWSEQUENTIALID(),
+    SaltCompositionId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SaltComposition_Id DEFAULT NEWSEQUENTIALID(),
     DisplayName       NVARCHAR(300)    NOT NULL,
     DosageForm        NVARCHAR(50)     NULL,
-    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_SC_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_SaltComposition_CreatedAt DEFAULT SYSUTCDATETIME(),
 
     CONSTRAINT PK_SaltComposition PRIMARY KEY CLUSTERED (SaltCompositionId)
   );

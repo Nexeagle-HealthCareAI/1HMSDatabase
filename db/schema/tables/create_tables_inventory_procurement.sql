@@ -39,7 +39,7 @@ BEGIN
     CONSTRAINT PK_Indent PRIMARY KEY CLUSTERED (IndentId),
     CONSTRAINT UX_IND_Number UNIQUE (HospitalId, IndentNumber),
     -- FK_IND_Store deferred to create_tables_zz_foreign_keys.sql: Store sorts AFTER this file alphabetically.
-    CONSTRAINT CK_IND_Status CHECK ([Status] IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','CONVERTED_TO_PO','CANCELLED'))
+    CONSTRAINT CK_IND_Status CHECK ([Status] IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','CONVERTED_TO_PO','PARTIALLY_ISSUED','ISSUED','CANCELLED'))
   );
 END
 GO

@@ -77,7 +77,13 @@ BEGIN
     PRINT 'Added TestCategoriesJson column to LabConfiguration table';
 END
 ELSE PRINT 'TestCategoriesJson column already exists';
+GO
 
+-- Separate batch: CREATE INDEX referencing LabCity/LabState/IsPubliclyListed must compile against
+-- a schema where those columns already exist -- combined into the same batch as the ALTER TABLE
+-- statements above, SQL Server fails to resolve them at compile time and the whole batch never
+-- executes (this is why the columns didn't actually get created on the first attempt at this
+-- migration, despite the deploy pipeline reporting success).
 IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'IX_LabConfiguration_City_State')
 BEGIN
     CREATE INDEX IX_LabConfiguration_City_State ON dbo.LabConfiguration (LabCity, LabState) WHERE IsPubliclyListed = 1;

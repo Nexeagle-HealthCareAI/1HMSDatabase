@@ -11,11 +11,22 @@
    "maleMax", "femaleMin", "femaleMax", "childMin", "childMax", "criticalLow", "criticalHigh",
    "sortOrder" } ] }. Any bound left out of a param's JSON is simply absent (no range/threshold
    in that direction) -- see PathologyResultFlagCalculator for how missing bounds/demographic
-   splits are resolved. Six panels below (CBC+ESR, Coagulation+Blood Grouping, LFT,
-   KFT+Electrolytes, Lipid Profile, Glucose+HbA1c) carry the full demographic/critical schema,
-   sourced from the 1Lab PRD v2.4.0 Section 8 reference tables. The remaining panels keep their
-   original flat {min,max} shape (still valid -- the flag calculator falls back to it) and can be
-   enriched incrementally via the Test Catalog Manager UI without any further migration.
+   splits are resolved.
+
+   IMPORTANT: every parameter below MUST use maleMin/maleMax/femaleMin/femaleMax (duplicating the
+   same value into both when there's no real gender difference), never the older flat {min,max}
+   pair. PathologyResultFlagCalculator.cs and its TS port only ever read the six named bounds
+   above -- a plain "min"/"max" key deserializes to nothing and the parameter silently never
+   flags HIGH/LOW/CRITICAL for ANY value, however abnormal (confirmed by reading
+   EnterPathologyResultHandler.cs's ParameterSchemaItem, which has no Min/Max property at all). An
+   earlier version of this file left several panels in that flat shape believing the calculator
+   "fell back" to it; it doesn't, and a full catalog audit + fix converted every one of them (see
+   dml_pathology_test_ranges_fix.sql for the matching one-time backfill of hospitals seeded before
+   this fix). CBC+ESR, Coagulation, LFT, KFT+Electrolytes, Lipid Profile, and Glucose+HbA1c
+   additionally carry childMin/childMax and criticalLow/criticalHigh where clinically meaningful,
+   sourced from the 1Lab PRD v2.4.0 Section 8 reference tables plus the audit's pediatric-gap
+   fixes (ALP, Creatinine). Everything here can still be edited/enriched further per-hospital via
+   the Test Catalog Manager UI without any further migration.
    ========================================================= */
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
@@ -67,12 +78,15 @@ BEGIN TRY
    ]}', 30),
 
   (N'HEM-RETIC', N'Reticulocyte Count', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
-   N'{"params":[{"name":"Reticulocyte Count","unit":"%","min":0.5,"max":2.5}]}', 40),
+   N'{"params":[{"name":"Reticulocyte Count","unit":"%","defaultValue":"1.0","maleMin":0.5,"maleMax":2.5,"femaleMin":0.5,"femaleMax":2.5,"sortOrder":1}]}', 40),
 
   (N'HEM-BLOODGROUP', N'Blood Grouping & Rh Typing', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
+   -- No defaultValue on either param, deliberately -- a blood group is a fixed patient-identity
+   -- field, not a "typical normal." A default here would let 1-Click Autofill Normals write a
+   -- fabricated blood group into a real result.
    N'{"params":[
-     {"name":"ABO Blood Grouping","unit":"","defaultValue":"B Positive","sortOrder":1},
-     {"name":"Rh Factor (D Antigen)","unit":"","defaultValue":"Positive","sortOrder":2}
+     {"name":"ABO Blood Grouping","unit":"","sortOrder":1},
+     {"name":"Rh Factor (D Antigen)","unit":"","sortOrder":2}
    ]}', 45);
 
   /* ===== COAGULATION (enriched) ===== */
@@ -108,9 +122,12 @@ BEGIN TRY
      {"name":"HDL Cholesterol","unit":"mg/dL","defaultValue":"48.0","maleMin":40.0,"femaleMin":50.0,"sortOrder":3},
      {"name":"LDL Cholesterol","unit":"mg/dL","defaultValue":"92.0","maleMax":100.0,"femaleMax":100.0,"sortOrder":4},
      {"name":"VLDL Cholesterol","unit":"mg/dL","defaultValue":"23.0","maleMin":10.0,"maleMax":30.0,"femaleMin":10.0,"femaleMax":30.0,"sortOrder":5},
-     {"name":"Total Cholesterol / HDL Ratio","unit":"ratio","defaultValue":"3.40","maleMin":3.30,"maleMax":4.40,"femaleMin":3.30,"femaleMax":4.40,"sortOrder":6}
+     {"name":"Total Cholesterol / HDL Ratio","unit":"ratio","defaultValue":"3.40","maleMax":4.40,"femaleMax":4.40,"sortOrder":6}
    ]}', 130),
 
+  -- ALP carries a childMin/childMax band (the others in this panel don't) -- bone-growth
+  -- elevation makes a normal child's ALP read HIGH against the adult range, the single most
+  -- clinically significant pediatric difference in this panel.
   (N'BIO-LFT', N'Liver Function Test (LFT)', N'BIOCHEMISTRY', N'Serum', N'Plain',
    N'{"params":[
      {"name":"Bilirubin - Total","unit":"mg/dL","defaultValue":"0.70","maleMin":0.20,"maleMax":1.20,"femaleMin":0.20,"femaleMax":1.20,"criticalHigh":15.0,"sortOrder":1},
@@ -118,7 +135,7 @@ BEGIN TRY
      {"name":"Bilirubin - Indirect","unit":"mg/dL","defaultValue":"0.55","maleMin":0.10,"maleMax":0.90,"femaleMin":0.10,"femaleMax":0.90,"sortOrder":3},
      {"name":"SGOT / AST","unit":"U/L","defaultValue":"22.0","maleMin":5.0,"maleMax":40.0,"femaleMin":5.0,"femaleMax":40.0,"criticalHigh":500.0,"sortOrder":4},
      {"name":"SGPT / ALT","unit":"U/L","defaultValue":"24.0","maleMin":5.0,"maleMax":45.0,"femaleMin":5.0,"femaleMax":45.0,"criticalHigh":500.0,"sortOrder":5},
-     {"name":"Alkaline Phosphatase (ALP)","unit":"U/L","defaultValue":"75.0","maleMin":30.0,"maleMax":120.0,"femaleMin":30.0,"femaleMax":120.0,"criticalHigh":700.0,"sortOrder":6},
+     {"name":"Alkaline Phosphatase (ALP)","unit":"U/L","defaultValue":"75.0","maleMin":30.0,"maleMax":120.0,"femaleMin":30.0,"femaleMax":120.0,"childMin":100.0,"childMax":350.0,"criticalHigh":700.0,"sortOrder":6},
      {"name":"Gamma GT (GGT)","unit":"U/L","defaultValue":"28.0","maleMin":10.0,"maleMax":50.0,"femaleMin":5.0,"femaleMax":35.0,"criticalHigh":250.0,"sortOrder":7},
      {"name":"Total Protein","unit":"g/dL","defaultValue":"7.20","maleMin":6.00,"maleMax":8.30,"femaleMin":6.00,"femaleMax":8.30,"criticalLow":4.5,"sortOrder":8},
      {"name":"Serum Albumin","unit":"g/dL","defaultValue":"4.20","maleMin":3.50,"maleMax":5.00,"femaleMin":3.50,"femaleMax":5.00,"criticalLow":2.0,"sortOrder":9},
@@ -126,10 +143,13 @@ BEGIN TRY
      {"name":"Albumin : Globulin Ratio (A/G)","unit":"ratio","defaultValue":"1.40","maleMin":1.20,"maleMax":2.20,"femaleMin":1.20,"femaleMax":2.20,"sortOrder":11}
    ]}', 140),
 
+  -- Creatinine carries a childMin/childMax band (the others in this panel don't) -- children run
+  -- substantially lower than adults on lower muscle mass, so a genuinely abnormal pediatric value
+  -- can otherwise still read NORMAL against the adult floor.
   (N'BIO-KFT', N'Kidney Function Test (KFT/RFT)', N'BIOCHEMISTRY', N'Serum', N'Plain',
    N'{"params":[
      {"name":"Blood Urea","unit":"mg/dL","defaultValue":"24.0","maleMin":15.0,"maleMax":45.0,"femaleMin":15.0,"femaleMax":45.0,"criticalHigh":120.0,"sortOrder":1},
-     {"name":"Serum Creatinine","unit":"mg/dL","defaultValue":"0.90","maleMin":0.70,"maleMax":1.30,"femaleMin":0.60,"femaleMax":1.10,"criticalHigh":5.00,"sortOrder":2},
+     {"name":"Serum Creatinine","unit":"mg/dL","defaultValue":"0.90","maleMin":0.70,"maleMax":1.30,"femaleMin":0.60,"femaleMax":1.10,"childMin":0.30,"childMax":0.70,"criticalHigh":5.00,"sortOrder":2},
      {"name":"Blood Urea Nitrogen (BUN)","unit":"mg/dL","defaultValue":"11.2","maleMin":7.0,"maleMax":20.0,"femaleMin":7.0,"femaleMax":20.0,"criticalHigh":60.0,"sortOrder":3},
      {"name":"Serum Uric Acid","unit":"mg/dL","defaultValue":"4.80","maleMin":3.50,"maleMax":7.20,"femaleMin":2.60,"femaleMax":6.00,"criticalHigh":12.0,"sortOrder":4},
      {"name":"Serum Sodium (Na+)","unit":"mmol/L","defaultValue":"140.0","maleMin":135.0,"maleMax":145.0,"femaleMin":135.0,"femaleMax":145.0,"criticalLow":120.0,"criticalHigh":160.0,"sortOrder":5},
@@ -138,16 +158,27 @@ BEGIN TRY
      {"name":"Serum Calcium (Total)","unit":"mg/dL","defaultValue":"9.40","maleMin":8.50,"maleMax":10.50,"femaleMin":8.50,"femaleMax":10.50,"criticalLow":6.50,"criticalHigh":13.0,"sortOrder":8}
    ]}', 150),
 
+  -- Same gender-split range as the Uric Acid parameter inside BIO-KFT -- kept in sync
+  -- deliberately, since a hospital/patient can order this standalone instead of the full panel.
   (N'BIO-URIC', N'Serum Uric Acid', N'BIOCHEMISTRY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Uric Acid","unit":"mg/dL","min":3.5,"max":7.2}]}', 155),
+   N'{"params":[{"name":"Uric Acid","unit":"mg/dL","defaultValue":"4.80","maleMin":3.50,"maleMax":7.20,"femaleMin":2.60,"femaleMax":6.00,"criticalHigh":12.0,"sortOrder":1}]}', 155),
 
+  -- criticalHigh added to all three -- Troponin I elevation is the textbook definition of a lab
+  -- panic value (acute MI), and this panel previously had no critical threshold anywhere, so it
+  -- would never trip the critical-value banner/beep in OrderResultEntry.tsx no matter how
+  -- abnormal. Thresholds are standard hospital panic-value defaults, tunable per-hospital via the
+  -- Test Catalog Manager.
   (N'BIO-CARDIAC', N'Cardiac Markers', N'BIOCHEMISTRY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Troponin I","unit":"ng/mL","min":0,"max":0.04},{"name":"CPK-MB","unit":"U/L","min":0,"max":25},{"name":"CPK Total","unit":"U/L","min":30,"max":200}]}', 160);
+   N'{"params":[
+     {"name":"Troponin I","unit":"ng/mL","defaultValue":"0.01","maleMin":0,"maleMax":0.04,"femaleMin":0,"femaleMax":0.04,"criticalHigh":0.5,"sortOrder":1},
+     {"name":"CPK-MB","unit":"U/L","defaultValue":"12","maleMin":0,"maleMax":25,"femaleMin":0,"femaleMax":25,"criticalHigh":100,"sortOrder":2},
+     {"name":"CPK Total","unit":"U/L","defaultValue":"110","maleMin":30,"maleMax":200,"femaleMin":30,"femaleMax":200,"criticalHigh":1000,"sortOrder":3}
+   ]}', 160);
 
   /* ===== CLINICAL PATHOLOGY (unchanged this phase) ===== */
   INSERT INTO @Tests VALUES
   (N'CP-URINE-R', N'Urine Routine & Microscopy', N'CLINICAL_PATHOLOGY', N'Urine', N'Container',
-   N'{"params":[{"name":"Color","unit":""},{"name":"Appearance","unit":""},{"name":"pH","unit":"","min":4.5,"max":8.0},{"name":"Specific Gravity","unit":"","min":1.005,"max":1.030},{"name":"Protein","unit":""},{"name":"Glucose","unit":""},{"name":"Ketones","unit":""},{"name":"Bilirubin","unit":""},{"name":"Urobilinogen","unit":""},{"name":"RBCs","unit":"/hpf","min":0,"max":2},{"name":"WBCs","unit":"/hpf","min":0,"max":5},{"name":"Epithelial Cells","unit":""},{"name":"Casts","unit":""},{"name":"Crystals","unit":""},{"name":"Bacteria","unit":""}]}', 200),
+   N'{"params":[{"name":"Color","unit":""},{"name":"Appearance","unit":""},{"name":"pH","unit":"","maleMin":4.5,"maleMax":8.0,"femaleMin":4.5,"femaleMax":8.0},{"name":"Specific Gravity","unit":"","maleMin":1.005,"maleMax":1.030,"femaleMin":1.005,"femaleMax":1.030},{"name":"Protein","unit":""},{"name":"Glucose","unit":""},{"name":"Ketones","unit":""},{"name":"Bilirubin","unit":""},{"name":"Urobilinogen","unit":""},{"name":"RBCs","unit":"/hpf","maleMin":0,"maleMax":2,"femaleMin":0,"femaleMax":2},{"name":"WBCs","unit":"/hpf","maleMin":0,"maleMax":5,"femaleMin":0,"femaleMax":5},{"name":"Epithelial Cells","unit":""},{"name":"Casts","unit":""},{"name":"Crystals","unit":""},{"name":"Bacteria","unit":""}]}', 200),
 
   (N'CP-STOOL-R', N'Stool Routine & Microscopy', N'CLINICAL_PATHOLOGY', N'Stool', N'Container',
    N'{"params":[{"name":"Color","unit":""},{"name":"Consistency","unit":""},{"name":"Occult Blood","unit":""},{"name":"Ova","unit":""},{"name":"Cysts","unit":""},{"name":"RBCs","unit":""},{"name":"WBCs","unit":""},{"name":"Mucus","unit":""}]}', 210),
@@ -161,10 +192,10 @@ BEGIN TRY
    N'{"params":[{"name":"S. Typhi O","unit":"titre"},{"name":"S. Typhi H","unit":"titre"},{"name":"S. Paratyphi AO","unit":"titre"},{"name":"S. Paratyphi AH","unit":"titre"}]}', 300),
 
   (N'SER-CRP', N'C-Reactive Protein (CRP)', N'SEROLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"CRP","unit":"mg/L","min":0,"max":6}]}', 310),
+   N'{"params":[{"name":"CRP","unit":"mg/L","maleMin":0,"maleMax":6,"femaleMin":0,"femaleMax":6}]}', 310),
 
   (N'SER-RA', N'Rheumatoid Factor (RA)', N'SEROLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"RA Factor","unit":"IU/mL","min":0,"max":14}]}', 320),
+   N'{"params":[{"name":"RA Factor","unit":"IU/mL","maleMin":0,"maleMax":14,"femaleMin":0,"femaleMax":14}]}', 320),
 
   (N'SER-HIV', N'HIV I & II Antibody', N'SEROLOGY', N'Serum', N'Plain',
    N'{"params":[{"name":"HIV I & II","unit":""}]}', 330),
@@ -181,19 +212,21 @@ BEGIN TRY
   /* ===== ENDOCRINOLOGY (unchanged this phase) ===== */
   INSERT INTO @Tests VALUES
   (N'ENDO-THYROID', N'Thyroid Profile (T3, T4, TSH)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"T3","unit":"ng/dL","min":80,"max":200},{"name":"T4","unit":"µg/dL","min":5.1,"max":14.1},{"name":"TSH","unit":"µIU/mL","min":0.27,"max":4.20}]}', 400),
+   N'{"params":[{"name":"T3","unit":"ng/dL","maleMin":80,"maleMax":200,"femaleMin":80,"femaleMax":200},{"name":"T4","unit":"µg/dL","maleMin":5.1,"maleMax":14.1,"femaleMin":5.1,"femaleMax":14.1},{"name":"TSH","unit":"µIU/mL","maleMin":0.27,"maleMax":4.20,"femaleMin":0.27,"femaleMax":4.20}]}', 400),
 
+  -- Female range is a real physiological split (non-pregnant female prolactin legitimately runs
+  -- higher than male), not just a mechanical copy -- see the catalog audit.
   (N'ENDO-PROLACTIN', N'Serum Prolactin', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Prolactin","unit":"ng/mL","min":2,"max":18}]}', 410),
+   N'{"params":[{"name":"Prolactin","unit":"ng/mL","maleMin":2,"maleMax":18,"femaleMin":2,"femaleMax":29}]}', 410),
 
   (N'ENDO-CORTISOL', N'Serum Cortisol (Morning)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Cortisol (AM)","unit":"µg/dL","min":6.2,"max":19.4}]}', 420),
+   N'{"params":[{"name":"Cortisol (AM)","unit":"µg/dL","maleMin":6.2,"maleMax":19.4,"femaleMin":6.2,"femaleMax":19.4}]}', 420),
 
   (N'ENDO-VITD', N'Vitamin D (25-OH)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"25-OH Vitamin D","unit":"ng/mL","min":30,"max":100}]}', 430),
+   N'{"params":[{"name":"25-OH Vitamin D","unit":"ng/mL","maleMin":30,"maleMax":100,"femaleMin":30,"femaleMax":100}]}', 430),
 
   (N'ENDO-VITB12', N'Vitamin B12', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Vitamin B12","unit":"pg/mL","min":200,"max":900}]}', 440);
+   N'{"params":[{"name":"Vitamin B12","unit":"pg/mL","maleMin":200,"maleMax":900,"femaleMin":200,"femaleMax":900}]}', 440);
 
 
   /* ===== Insert only missing (hospital, TestCode) combinations, for every active hospital ===== */

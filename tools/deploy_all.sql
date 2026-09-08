@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-09-08 13:06  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-09-08 13:49  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -10674,6 +10674,37 @@ GO
 
 IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.TransfusionEvent') AND name = 'EncounterId' AND is_nullable = 0)
   ALTER TABLE dbo.TransfusionEvent ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/backfill_hospital_department_mappings.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Backfills dbo.HospitalDepartmentMappings for doctors whose department was assigned via
+-- DoctorUpdateHandler before it started auto-creating the mapping row (see easyHMSAPI commit
+-- fixing DoctorUpdateHandler.cs). Symptom: doctor's PrimaryDepartment/DoctorDepartments were set
+-- correctly, but the department never appeared in the appointment board's department dropdown,
+-- because GetAppointmentDepartmentsHandler reads only HospitalDepartmentMappings.
+-- Safe to re-run: only inserts (HospitalID, DepartmentID) pairs that don't already exist.
+INSERT INTO dbo.HospitalDepartmentMappings (MappingID, HospitalID, DepartmentID, IsActive, MappedAt)
+SELECT DISTINCT NEWID(), src.HospitalID, src.DepartmentID, 1, SYSUTCDATETIME()
+FROM (
+    SELECT dd.HospitalID, dd.DepartmentID
+    FROM dbo.DoctorDepartments dd
+
+    UNION
+
+    SELECT doc.HospitalID, doc.PrimaryDepartmentID AS DepartmentID
+    FROM dbo.Doctors doc
+    WHERE doc.PrimaryDepartmentID IS NOT NULL
+) src
+WHERE NOT EXISTS (
+    SELECT 1 FROM dbo.HospitalDepartmentMappings hdm
+    WHERE hdm.HospitalID = src.HospitalID AND hdm.DepartmentID = src.DepartmentID
+);
 GO
 
 GO

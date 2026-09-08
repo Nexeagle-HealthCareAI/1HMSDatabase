@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-08-20 12:25  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-09-08 13:06  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -1709,6 +1709,16 @@ CREATE TABLE dbo.Encounter
     CONSTRAINT PK_Encounter PRIMARY KEY CLUSTERED (EncounterId)
 );
 END
+GO
+
+-- Existing DBs: optional visit-date override, chosen once at visit creation. NULL means every
+-- charge/invoice on this encounter uses the real current time, unchanged from before this column
+-- existed. When set, AddChargeEventHandler/CreateDraftInvoiceHandler use it instead.
+IF COL_LENGTH('dbo.Encounter','ServiceDate') IS NULL
+BEGIN
+  ALTER TABLE dbo.Encounter ADD ServiceDate DATETIME2(3) NULL;
+END
+GO
 
 IF OBJECT_ID('dbo.BillingChargeEvent','U') IS NULL
 BEGIN
@@ -1780,6 +1790,19 @@ BEGIN
 END
 GO
 
+-- Existing DBs: add backdated-billing audit columns to BillingChargeEvent if not already present.
+IF COL_LENGTH('dbo.BillingChargeEvent','IsBackdated') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingChargeEvent ADD IsBackdated BIT NOT NULL CONSTRAINT DF_BCE_IsBackdated DEFAULT (0);
+END
+GO
+
+IF COL_LENGTH('dbo.BillingChargeEvent','BackdateReason') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingChargeEvent ADD BackdateReason NVARCHAR(500) NULL;
+END
+GO
+
 
 IF OBJECT_ID('dbo.BillingInvoice','U') IS NULL
 BEGIN
@@ -1820,6 +1843,20 @@ BEGIN
     CONSTRAINT PK_BillingInvoice PRIMARY KEY CLUSTERED (InvoiceId)
   );
 END
+GO
+
+-- Existing DBs: add backdated-billing audit columns to BillingInvoice if not already present.
+IF COL_LENGTH('dbo.BillingInvoice','IsBackdated') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingInvoice ADD IsBackdated BIT NOT NULL CONSTRAINT DF_INV_IsBackdated DEFAULT (0);
+END
+GO
+
+IF COL_LENGTH('dbo.BillingInvoice','BackdateReason') IS NULL
+BEGIN
+  ALTER TABLE dbo.BillingInvoice ADD BackdateReason NVARCHAR(500) NULL;
+END
+GO
 
 
 IF OBJECT_ID('dbo.BillingInvoiceChargeEvent','U') IS NULL
@@ -3196,6 +3233,70 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_free_tier_usage.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Usage-based free tier: replaces the old time-based "1 month trial" lockout. A hospital still
+-- on the Trial subscription status gets a pooled monthly quota of "patient management actions"
+-- (IPD admission, OPD appointment -- online-confirm and walk-in, pathology order, pharmacy
+-- checkout) rather than being cut off once a calendar trial period ends. See
+-- HospitalSubscription.GetEffectiveStatus (easyHMSAPI) -- Trial no longer auto-expires by date.
+
+IF OBJECT_ID('dbo.PlatformSetting', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PlatformSetting (
+        SettingKey NVARCHAR(100) NOT NULL CONSTRAINT PK_PlatformSetting PRIMARY KEY,
+        SettingValue NVARCHAR(500) NOT NULL,
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_PlatformSetting_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedBy NVARCHAR(200) NULL
+    );
+
+    PRINT 'Created table PlatformSetting';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM dbo.PlatformSetting WHERE SettingKey = 'FreeTierMonthlyLimit')
+BEGIN
+    INSERT INTO dbo.PlatformSetting (SettingKey, SettingValue, UpdatedBy) VALUES ('FreeTierMonthlyLimit', '100', 'SYSTEM');
+    PRINT 'Seeded FreeTierMonthlyLimit = 100';
+END
+GO
+
+-- Per-hospital override -- absent row means "use the global PlatformSetting default".
+IF OBJECT_ID('dbo.HospitalFreeTierLimit', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HospitalFreeTierLimit (
+        HospitalId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_HospitalFreeTierLimit PRIMARY KEY CONSTRAINT FK_HospitalFreeTierLimit_Hospitals FOREIGN KEY REFERENCES dbo.Hospitals(HospitalID),
+        MonthlyLimit INT NOT NULL,
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HospitalFreeTierLimit_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedBy NVARCHAR(200) NULL
+    );
+
+    PRINT 'Created table HospitalFreeTierLimit';
+END
+GO
+
+-- One row per (HospitalId, YearMonth), UsedCount incremented atomically (UPDLOCK/HOLDLOCK) by
+-- easyHMSAPI's UsageLimitService on every countable action -- same raw-SQL row-locking
+-- convention as RecordInventoryMovementRequestModel's handler.
+IF OBJECT_ID('dbo.HospitalMonthlyUsage', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HospitalMonthlyUsage (
+        HospitalId UNIQUEIDENTIFIER NOT NULL CONSTRAINT FK_HospitalMonthlyUsage_Hospitals FOREIGN KEY REFERENCES dbo.Hospitals(HospitalID),
+        YearMonth CHAR(7) NOT NULL, -- 'YYYY-MM'
+        UsedCount INT NOT NULL CONSTRAINT DF_HospitalMonthlyUsage_UsedCount DEFAULT (0),
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HospitalMonthlyUsage_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        CONSTRAINT PK_HospitalMonthlyUsage PRIMARY KEY (HospitalId, YearMonth)
+    );
+
+    PRINT 'Created table HospitalMonthlyUsage';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_hospital_leads.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -3241,6 +3342,258 @@ BEGIN
 
   CREATE INDEX IX_HospitalLeads_HospitalId_OccurredAt ON dbo.HospitalLeads (HospitalId, OccurredAt);
   CREATE INDEX IX_HospitalLeads_SessionId ON dbo.HospitalLeads (SessionId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_hr.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- HR Suite Tables: Employee Management, Roster, Attendance, Leaves, and Payroll
+
+-- 1. HrEmployees
+IF OBJECT_ID('dbo.HrEmployees', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrEmployees (
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrEmployee_Id DEFAULT NEWSEQUENTIALID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        EmployeeCode NVARCHAR(50) NOT NULL,
+        FirstName NVARCHAR(100) NOT NULL,
+        LastName NVARCHAR(100) NOT NULL,
+        UserId UNIQUEIDENTIFIER NULL,
+        Gender NVARCHAR(20) NOT NULL,
+        DateOfBirth DATE NOT NULL,
+        BloodGroup NVARCHAR(10) NULL,
+        ContactNumber NVARCHAR(20) NOT NULL,
+        Email NVARCHAR(150) NULL,
+        PhotoObjectUrl NVARCHAR(500) NULL,
+        EmploymentType NVARCHAR(50) NOT NULL,
+        DepartmentId UNIQUEIDENTIFIER NOT NULL,
+        Designation NVARCHAR(100) NOT NULL,
+        ReportingManagerId UNIQUEIDENTIFIER NULL,
+        DateOfJoining DATE NOT NULL,
+        ProbationEndDate DATE NULL,
+        PanNumber NVARCHAR(20) NOT NULL,
+        AadhaarNumberHash NVARCHAR(128) NULL,
+        UanNumber NVARCHAR(30) NULL,
+        EsiNumber NVARCHAR(30) NULL,
+        BankName NVARCHAR(100) NULL,
+        BankAccountNumber NVARCHAR(50) NULL,
+        BankIfsc NVARCHAR(20) NULL,
+        PayrollTrack NVARCHAR(30) NOT NULL CONSTRAINT DF_HrEmployee_PayrollTrack DEFAULT 'TRACK_A_SALARIED',
+        IsActive BIT NOT NULL CONSTRAINT DF_HrEmployee_IsActive DEFAULT 1,
+        Status NVARCHAR(20) NOT NULL CONSTRAINT DF_HrEmployee_Status DEFAULT 'ACTIVE',
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrEmployee_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy NVARCHAR(100) NULL,
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrEmployee_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy NVARCHAR(100) NULL,
+        RowVersion ROWVERSION NULL,
+        CONSTRAINT PK_HrEmployees PRIMARY KEY CLUSTERED (HrEmployeeId)
+    );
+END
+GO
+
+-- 2. HrEmployeeCredentials
+IF OBJECT_ID('dbo.HrEmployeeCredentials', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrEmployeeCredentials (
+        HrEmployeeCredentialId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrEmployeeCredential_Id DEFAULT NEWSEQUENTIALID(),
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        CouncilName NVARCHAR(150) NOT NULL,
+        RegistrationNumber NVARCHAR(100) NOT NULL,
+        QualificationDegree NVARCHAR(100) NOT NULL,
+        DegreeCompletionYear INT NOT NULL,
+        LicenseValidUntil DATE NOT NULL,
+        DocumentScanUrl NVARCHAR(500) NULL,
+        IsVerified BIT NOT NULL CONSTRAINT DF_HrEmployeeCredential_IsVerified DEFAULT 0,
+        VerifiedByUserId UNIQUEIDENTIFIER NULL,
+        VerifiedAt DATETIME2 NULL,
+        BlsExpiryDate DATE NULL,
+        AclsExpiryDate DATE NULL,
+        CONSTRAINT PK_HrEmployeeCredentials PRIMARY KEY CLUSTERED (HrEmployeeCredentialId)
+    );
+END
+GO
+
+-- 3. HrHospitalShifts
+IF OBJECT_ID('dbo.HrHospitalShifts', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrHospitalShifts (
+        HrHospitalShiftId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrHospitalShift_Id DEFAULT NEWSEQUENTIALID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        ShiftCode NVARCHAR(20) NOT NULL,
+        ShiftName NVARCHAR(100) NOT NULL,
+        StartTime TIME NOT NULL,
+        EndTime TIME NOT NULL,
+        GracePeriodMinutes INT NOT NULL CONSTRAINT DF_HrHospitalShift_GracePeriod DEFAULT 15,
+        HandoverBufferMinutes INT NOT NULL CONSTRAINT DF_HrHospitalShift_HandoverBuffer DEFAULT 15,
+        NightAllowanceAmount DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrHospitalShift_NightAllowance DEFAULT 0,
+        CalloutFeeAmount DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrHospitalShift_CalloutFee DEFAULT 0,
+        IsActive BIT NOT NULL CONSTRAINT DF_HrHospitalShift_IsActive DEFAULT 1,
+        ApplicableRolesJson NVARCHAR(500) NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrHospitalShift_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HrHospitalShifts PRIMARY KEY CLUSTERED (HrHospitalShiftId)
+    );
+END
+GO
+
+-- 4. HrDutyRosters
+IF OBJECT_ID('dbo.HrDutyRosters', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrDutyRosters (
+        HrDutyRosterId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrDutyRoster_Id DEFAULT NEWSEQUENTIALID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        HrHospitalShiftId UNIQUEIDENTIFIER NOT NULL,
+        RosterDate DATE NOT NULL,
+        IsOnCall BIT NOT NULL CONSTRAINT DF_HrDutyRoster_IsOnCall DEFAULT 0,
+        WardId UNIQUEIDENTIFIER NULL,
+        Status NVARCHAR(30) NOT NULL CONSTRAINT DF_HrDutyRoster_Status DEFAULT 'SCHEDULED',
+        RestPeriodViolation BIT NOT NULL CONSTRAINT DF_HrDutyRoster_RestPeriodViolation DEFAULT 0,
+        ViolationMessage NVARCHAR(300) NULL,
+        SwappedWithRosterId UNIQUEIDENTIFIER NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrDutyRoster_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy NVARCHAR(100) NULL,
+        CONSTRAINT PK_HrDutyRosters PRIMARY KEY CLUSTERED (HrDutyRosterId)
+    );
+END
+GO
+
+-- 5. HrAttendanceLogs
+IF OBJECT_ID('dbo.HrAttendanceLogs', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrAttendanceLogs (
+        HrAttendanceLogId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrAttendanceLog_Id DEFAULT NEWSEQUENTIALID(),
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        AttendanceDate DATE NOT NULL,
+        PunchIn DATETIME2 NULL,
+        PunchOut DATETIME2 NULL,
+        TotalHoursWorked DECIMAL(5,2) NULL,
+        OvertimeHours DECIMAL(5,2) NOT NULL CONSTRAINT DF_HrAttendanceLog_Overtime DEFAULT 0,
+        PunchSource NVARCHAR(50) NOT NULL CONSTRAINT DF_HrAttendanceLog_PunchSource DEFAULT 'BIOMETRIC',
+        BiometricDeviceId NVARCHAR(100) NULL,
+        GeoLocation NVARCHAR(100) NULL,
+        Status NVARCHAR(30) NOT NULL CONSTRAINT DF_HrAttendanceLog_Status DEFAULT 'PRESENT',
+        Notes NVARCHAR(300) NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrAttendanceLog_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HrAttendanceLogs PRIMARY KEY CLUSTERED (HrAttendanceLogId)
+    );
+END
+GO
+
+-- 6. HrLeaveBalances
+IF OBJECT_ID('dbo.HrLeaveBalances', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrLeaveBalances (
+        HrLeaveBalanceId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrLeaveBalance_Id DEFAULT NEWSEQUENTIALID(),
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        Year INT NOT NULL,
+        CasualLeaveBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_CL DEFAULT 12.0,
+        SickLeaveBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_SL DEFAULT 12.0,
+        EarnedLeaveBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_EL DEFAULT 15.0,
+        CompOffBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_CompOff DEFAULT 0.0,
+        MaternityLeaveBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_Maternity DEFAULT 0.0,
+        CmeLeaveBalance DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_CME DEFAULT 5.0,
+        CasualLeaveUsed DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_CLUsed DEFAULT 0.0,
+        SickLeaveUsed DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_SLUsed DEFAULT 0.0,
+        EarnedLeaveUsed DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrLeaveBalance_ELUsed DEFAULT 0.0,
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrLeaveBalance_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HrLeaveBalances PRIMARY KEY CLUSTERED (HrLeaveBalanceId)
+    );
+END
+GO
+
+-- 7. HrLeaveRequests
+IF OBJECT_ID('dbo.HrLeaveRequests', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrLeaveRequests (
+        HrLeaveRequestId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrLeaveRequest_Id DEFAULT NEWSEQUENTIALID(),
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        LeaveType NVARCHAR(30) NOT NULL,
+        StartDate DATE NOT NULL,
+        EndDate DATE NOT NULL,
+        TotalDays DECIMAL(4,1) NOT NULL,
+        Reason NVARCHAR(500) NOT NULL,
+        Status NVARCHAR(30) NOT NULL CONSTRAINT DF_HrLeaveRequest_Status DEFAULT 'PENDING',
+        ApprovedByUserId UNIQUEIDENTIFIER NULL,
+        ApprovedAt DATETIME2 NULL,
+        MedicalCertificateUrl NVARCHAR(500) NULL,
+        RejectionReason NVARCHAR(300) NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrLeaveRequest_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HrLeaveRequests PRIMARY KEY CLUSTERED (HrLeaveRequestId)
+    );
+END
+GO
+
+-- 8. HrPayrollRuns
+IF OBJECT_ID('dbo.HrPayrollRuns', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrPayrollRuns (
+        HrPayrollRunId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrPayrollRun_Id DEFAULT NEWSEQUENTIALID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        RunName NVARCHAR(100) NOT NULL,
+        Month INT NOT NULL,
+        Year INT NOT NULL,
+        Status NVARCHAR(30) NOT NULL CONSTRAINT DF_HrPayrollRun_Status DEFAULT 'DRAFT',
+        TotalGrossPayroll DECIMAL(15,2) NOT NULL,
+        TotalNetDisbursement DECIMAL(15,2) NOT NULL,
+        TotalPfContribution DECIMAL(12,2) NOT NULL,
+        TotalEsiContribution DECIMAL(12,2) NOT NULL,
+        TotalTdsDeducted DECIMAL(12,2) NOT NULL,
+        EmployeeCount INT NOT NULL,
+        ProcessedByUserId UNIQUEIDENTIFIER NULL,
+        ApprovedByUserId UNIQUEIDENTIFIER NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrPayrollRun_CreatedAt DEFAULT SYSUTCDATETIME(),
+        ApprovedAt DATETIME2 NULL,
+        DisbursedAt DATETIME2 NULL,
+        BankExportFileUrl NVARCHAR(500) NULL,
+        CONSTRAINT PK_HrPayrollRuns PRIMARY KEY CLUSTERED (HrPayrollRunId)
+    );
+END
+GO
+
+-- 9. HrPayslips
+IF OBJECT_ID('dbo.HrPayslips', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrPayslips (
+        HrPayslipId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrPayslip_Id DEFAULT NEWSEQUENTIALID(),
+        HrPayrollRunId UNIQUEIDENTIFIER NOT NULL,
+        HrEmployeeId UNIQUEIDENTIFIER NOT NULL,
+        PayslipNumber NVARCHAR(50) NOT NULL,
+        PayrollTrack NVARCHAR(30) NOT NULL,
+        TotalDaysInMonth INT NOT NULL,
+        PayableDays DECIMAL(4,1) NOT NULL,
+        OvertimeDays DECIMAL(4,1) NOT NULL CONSTRAINT DF_HrPayslip_Overtime DEFAULT 0,
+        NightShiftCount INT NOT NULL CONSTRAINT DF_HrPayslip_NightShift DEFAULT 0,
+        BasicEarned DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Basic DEFAULT 0,
+        HraEarned DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_HRA DEFAULT 0,
+        AllowancesEarned DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Allowances DEFAULT 0,
+        OvertimeAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_OvertimeAmt DEFAULT 0,
+        NightAllowanceAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_NightAmt DEFAULT 0,
+        IncentivesAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Incentives DEFAULT 0,
+        RetainerAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Retainer DEFAULT 0,
+        OpdShareAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Opd DEFAULT 0,
+        IpdVisitAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Ipd DEFAULT 0,
+        SurgeryShareAmount DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrPayslip_Surgery DEFAULT 0,
+        GrossEarnings DECIMAL(12,2) NOT NULL,
+        PfEmployee DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_Pf DEFAULT 0,
+        EsiEmployee DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_Esi DEFAULT 0,
+        ProfTax DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_ProfTax DEFAULT 0,
+        TdsDeducted DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_Tds DEFAULT 0,
+        LoanInstallment DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_Loan DEFAULT 0,
+        TotalDeductions DECIMAL(12,2) NOT NULL,
+        NetSalary DECIMAL(12,2) NOT NULL,
+        PfEmployer DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_PfEmp DEFAULT 0,
+        EsiEmployer DECIMAL(10,2) NOT NULL CONSTRAINT DF_HrPayslip_EsiEmp DEFAULT 0,
+        PdfUrl NVARCHAR(500) NULL,
+        IsSentWhatsapp BIT NOT NULL CONSTRAINT DF_HrPayslip_SentWhatsapp DEFAULT 0,
+        WhatsappSentAt DATETIME2 NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_HrPayslip_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HrPayslips PRIMARY KEY CLUSTERED (HrPayslipId)
+    );
 END
 GO
 
@@ -3784,7 +4137,7 @@ BEGIN
     CONSTRAINT PK_Indent PRIMARY KEY CLUSTERED (IndentId),
     CONSTRAINT UX_IND_Number UNIQUE (HospitalId, IndentNumber),
     -- FK_IND_Store deferred to create_tables_zz_foreign_keys.sql: Store sorts AFTER this file alphabetically.
-    CONSTRAINT CK_IND_Status CHECK ([Status] IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','CONVERTED_TO_PO','CANCELLED'))
+    CONSTRAINT CK_IND_Status CHECK ([Status] IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','CONVERTED_TO_PO','PARTIALLY_ISSUED','ISSUED','CANCELLED'))
   );
 END
 GO
@@ -5690,6 +6043,324 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pharmacy_print_settings.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3b: statutory/print fields for pharmacy bills (Drug License numbers, FSSAI,
+-- registered pharmacist, return policy). Separate from InvoicePrintSettings (generic font/margin
+-- config for the hospital's general invoice) â€” pharmacy bills carry Drugs & Cosmetics Act-mandated
+-- fields no other bill type needs. One row per hospital.
+
+IF OBJECT_ID('dbo.PharmacyPrintSettings','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PharmacyPrintSettings
+  (
+    PharmacyPrintSettingsId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PPS_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId              UNIQUEIDENTIFIER NOT NULL,
+
+    TradeName               NVARCHAR(200)    NULL,
+    Dl20BNumber              NVARCHAR(100)    NULL,
+    Dl21BNumber              NVARCHAR(100)    NULL,
+    FssaiNumber              NVARCHAR(50)     NULL,
+    PharmacistName           NVARCHAR(150)    NULL,
+    PharmacistRegNo          NVARCHAR(100)    NULL,
+    ReturnPolicyText         NVARCHAR(1000)   NULL,
+    ShowVerificationQr       BIT              NOT NULL CONSTRAINT DF_PPS_ShowQr DEFAULT (1),
+
+    CreatedAt                DATETIME2(3)     NOT NULL CONSTRAINT DF_PPS_CreatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedAt                DATETIME2(3)     NOT NULL CONSTRAINT DF_PPS_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy                NVARCHAR(100)    NULL,
+
+    CONSTRAINT PK_PharmacyPrintSettings PRIMARY KEY CLUSTERED (PharmacyPrintSettingsId),
+    CONSTRAINT FK_PPS_Hospital FOREIGN KEY (HospitalId) REFERENCES dbo.Hospitals(HospitalID)
+  );
+
+  CREATE UNIQUE INDEX UX_PPS_Hospital ON dbo.PharmacyPrintSettings (HospitalId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pharmacy_return.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3d: patient return/restock ledger. Deliberately separate from
+-- BillingInvoice/BillingChargeEvent â€” no partial-qty adjustment primitive exists on a charge event
+-- today, and voiding+reposting the whole line was rejected, so the return and its refund amount
+-- live entirely here. The original invoice rows are never touched by this workflow.
+
+IF OBJECT_ID('dbo.PharmacyReturn','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PharmacyReturn
+  (
+    ReturnId           UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PHRET_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
+    InvoiceId          UNIQUEIDENTIFIER NOT NULL,
+    InvoiceNo          NVARCHAR(30)     NULL,
+    PatientId          NVARCHAR(50)     NULL,
+    EncounterId        UNIQUEIDENTIFIER NOT NULL,
+
+    ReturnNo           NVARCHAR(30)     NOT NULL,
+    TotalRefundAmount  DECIMAL(18,2)    NOT NULL CONSTRAINT DF_PHRET_TotalRefund DEFAULT (0),
+    RefundMode         NVARCHAR(20)     NULL,
+    Notes              NVARCHAR(500)    NULL,
+
+    ReturnedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PHRET_ReturnedAt DEFAULT SYSUTCDATETIME(),
+    ReturnedBy         NVARCHAR(200)    NULL,
+    ReturnedByUserId   UNIQUEIDENTIFIER NULL,
+
+    CreatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_PHRET_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_PharmacyReturn PRIMARY KEY CLUSTERED (ReturnId),
+    CONSTRAINT UX_PHRET_Number UNIQUE (HospitalId, ReturnNo),
+    CONSTRAINT FK_PHRET_Invoice FOREIGN KEY (InvoiceId) REFERENCES dbo.BillingInvoice(InvoiceId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PHRET_HospitalTime' AND object_id=OBJECT_ID('dbo.PharmacyReturn'))
+BEGIN
+  CREATE INDEX IX_PHRET_HospitalTime
+  ON dbo.PharmacyReturn(HospitalId, ReturnedAt DESC);
+END
+GO
+
+IF OBJECT_ID('dbo.PharmacyReturnLine','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PharmacyReturnLine
+  (
+    ReturnLineId    UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PHRETL_Id DEFAULT NEWSEQUENTIALID(),
+
+    ReturnId        UNIQUEIDENTIFIER NOT NULL,
+    ChargeEventId   UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId UNIQUEIDENTIFIER NOT NULL,
+    BatchId         UNIQUEIDENTIFIER NOT NULL,
+    ReturnedQty     DECIMAL(18,3)    NOT NULL,
+    UnitPrice       DECIMAL(18,2)    NOT NULL,
+    RefundAmount    DECIMAL(18,2)    NOT NULL,
+
+    CONSTRAINT PK_PharmacyReturnLine PRIMARY KEY CLUSTERED (ReturnLineId),
+    CONSTRAINT FK_PHRETL_Return FOREIGN KEY (ReturnId) REFERENCES dbo.PharmacyReturn(ReturnId) ON DELETE CASCADE,
+    CONSTRAINT FK_PHRETL_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT FK_PHRETL_Batch FOREIGN KEY (BatchId) REFERENCES dbo.Batch(BatchId),
+    CONSTRAINT CK_PHRETL_Qty CHECK (ReturnedQty > 0),
+    CONSTRAINT CK_PHRETL_UnitPrice CHECK (UnitPrice >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PHRETL_Return' AND object_id=OBJECT_ID('dbo.PharmacyReturnLine'))
+BEGIN
+  CREATE INDEX IX_PHRETL_Return
+  ON dbo.PharmacyReturnLine(ReturnId);
+END
+GO
+
+-- Re-validation of the returnable ceiling (dispensed minus already-returned) filters on
+-- (ChargeEventId, BatchId) on every call â€” see GetReturnableInvoiceLinesHandler / CreatePharmacyReturnHandler.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PHRETL_ChargeEventBatch' AND object_id=OBJECT_ID('dbo.PharmacyReturnLine'))
+BEGIN
+  CREATE INDEX IX_PHRETL_ChargeEventBatch
+  ON dbo.PharmacyReturnLine(ChargeEventId, BatchId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pharmacy_salt_composition.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3c: normalized Molecule/SaltComposition catalog driving 1-click generic
+-- substitution. Global (not per-hospital) â€” a composition like "Amoxicillin 500mg + Clavulanic
+-- Acid 125mg" is the same everywhere, only which brands/items a hospital stocks differs.
+
+IF OBJECT_ID('dbo.Molecule','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Molecule
+  (
+    MoleculeId  UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_Molecule_Id DEFAULT NEWSEQUENTIALID(),
+    Name        NVARCHAR(150)    NOT NULL,
+    CreatedAt   DATETIME2(3)     NOT NULL CONSTRAINT DF_Molecule_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_Molecule PRIMARY KEY CLUSTERED (MoleculeId)
+  );
+
+  CREATE UNIQUE INDEX UX_Molecule_Name ON dbo.Molecule (Name);
+END
+GO
+
+IF OBJECT_ID('dbo.SaltComposition','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.SaltComposition
+  (
+    SaltCompositionId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SaltComposition_Id DEFAULT NEWSEQUENTIALID(),
+    DisplayName       NVARCHAR(300)    NOT NULL,
+    DosageForm        NVARCHAR(50)     NULL,
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_SaltComposition_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_SaltComposition PRIMARY KEY CLUSTERED (SaltCompositionId)
+  );
+END
+GO
+
+IF OBJECT_ID('dbo.SaltCompositionComponent','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.SaltCompositionComponent
+  (
+    SaltCompositionComponentId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SCC_Id DEFAULT NEWSEQUENTIALID(),
+    SaltCompositionId          UNIQUEIDENTIFIER NOT NULL,
+    MoleculeId                 UNIQUEIDENTIFIER NOT NULL,
+    StrengthValue              DECIMAL(10,3)    NOT NULL,
+    StrengthUnit               NVARCHAR(10)     NOT NULL,
+
+    CONSTRAINT PK_SaltCompositionComponent PRIMARY KEY CLUSTERED (SaltCompositionComponentId),
+    CONSTRAINT FK_SCC_Composition FOREIGN KEY (SaltCompositionId) REFERENCES dbo.SaltComposition(SaltCompositionId),
+    CONSTRAINT FK_SCC_Molecule FOREIGN KEY (MoleculeId) REFERENCES dbo.Molecule(MoleculeId)
+  );
+
+  CREATE INDEX IX_SCC_Composition ON dbo.SaltCompositionComponent (SaltCompositionId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pharmacy_schedule_register.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3b: statutory register for regulated-but-non-narcotic drug schedules (Schedule H1
+-- today). One row per dispense of a ScheduleClass=H1 item. Separate from NarcoticRegisterEntry
+-- (which tracks 3D/3E/3H forms and mandates a witness under NDPS rules) since the Drugs &
+-- Cosmetics Rules H1 register only needs date/patient/prescriber/qty.
+
+IF OBJECT_ID('dbo.DrugScheduleRegisterEntry','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.DrugScheduleRegisterEntry
+  (
+    RegisterEntryId   UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_DSRE_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId   UNIQUEIDENTIFIER NOT NULL,
+    BatchId           UNIQUEIDENTIFIER NOT NULL,
+    StoreId           UNIQUEIDENTIFIER NOT NULL,
+
+    ScheduleClass     NVARCHAR(20)     NOT NULL,
+    Qty               DECIMAL(18,3)    NOT NULL,
+
+    PatientId         NVARCHAR(50)     NULL,
+    EncounterId       UNIQUEIDENTIFIER NULL,
+    PrescriberRef     NVARCHAR(200)    NULL,
+
+    DispensedBy       NVARCHAR(100)    NULL,
+    DispensedByUserId UNIQUEIDENTIFIER NULL,
+
+    RecordedAt        DATETIME2(3)     NOT NULL CONSTRAINT DF_DSRE_RecordedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_DrugScheduleRegisterEntry PRIMARY KEY CLUSTERED (RegisterEntryId),
+    CONSTRAINT FK_DSRE_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT FK_DSRE_Batch FOREIGN KEY (BatchId) REFERENCES dbo.Batch(BatchId),
+    CONSTRAINT FK_DSRE_Store FOREIGN KEY (StoreId) REFERENCES dbo.Store(StoreId)
+  );
+
+  CREATE INDEX IX_DSRE_Hospital_RecordedAt ON dbo.DrugScheduleRegisterEntry (HospitalId, RecordedAt DESC);
+  CREATE INDEX IX_DSRE_Item ON dbo.DrugScheduleRegisterEntry (InventoryItemId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pharmacy_vendor_return.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3d: return-to-vendor (RTV) debit note. Stock is deducted for real via the shared
+-- InventoryMovement handler (ADJUST_OUT) before this note is written â€” these two tables are the
+-- vendor-facing paper trail, not the source of truth for stock.
+
+IF OBJECT_ID('dbo.VendorReturnNote','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.VendorReturnNote
+  (
+    VendorReturnId    UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_RTV_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+    VendorId          UNIQUEIDENTIFIER NOT NULL,
+
+    ReturnNoteNo      NVARCHAR(30)     NOT NULL,
+    TotalQty          DECIMAL(18,3)    NOT NULL CONSTRAINT DF_RTV_TotalQty DEFAULT (0),
+    TotalValue        DECIMAL(18,2)    NOT NULL CONSTRAINT DF_RTV_TotalValue DEFAULT (0),
+    Notes             NVARCHAR(500)    NULL,
+
+    GeneratedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_RTV_GeneratedAt DEFAULT SYSUTCDATETIME(),
+    GeneratedBy       NVARCHAR(200)    NULL,
+    GeneratedByUserId UNIQUEIDENTIFIER NULL,
+
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_RTV_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_VendorReturnNote PRIMARY KEY CLUSTERED (VendorReturnId),
+    CONSTRAINT UX_RTV_Number UNIQUE (HospitalId, ReturnNoteNo),
+    CONSTRAINT FK_RTV_Vendor FOREIGN KEY (VendorId) REFERENCES dbo.Vendor(VendorId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_RTV_HospitalVendor' AND object_id=OBJECT_ID('dbo.VendorReturnNote'))
+BEGIN
+  CREATE INDEX IX_RTV_HospitalVendor
+  ON dbo.VendorReturnNote(HospitalId, VendorId, GeneratedAt DESC);
+END
+GO
+
+IF OBJECT_ID('dbo.VendorReturnLine','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.VendorReturnLine
+  (
+    VendorReturnLineId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_RTVL_Id DEFAULT NEWSEQUENTIALID(),
+
+    VendorReturnId      UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId      UNIQUEIDENTIFIER NOT NULL,
+    BatchId              UNIQUEIDENTIFIER NOT NULL,
+    BatchNumber          NVARCHAR(50)     NULL,
+    ExpiryDate           DATETIME2(3)     NULL,
+    Qty                  DECIMAL(18,3)    NOT NULL,
+    UnitCost             DECIMAL(18,2)    NOT NULL,
+    LineValue            DECIMAL(18,2)    NOT NULL,
+
+    CONSTRAINT PK_VendorReturnLine PRIMARY KEY CLUSTERED (VendorReturnLineId),
+    CONSTRAINT FK_RTVL_Return FOREIGN KEY (VendorReturnId) REFERENCES dbo.VendorReturnNote(VendorReturnId) ON DELETE CASCADE,
+    CONSTRAINT FK_RTVL_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT FK_RTVL_Batch FOREIGN KEY (BatchId) REFERENCES dbo.Batch(BatchId),
+    CONSTRAINT CK_RTVL_Qty CHECK (Qty > 0),
+    CONSTRAINT CK_RTVL_UnitCost CHECK (UnitCost >= 0)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_RTVL_Return' AND object_id=OBJECT_ID('dbo.VendorReturnLine'))
+BEGIN
+  CREATE INDEX IX_RTVL_Return
+  ON dbo.VendorReturnLine(VendorReturnId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_rate_card.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -6893,6 +7564,160 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_zz_hr_foreign_keys.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- HR Foreign Keys (Deferred)
+
+-- HrEmployee -> Hospital
+IF OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Hospital','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrEmployee_Hospital')
+BEGIN
+  ALTER TABLE dbo.HrEmployees
+    ADD CONSTRAINT FK_HrEmployee_Hospital FOREIGN KEY (HospitalId)
+    REFERENCES dbo.Hospital(HospitalId);
+END
+GO
+
+-- HrEmployee -> Department
+IF OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Department','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrEmployee_Department')
+BEGIN
+  ALTER TABLE dbo.HrEmployees
+    ADD CONSTRAINT FK_HrEmployee_Department FOREIGN KEY (DepartmentId)
+    REFERENCES dbo.Department(DepartmentId);
+END
+GO
+
+-- HrEmployeeCredential -> HrEmployee
+IF OBJECT_ID('dbo.HrEmployeeCredentials','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrEmployeeCredential_Employee')
+BEGIN
+  ALTER TABLE dbo.HrEmployeeCredentials
+    ADD CONSTRAINT FK_HrEmployeeCredential_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+-- HrHospitalShift -> Hospital
+IF OBJECT_ID('dbo.HrHospitalShifts','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Hospital','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrHospitalShift_Hospital')
+BEGIN
+  ALTER TABLE dbo.HrHospitalShifts
+    ADD CONSTRAINT FK_HrHospitalShift_Hospital FOREIGN KEY (HospitalId)
+    REFERENCES dbo.Hospital(HospitalId);
+END
+GO
+
+-- HrDutyRoster -> HrEmployee
+IF OBJECT_ID('dbo.HrDutyRosters','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrDutyRoster_Employee')
+BEGIN
+  ALTER TABLE dbo.HrDutyRosters
+    ADD CONSTRAINT FK_HrDutyRoster_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+-- HrDutyRoster -> HrHospitalShift
+IF OBJECT_ID('dbo.HrDutyRosters','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrHospitalShifts','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrDutyRoster_Shift')
+BEGIN
+  ALTER TABLE dbo.HrDutyRosters
+    ADD CONSTRAINT FK_HrDutyRoster_Shift FOREIGN KEY (HrHospitalShiftId)
+    REFERENCES dbo.HrHospitalShifts(HrHospitalShiftId);
+END
+GO
+
+-- HrAttendanceLog -> HrEmployee
+IF OBJECT_ID('dbo.HrAttendanceLogs','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrAttendanceLog_Employee')
+BEGIN
+  ALTER TABLE dbo.HrAttendanceLogs
+    ADD CONSTRAINT FK_HrAttendanceLog_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+-- HrLeaveBalance -> HrEmployee
+IF OBJECT_ID('dbo.HrLeaveBalances','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrLeaveBalance_Employee')
+BEGIN
+  ALTER TABLE dbo.HrLeaveBalances
+    ADD CONSTRAINT FK_HrLeaveBalance_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+-- HrLeaveRequest -> HrEmployee
+IF OBJECT_ID('dbo.HrLeaveRequests','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrLeaveRequest_Employee')
+BEGIN
+  ALTER TABLE dbo.HrLeaveRequests
+    ADD CONSTRAINT FK_HrLeaveRequest_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+-- HrPayrollRun -> Hospital
+IF OBJECT_ID('dbo.HrPayrollRuns','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Hospital','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrPayrollRun_Hospital')
+BEGIN
+  ALTER TABLE dbo.HrPayrollRuns
+    ADD CONSTRAINT FK_HrPayrollRun_Hospital FOREIGN KEY (HospitalId)
+    REFERENCES dbo.Hospital(HospitalId);
+END
+GO
+
+-- HrPayslip -> HrPayrollRun
+IF OBJECT_ID('dbo.HrPayslips','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrPayrollRuns','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrPayslip_PayrollRun')
+BEGIN
+  ALTER TABLE dbo.HrPayslips
+    ADD CONSTRAINT FK_HrPayslip_PayrollRun FOREIGN KEY (HrPayrollRunId)
+    REFERENCES dbo.HrPayrollRuns(HrPayrollRunId);
+END
+GO
+
+-- HrPayslip -> HrEmployee
+IF OBJECT_ID('dbo.HrPayslips','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrPayslip_Employee')
+BEGIN
+  ALTER TABLE dbo.HrPayslips
+    ADD CONSTRAINT FK_HrPayslip_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+ - -   H r E m p l o y e e   - >   U s e r 
+ I F   O B J E C T _ I D ( ' d b o . H r E m p l o y e e s ' , ' U ' )   I S   N O T   N U L L 
+       A N D   O B J E C T _ I D ( ' d b o . U s e r s ' , ' U ' )   I S   N O T   N U L L 
+       A N D   N O T   E X I S T S   ( S E L E C T   1   F R O M   s y s . f o r e i g n _ k e y s   W H E R E   n a m e   =   ' F K _ H r E m p l o y e e _ U s e r ' ) 
+ B E G I N 
+     A L T E R   T A B L E   d b o . H r E m p l o y e e s 
+         A D D   C O N S T R A I N T   F K _ H r E m p l o y e e _ U s e r   F O R E I G N   K E Y   ( U s e r I d ) 
+         R E F E R E N C E S   d b o . U s e r s ( U s e r I D ) ; 
+ E N D 
+ G O 
+  
+ 
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/dml_nightJob_scripts.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7458,6 +8283,35 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_batch_add_mrp_and_barcode.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3a: Batch.MRP (retail price at batch level, since MRP can differ per batch)
+-- and Batch.BarcodeValue (keyboard-wedge scan lookup key) for POS dispensing.
+IF COL_LENGTH('dbo.Batch', 'MRP') IS NULL
+BEGIN
+  ALTER TABLE dbo.Batch
+    ADD MRP DECIMAL(18,2) NULL;
+END
+GO
+
+IF COL_LENGTH('dbo.Batch', 'BarcodeValue') IS NULL
+BEGIN
+  ALTER TABLE dbo.Batch
+    ADD BarcodeValue NVARCHAR(100) NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_BATCH_BarcodeValue' AND object_id = OBJECT_ID('dbo.Batch'))
+BEGIN
+  CREATE INDEX IX_BATCH_BarcodeValue ON dbo.Batch (BarcodeValue) WHERE BarcodeValue IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_bedmaster_room_id.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7681,6 +8535,25 @@ GO
 IF COL_LENGTH('dbo.ClinicalOrderLine','IsHighAlert') IS NULL
   ALTER TABLE dbo.ClinicalOrderLine ADD IsHighAlert BIT NOT NULL
     CONSTRAINT DF_COL_IsHighAlert DEFAULT (0);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_clinicalorderline_add_linked_pathology_order_line.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Links an IPD ClinicalOrderLine (OrderType = LAB) to the structured PathologyOrderLine created
+-- alongside it, so the Pathology Lab workspace's results/report pipeline can pick up IPD lab
+-- orders too, not just OPD ones. Set once, at order-placement time, when the line's ChargeId
+-- resolves to a PathologyTestMaster row for this hospital; left NULL for lines that don't
+-- resolve to a catalogued test (free-text lab items, or a charge with no catalog test behind it).
+IF COL_LENGTH('dbo.ClinicalOrderLine', 'LinkedPathologyOrderLineId') IS NULL
+BEGIN
+  ALTER TABLE dbo.ClinicalOrderLine
+    ADD LinkedPathologyOrderLineId UNIQUEIDENTIFIER NULL;
+END
 GO
 
 GO
@@ -8032,6 +8905,21 @@ BEGIN
 
     IF COL_LENGTH('dbo.Doctors', 'RegistrationVerifiedByUserId') IS NULL
         ALTER TABLE dbo.Doctors ADD RegistrationVerifiedByUserId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_goodsreceiptnoteline_add_free_qty.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3c: trade-scheme free units ("10+1") on a GRN line, on top of the billed Qty.
+IF COL_LENGTH('dbo.GoodsReceiptNoteLine', 'FreeQty') IS NULL
+BEGIN
+  ALTER TABLE dbo.GoodsReceiptNoteLine
+    ADD FreeQty DECIMAL(18,3) NOT NULL CONSTRAINT DF_GRNLine_FreeQty DEFAULT (0);
 END
 GO
 
@@ -8395,6 +9283,29 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_indent_status_add_issued_states.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- CK_IND_Status was created before ISSUED/PARTIALLY_ISSUED existed as Indent statuses (added by
+-- alter_indent_internal_workflow.sql for internal store-to-store transfers via IssueIndent). The
+-- constraint was never updated, so every dispatch of an internal request fails at SaveChangesAsync
+-- with a generic "An error occurred while saving the entity changes" (CHECK constraint violation)
+-- - found live-testing the pharmacy request/dispatch feature.
+
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_IND_Status' AND parent_object_id = OBJECT_ID('dbo.Indent'))
+BEGIN
+  ALTER TABLE dbo.Indent DROP CONSTRAINT CK_IND_Status;
+END
+GO
+
+ALTER TABLE dbo.Indent ADD CONSTRAINT CK_IND_Status
+  CHECK ([Status] IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','CONVERTED_TO_PO','PARTIALLY_ISSUED','ISSUED','CANCELLED'));
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_instrument_set_store_link.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8553,6 +9464,256 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_inventoryitem_add_salt_composition.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3c: links an InventoryItem to its normalized SaltComposition â€” items sharing a
+-- SaltCompositionId (with live stock) are generic substitutes for each other.
+IF COL_LENGTH('dbo.InventoryItem', 'SaltCompositionId') IS NULL
+BEGIN
+  ALTER TABLE dbo.InventoryItem
+    ADD SaltCompositionId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_InventoryItem_SaltComposition')
+BEGIN
+  ALTER TABLE dbo.InventoryItem
+    ADD CONSTRAINT FK_InventoryItem_SaltComposition FOREIGN KEY (SaltCompositionId) REFERENCES dbo.SaltComposition(SaltCompositionId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_InventoryItem_SaltCompositionId' AND object_id = OBJECT_ID('dbo.InventoryItem'))
+BEGIN
+  CREATE INDEX IX_InventoryItem_SaltCompositionId ON dbo.InventoryItem (SaltCompositionId) WHERE SaltCompositionId IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_labconfiguration_add_accreditation_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds the accreditation badge + preprinted-stationery fields to LabConfiguration, shown on
+-- generated pathology report letterheads. Null/empty accreditation fields simply don't render
+-- their badge line -- no accreditation is a valid, common state for a Tier 3/4 facility, not an
+-- error. IsPreprintedStationery tells the report renderer to leave the configured top/bottom
+-- margin band blank instead of drawing the digital letterhead there.
+IF COL_LENGTH('dbo.LabConfiguration', 'NablAccreditationNumber') IS NULL
+BEGIN
+  ALTER TABLE dbo.LabConfiguration
+    ADD NablAccreditationNumber NVARCHAR(100) NULL,
+        NablLogoUrl NVARCHAR(500) NULL,
+        Iso15189Number NVARCHAR(100) NULL,
+        IcmrRegistrationId NVARCHAR(100) NULL,
+        IsPreprintedStationery BIT NOT NULL CONSTRAINT DF_LabConfiguration_IsPreprintedStationery DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_labconfiguration_add_identity_and_signoff.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Add lab identity and sign-off name columns to LabConfiguration
+-- Description: LabName/LabAddress/LabRegistrationNumber let a lab override the
+--              hospital's generic identity on its report letterhead; falls back
+--              to the Hospitals table fields when left null. TechnicianName/
+--              PathologistName print as a static manual sign-off line at the
+--              bottom of generated reports.
+-- =============================================================================
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabName')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabName NVARCHAR(200) NULL;
+    PRINT 'Added LabName column to LabConfiguration table';
+END
+ELSE PRINT 'LabName column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabAddress')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabAddress NVARCHAR(500) NULL;
+    PRINT 'Added LabAddress column to LabConfiguration table';
+END
+ELSE PRINT 'LabAddress column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabRegistrationNumber')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabRegistrationNumber NVARCHAR(100) NULL;
+    PRINT 'Added LabRegistrationNumber column to LabConfiguration table';
+END
+ELSE PRINT 'LabRegistrationNumber column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'TechnicianName')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD TechnicianName NVARCHAR(200) NULL;
+    PRINT 'Added TechnicianName column to LabConfiguration table';
+END
+ELSE PRINT 'TechnicianName column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'PathologistName')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD PathologistName NVARCHAR(200) NULL;
+    PRINT 'Added PathologistName column to LabConfiguration table';
+END
+ELSE PRINT 'PathologistName column already exists';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_labconfiguration_add_letterhead_mode.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds LabConfiguration.LetterheadMode -- which source the pathology report PDF draws its
+-- header/footer from: CUSTOM_TEMPLATE (the hospital's default PathologyReportTemplate),
+-- BLANK_PREPRINTED (leave the margin band empty, for physical pre-printed stationery), or
+-- SYSTEM_DEFAULT (an auto-generated hospital-branded header, same idea as billing invoices).
+-- A 3-state string rather than a bool -- IsPreprintedStationery (added by
+-- alter_labconfiguration_add_accreditation_fields.sql) can't cleanly distinguish "nothing
+-- configured" from "deliberately blank" from "deliberately default," so this supersedes its
+-- intent rather than building on top of it. Existing hospitals default to SYSTEM_DEFAULT --
+-- an upgrade from today's hardcoded plain-text header, not a regression.
+IF COL_LENGTH('dbo.LabConfiguration', 'LetterheadMode') IS NULL
+BEGIN
+  ALTER TABLE dbo.LabConfiguration
+    ADD LetterheadMode NVARCHAR(30) NOT NULL CONSTRAINT DF_LabConfiguration_LetterheadMode DEFAULT ('SYSTEM_DEFAULT');
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_labconfiguration_add_public_listing.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Add Doctor Dekho public listing columns to LabConfiguration
+-- Description: IsPubliclyListed is an independent opt-in (does not require
+--              Hospitals.IsPubliclyListed) that makes a lab discoverable on
+--              the public directory. LabCity/LabState/LabPincode are
+--              structured location fields (distinct from the freetext
+--              LabAddress column) needed for city/state search, mirroring
+--              Hospitals' own Location + City/State/Pincode split.
+-- =============================================================================
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'IsPubliclyListed')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD IsPubliclyListed BIT NOT NULL CONSTRAINT DF_LabConfiguration_IsPubliclyListed DEFAULT (0);
+    PRINT 'Added IsPubliclyListed column to LabConfiguration table';
+END
+ELSE PRINT 'IsPubliclyListed column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'PublicDescription')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD PublicDescription NVARCHAR(1000) NULL;
+    PRINT 'Added PublicDescription column to LabConfiguration table';
+END
+ELSE PRINT 'PublicDescription column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'PublicContactPhone')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD PublicContactPhone NVARCHAR(20) NULL;
+    PRINT 'Added PublicContactPhone column to LabConfiguration table';
+END
+ELSE PRINT 'PublicContactPhone column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'PublicContactEmail')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD PublicContactEmail NVARCHAR(256) NULL;
+    PRINT 'Added PublicContactEmail column to LabConfiguration table';
+END
+ELSE PRINT 'PublicContactEmail column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabCity')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabCity NVARCHAR(100) NULL;
+    PRINT 'Added LabCity column to LabConfiguration table';
+END
+ELSE PRINT 'LabCity column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabState')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabState NVARCHAR(100) NULL;
+    PRINT 'Added LabState column to LabConfiguration table';
+END
+ELSE PRINT 'LabState column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabPincode')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabPincode NVARCHAR(20) NULL;
+    PRINT 'Added LabPincode column to LabConfiguration table';
+END
+ELSE PRINT 'LabPincode column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'Latitude')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD Latitude DECIMAL(9,6) NULL;
+    PRINT 'Added Latitude column to LabConfiguration table';
+END
+ELSE PRINT 'Latitude column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'Longitude')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD Longitude DECIMAL(9,6) NULL;
+    PRINT 'Added Longitude column to LabConfiguration table';
+END
+ELSE PRINT 'Longitude column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'TestCategoriesJson')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD TestCategoriesJson NVARCHAR(1000) NULL;
+    PRINT 'Added TestCategoriesJson column to LabConfiguration table';
+END
+ELSE PRINT 'TestCategoriesJson column already exists';
+GO
+
+-- Separate batch: CREATE INDEX referencing LabCity/LabState/IsPubliclyListed must compile against
+-- a schema where those columns already exist -- combined into the same batch as the ALTER TABLE
+-- statements above, SQL Server fails to resolve them at compile time and the whole batch never
+-- executes (this is why the columns didn't actually get created on the first attempt at this
+-- migration, despite the deploy pipeline reporting success).
+IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'IX_LabConfiguration_City_State')
+BEGIN
+    CREATE INDEX IX_LabConfiguration_City_State ON dbo.LabConfiguration (LabCity, LabState) WHERE IsPubliclyListed = 1;
+    PRINT 'Added IX_LabConfiguration_City_State index to LabConfiguration table';
+END
+ELSE PRINT 'IX_LabConfiguration_City_State index already exists';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_labconfiguration_add_report_field_layout.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds LabConfiguration.ReportFieldLayoutJson -- the hospital-wide pathology report field layout:
+-- { "reportFields": [...], "lineFields": [...] }, each an ordered list of
+-- {key, label, type, builtIn, showInPad, showInPrint, order, options} items (see
+-- pathologyFieldLayoutApi.ts). reportFields fill in once per report (Clinical History, Comments,
+-- ...); lineFields repeat on every test line alongside the built-in Interpretation / Notes field.
+-- Null/empty means "use the built-in defaults," merged client-side -- same evolvable-JSON-blob
+-- trick as LetterheadMode (see alter_labconfiguration_add_letterhead_mode.sql), so no default value
+-- and no backfill is needed for existing hospitals.
+IF COL_LENGTH('dbo.LabConfiguration', 'ReportFieldLayoutJson') IS NULL
+BEGIN
+  ALTER TABLE dbo.LabConfiguration
+    ADD ReportFieldLayoutJson NVARCHAR(MAX) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_medication_administration_repoint_to_clinical_order.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8705,6 +9866,35 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_medicinemaster_add_inventoryitem_link.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Pharmacy Phase 3a: links the prescription-side MedicineMaster catalog to the stock-side
+-- InventoryItem catalog, so POS search can join both without merging the two tables.
+IF COL_LENGTH('dbo.MedicineMaster', 'InventoryItemId') IS NULL
+BEGIN
+  ALTER TABLE dbo.MedicineMaster
+    ADD InventoryItemId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_MedicineMaster_InventoryItem')
+BEGIN
+  ALTER TABLE dbo.MedicineMaster
+    ADD CONSTRAINT FK_MedicineMaster_InventoryItem FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_MedicineMaster_InventoryItemId' AND object_id = OBJECT_ID('dbo.MedicineMaster'))
+BEGIN
+  CREATE INDEX IX_MedicineMaster_InventoryItemId ON dbo.MedicineMaster (InventoryItemId) WHERE InventoryItemId IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_medicinemaster_widen_genericname.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8809,6 +9999,168 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_OT_Price')
   ALTER TABLE dbo.OperationTheatre ADD CONSTRAINT CK_OT_Price CHECK (Price >= 0);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathology_result_reportid_nullable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Make PathologyResult.ReportId nullable
+-- Results are entered before a report is generated, so ReportId must allow NULL.
+
+IF COL_LENGTH('dbo.PathologyResult', 'ReportId') IS NOT NULL
+BEGIN
+    ALTER TABLE dbo.PathologyResult ALTER COLUMN ReportId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathologyorder_add_report_field_values.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds PathologyOrder.ReportFieldValuesJson -- the values a pathologist has typed for the
+-- hospital's configured report-level fields (LabConfiguration.ReportFieldLayoutJson's
+-- "reportFields" list) on this specific order: { key: value }. Lives on the order rather than
+-- PathologyReport so it's fillable/editable before a report is ever generated and survives freely
+-- regenerating the report, the same way per-line values already live on PathologyResult rather
+-- than being copied into PathologyReport.
+IF COL_LENGTH('dbo.PathologyOrder', 'ReportFieldValuesJson') IS NULL
+BEGIN
+  ALTER TABLE dbo.PathologyOrder
+    ADD ReportFieldValuesJson NVARCHAR(MAX) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathologyorder_add_source_and_stat.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds SourceType (OPD/IPD/EMERGENCY/WALK_IN) and IsStat to PathologyOrder. EncounterId/AdmissionId
+-- alone don't cleanly distinguish OPD from Emergency (both can carry an EncounterId), so the
+-- caller passes SourceType explicitly at order-creation time. Drives the Pathology Workspace's
+-- source-filter tabs and STAT/urgent sort-to-top highlighting.
+IF COL_LENGTH('dbo.PathologyOrder', 'SourceType') IS NULL
+BEGIN
+  ALTER TABLE dbo.PathologyOrder
+    ADD SourceType NVARCHAR(20) NULL,
+        IsStat BIT NOT NULL CONSTRAINT DF_PathologyOrder_IsStat DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathologyorder_add_token_number.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds PathologyOrder.TokenNumber -- a daily, per-hospital sequential token (1, 2, 3... resetting
+-- every day) assigned at order creation and printed on a thermal receipt for the patient, same
+-- idea as Appointments' token feature but hospital-scoped instead of per-doctor (pathology has no
+-- doctor-queue concept). Separate from OrderNo, which keeps its existing lab-accession format and
+-- meaning everywhere it's already used (reports, billing, detail page). See
+-- create_pathology_token_queue_table.sql for the counter table that allocates this value.
+IF COL_LENGTH('dbo.PathologyOrder', 'TokenNumber') IS NULL
+BEGIN
+  ALTER TABLE dbo.PathologyOrder
+    ADD TokenNumber INT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathologyorderline_add_external_lab_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds external-lab send/receive tracking to PathologyOrderLine, for lines whose test is
+-- outsourced (PathologyTestMaster.IsOutsourced). ExternalLabCost snapshots
+-- PathologyTestMaster.CostPrice at send-time (same snapshot pattern BillingChargeEvent already uses
+-- for charge rates) so a later catalog cost edit doesn't retroactively change an already-sent line's
+-- recorded cost. These columns stay NULL for in-house lines -- the existing PENDING /
+-- SAMPLE_COLLECTED / RESULT_ENTERED flow is unaffected.
+IF COL_LENGTH('dbo.PathologyOrderLine', 'ExternalLabId') IS NULL
+BEGIN
+  ALTER TABLE dbo.PathologyOrderLine
+    ADD ExternalLabId UNIQUEIDENTIFIER NULL,
+        SentToExternalLabAt DATETIME2 NULL,
+        ExternalLabRefNo NVARCHAR(100) NULL,
+        ExternalLabReceivedAt DATETIME2 NULL,
+        ExternalLabCost DECIMAL(18,2) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathologyreport_add_dual_signature.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds dual sign-off fields to PathologyReport: technician sign-off happens first, pathologist
+-- approval finalizes. Both identities are captured at their own sign-off time (name/reg-no copied
+-- in, not looked up later), so the PDF's signature block always reflects who actually signed even
+-- if their profile changes afterward.
+IF COL_LENGTH('dbo.PathologyReport', 'TechnicianUserId') IS NULL
+BEGIN
+  ALTER TABLE dbo.PathologyReport
+    ADD TechnicianUserId UNIQUEIDENTIFIER NULL,
+        TechnicianName NVARCHAR(150) NULL,
+        TechnicianRegNo NVARCHAR(50) NULL,
+        TechnicianSignedAt DATETIME2 NULL,
+        PathologistDoctorId UNIQUEIDENTIFIER NULL,
+        PathologistName NVARCHAR(150) NULL,
+        PathologistRegNo NVARCHAR(50) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathologyresult_add_critical_flag.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds PathologyResult.HasCriticalFlag: true when any parameter in ResultValuesJson computed to
+-- CRITICAL_HIGH/CRITICAL_LOW (see PathologyResultFlagCalculator). A single indexable column so
+-- "does this order have a panic value" is a WHERE clause, not a JSON scan, for the
+-- DocBoard/ward-banner instant-alert query.
+IF COL_LENGTH('dbo.PathologyResult', 'HasCriticalFlag') IS NULL
+BEGIN
+  ALTER TABLE dbo.PathologyResult
+    ADD HasCriticalFlag BIT NOT NULL CONSTRAINT DF_PathologyResult_HasCriticalFlag DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathologytestmaster_add_external_lab_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds outsourcing fields to PathologyTestMaster: IsOutsourced flags a test as processed by a
+-- third-party lab rather than in-house, DefaultExternalLabId is the routing default (soft link to
+-- PathologyExternalLab -- no FK, same convention as ChargeId), and CostPrice is the hospital's own
+-- cost when sent out. Patient-facing billing is untouched -- ChargeMaster.DefaultRate stays the only
+-- rate PathologyAutoBillingHelper posts; CostPrice is purely for hospital-side margin visibility.
+IF COL_LENGTH('dbo.PathologyTestMaster', 'IsOutsourced') IS NULL
+BEGIN
+  ALTER TABLE dbo.PathologyTestMaster
+    ADD IsOutsourced BIT NOT NULL CONSTRAINT DF_PathologyTestMaster_IsOutsourced DEFAULT (0),
+        DefaultExternalLabId UNIQUEIDENTIFIER NULL,
+        CostPrice DECIMAL(18,2) NULL;
+END
 GO
 
 GO
@@ -9831,6 +11183,46 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_discharge_config_tables__add_system_default_letterhead.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: System-generated default letterhead as an explicit, selectable choice
+-- Description: Adds UseSystemDefaultLetterhead to PrescriptionSettings and
+--              DischargeSettings. Previously the system-generated default
+--              letterhead only ever appeared as a silent runtime fallback when
+--              no template happened to be uploaded -- there was no way for an
+--              admin to deliberately choose it. Kept as its own flag rather
+--              than inferred from URI being NULL so switching to the default
+--              doesn't destroy an already-uploaded template: flipping the flag
+--              back off restores it without re-uploading. Defaults to 0 --
+--              every existing row keeps today's exact behavior.
+-- Named to sort after create_discharge_config_tables.sql (migrations apply in
+-- filename order) since it adds a column to a table that file creates.
+-- PrescriptionSettings itself lives in db/schema/tables (applied before every
+-- migration), so no ordering concern there.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PrescriptionSettings', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.PrescriptionSettings', 'UseSystemDefaultLetterhead') IS NULL
+        ALTER TABLE dbo.PrescriptionSettings ADD UseSystemDefaultLetterhead BIT NOT NULL
+            CONSTRAINT DF_PrescriptionSettings_UseSystemDefault DEFAULT (0);
+END
+GO
+
+IF OBJECT_ID('dbo.DischargeSettings', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.DischargeSettings', 'UseSystemDefaultLetterhead') IS NULL
+        ALTER TABLE dbo.DischargeSettings ADD UseSystemDefaultLetterhead BIT NOT NULL
+            CONSTRAINT DF_DischargeSettings_UseSystemDefault DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_discharge_medication_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -10819,6 +12211,128 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_pathology_token_queue_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create PathologyTokenQueue Table
+-- Description: Backs PathologyOrder.TokenNumber's daily counter -- one row per
+--              (hospital, day), mirroring DoctorQueues' locking-with-retry shape
+--              (see AppointmentBookingHelpers.AllocateTokenWithLockingAsync) but
+--              scoped to the hospital only, since pathology orders aren't tied to
+--              one doctor's queue the way appointments are.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PathologyTokenQueue', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyTokenQueue
+    (
+        HospitalId   UNIQUEIDENTIFIER NOT NULL,
+        TokenDate    DATE             NOT NULL,
+        NextTokenNo  INT              NOT NULL CONSTRAINT DF_PTQ_NextTokenNo DEFAULT (1),
+
+        UpdatedAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_PTQ_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+
+        RowVersion   ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_PathologyTokenQueue PRIMARY KEY CLUSTERED (HospitalId, TokenDate)
+    );
+
+    PRINT 'Created table PathologyTokenQueue';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_pathologyexternallab_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create PathologyExternalLab Table
+-- Description: Hospital-scoped master of third-party labs a pathology test can be
+--              referred/sent out to. Kept separate from dbo.Vendor (procurement's
+--              drug-license/payment-terms-flavored vendor entity) rather than reused,
+--              since there is nothing lab-specific (accreditation, report contact) to
+--              hang off Vendor without polluting the procurement domain.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PathologyExternalLab', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyExternalLab
+    (
+        ExternalLabId    UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PathologyExternalLab_Id DEFAULT NEWID(),
+        HospitalId       UNIQUEIDENTIFIER NOT NULL,
+        LabName          NVARCHAR(200)    NOT NULL,
+        ContactPerson    NVARCHAR(150)    NULL,
+        Phone            NVARCHAR(20)     NULL,
+        Email            NVARCHAR(150)    NULL,
+        Address          NVARCHAR(500)    NULL,
+        AccreditationNo  NVARCHAR(100)    NULL,
+        IsActive         BIT              NOT NULL CONSTRAINT DF_PathologyExternalLab_IsActive DEFAULT (1),
+
+        CreatedAt        DATETIME2        NOT NULL CONSTRAINT DF_PathologyExternalLab_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy        NVARCHAR(100)    NULL,
+        UpdatedAt        DATETIME2        NOT NULL CONSTRAINT DF_PathologyExternalLab_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy        NVARCHAR(100)    NULL,
+        RowVersion       ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_PathologyExternalLab PRIMARY KEY CLUSTERED (ExternalLabId)
+    );
+
+    PRINT 'Created table PathologyExternalLab';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_pathologyreportkeyword_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create PathologyReportKeyword Table
+-- Description: Hospital-scoped "type a keyword, get a formatted paragraph" templates for
+--              pathology report authoring (Interpretation / Notes and paragraph-type custom
+--              fields). TestId is a soft reference (no FK, matching PathologyOrderLine.TestId's
+--              own convention in this module) -- NULL means the keyword is usable while
+--              reporting on any test, not just one. ContentJson holds a StyledRun[] array
+--              (frontend richText.ts), opaque to the backend.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PathologyReportKeyword', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyReportKeyword
+    (
+        KeywordId    UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PathologyReportKeyword_Id DEFAULT NEWID(),
+        HospitalId   UNIQUEIDENTIFIER NOT NULL,
+        TestId       UNIQUEIDENTIFIER NULL,
+        Keyword      NVARCHAR(100)    NOT NULL,
+        ContentJson  NVARCHAR(MAX)    NOT NULL,
+        IsActive     BIT              NOT NULL CONSTRAINT DF_PathologyReportKeyword_IsActive DEFAULT (1),
+
+        CreatedAt    DATETIME2        NOT NULL CONSTRAINT DF_PathologyReportKeyword_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy    NVARCHAR(100)    NULL,
+        UpdatedAt    DATETIME2        NOT NULL CONSTRAINT DF_PathologyReportKeyword_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy    NVARCHAR(100)    NULL,
+        RowVersion   ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_PathologyReportKeyword PRIMARY KEY CLUSTERED (KeywordId)
+    );
+
+    CREATE INDEX IX_PathologyReportKeyword_Hospital_Test
+    ON dbo.PathologyReportKeyword(HospitalId, TestId);
+
+    PRINT 'Created table PathologyReportKeyword';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_patient_nurse_assignment_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -11262,6 +12776,24 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_tables_doctor_fee__add_free_follow_up_days.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds the per-doctor free-follow-up window (in days) used by AppointmentTypeResolver to
+-- decide New / Old-Fee / Old-No-Fee. 0 = no free window at all (every visit is chargeable) --
+-- this is the opposite polarity of PrescriptionSetting.ValidDuration's "0 = never expires",
+-- so it is deliberately its own column rather than reusing that field.
+IF COL_LENGTH('dbo.DoctorFee', 'FreeFollowUpDays') IS NULL
+BEGIN
+  ALTER TABLE dbo.DoctorFee
+    ADD FreeFollowUpDays INT NOT NULL CONSTRAINT DF_DF_FreeFollowUpDays DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_ventilator_and_weaning_tables.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -11420,6 +12952,120 @@ GO
 -- Idempotent: safe to re-run, only touches rows still carrying the stale 'AUTO' value.
 
 UPDATE dbo.BillingPolicy SET IpdBedChargeMode = 'DAILY_AUTO' WHERE IpdBedChargeMode = 'AUTO';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/fix_pathology_test_reference_ranges.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Data fix, not a schema change. seed_pathology_default_tests.sql only inserts a (HospitalId,
+-- TestCode) pair that doesn't already exist, so any hospital already onboarded before this fix
+-- landed is stuck with the old, broken ParameterSchemaJson forever unless backfilled here.
+--
+-- The catalog audit found that PathologyResultFlagCalculator.cs and its TS port only ever read
+-- maleMin/maleMax/femaleMin/femaleMax/childMin/childMax -- a parameter authored with the older
+-- flat {"min","max"} pair (EnterPathologyResultHandler.cs's ParameterSchemaItem has no such
+-- property) silently deserializes with every bound null and NEVER flags HIGH/LOW/CRITICAL,
+-- however abnormal the value. Eleven tests were still in that flat shape. Three more had
+-- unrelated data-correctness gaps (an autofillable blood-group default, no critical thresholds on
+-- Cardiac Markers, a clinically backwards Total Cholesterol/HDL Ratio floor) also fixed here. See
+-- seed_pathology_default_tests.sql for the corresponding fix to what NEW hospitals get seeded.
+--
+-- Guarded per TestCode by a LIKE match on a short fragment unique to the ORIGINAL broken JSON
+-- (not a byte-exact whole-string match, which would be fragile against whitespace) -- deliberately
+-- NOT an unconditional overwrite: TestCatalogForm.tsx lets a hospital edit a test's own schema,
+-- and always rewrites it in the maleMin/maleMax shape when it does, so a row that's already been
+-- opened and saved in the Test Catalog Manager will never match these fragments and is left
+-- untouched. Idempotent -- safe to re-run, each UPDATE only touches rows still carrying the exact
+-- pre-fix fragment.
+
+-- HEM-RETIC -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Reticulocyte Count","unit":"%","defaultValue":"1.0","maleMin":0.5,"maleMax":2.5,"femaleMin":0.5,"femaleMax":2.5,"sortOrder":1}]}'
+WHERE TestCode = N'HEM-RETIC' AND ParameterSchemaJson LIKE N'%"min":0.5,"max":2.5%';
+
+-- HEM-BLOODGROUP -- removes the autofillable "B Positive"/"Positive" defaults. A blood group is a
+-- fixed patient-identity field, not a "typical normal" -- leaving a default meant one click of
+-- 1-Click Autofill Normals could write a fabricated blood group into a real result.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"ABO Blood Grouping","unit":"","sortOrder":1},{"name":"Rh Factor (D Antigen)","unit":"","sortOrder":2}]}'
+WHERE TestCode = N'HEM-BLOODGROUP' AND ParameterSchemaJson LIKE N'%B Positive%';
+
+-- BIO-LIPID -- Total Cholesterol/HDL Ratio's lower bound removed (a lower ratio is always more
+-- protective; it should never flag LOW). Rest of the panel unchanged.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Serum Total Cholesterol","unit":"mg/dL","defaultValue":"165.0","maleMax":200.0,"femaleMax":200.0,"sortOrder":1},{"name":"Serum Triglycerides","unit":"mg/dL","defaultValue":"115.0","maleMax":150.0,"femaleMax":150.0,"sortOrder":2},{"name":"HDL Cholesterol","unit":"mg/dL","defaultValue":"48.0","maleMin":40.0,"femaleMin":50.0,"sortOrder":3},{"name":"LDL Cholesterol","unit":"mg/dL","defaultValue":"92.0","maleMax":100.0,"femaleMax":100.0,"sortOrder":4},{"name":"VLDL Cholesterol","unit":"mg/dL","defaultValue":"23.0","maleMin":10.0,"maleMax":30.0,"femaleMin":10.0,"femaleMax":30.0,"sortOrder":5},{"name":"Total Cholesterol / HDL Ratio","unit":"ratio","defaultValue":"3.40","maleMax":4.40,"femaleMax":4.40,"sortOrder":6}]}'
+WHERE TestCode = N'BIO-LIPID' AND ParameterSchemaJson LIKE N'%"Total Cholesterol / HDL Ratio","unit":"ratio","defaultValue":"3.40","maleMin":3.30%';
+
+-- BIO-LFT -- adds a pediatric band to Alkaline Phosphatase only (bone-growth elevation is the
+-- single most clinically significant pediatric difference in this panel). Rest unchanged.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Bilirubin - Total","unit":"mg/dL","defaultValue":"0.70","maleMin":0.20,"maleMax":1.20,"femaleMin":0.20,"femaleMax":1.20,"criticalHigh":15.0,"sortOrder":1},{"name":"Bilirubin - Direct","unit":"mg/dL","defaultValue":"0.15","maleMin":0.00,"maleMax":0.30,"femaleMin":0.00,"femaleMax":0.30,"criticalHigh":5.0,"sortOrder":2},{"name":"Bilirubin - Indirect","unit":"mg/dL","defaultValue":"0.55","maleMin":0.10,"maleMax":0.90,"femaleMin":0.10,"femaleMax":0.90,"sortOrder":3},{"name":"SGOT / AST","unit":"U/L","defaultValue":"22.0","maleMin":5.0,"maleMax":40.0,"femaleMin":5.0,"femaleMax":40.0,"criticalHigh":500.0,"sortOrder":4},{"name":"SGPT / ALT","unit":"U/L","defaultValue":"24.0","maleMin":5.0,"maleMax":45.0,"femaleMin":5.0,"femaleMax":45.0,"criticalHigh":500.0,"sortOrder":5},{"name":"Alkaline Phosphatase (ALP)","unit":"U/L","defaultValue":"75.0","maleMin":30.0,"maleMax":120.0,"femaleMin":30.0,"femaleMax":120.0,"childMin":100.0,"childMax":350.0,"criticalHigh":700.0,"sortOrder":6},{"name":"Gamma GT (GGT)","unit":"U/L","defaultValue":"28.0","maleMin":10.0,"maleMax":50.0,"femaleMin":5.0,"femaleMax":35.0,"criticalHigh":250.0,"sortOrder":7},{"name":"Total Protein","unit":"g/dL","defaultValue":"7.20","maleMin":6.00,"maleMax":8.30,"femaleMin":6.00,"femaleMax":8.30,"criticalLow":4.5,"sortOrder":8},{"name":"Serum Albumin","unit":"g/dL","defaultValue":"4.20","maleMin":3.50,"maleMax":5.00,"femaleMin":3.50,"femaleMax":5.00,"criticalLow":2.0,"sortOrder":9},{"name":"Serum Globulin","unit":"g/dL","defaultValue":"3.00","maleMin":2.00,"maleMax":3.50,"femaleMin":2.00,"femaleMax":3.50,"sortOrder":10},{"name":"Albumin : Globulin Ratio (A/G)","unit":"ratio","defaultValue":"1.40","maleMin":1.20,"maleMax":2.20,"femaleMin":1.20,"femaleMax":2.20,"sortOrder":11}]}'
+WHERE TestCode = N'BIO-LFT' AND ParameterSchemaJson LIKE N'%"Alkaline Phosphatase (ALP)","unit":"U/L","defaultValue":"75.0","maleMin":30.0,"maleMax":120.0,"femaleMin":30.0,"femaleMax":120.0,"criticalHigh":700.0%';
+
+-- BIO-KFT -- adds a pediatric band to Serum Creatinine only (children run substantially lower
+-- than adults on lower muscle mass). Rest unchanged.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Blood Urea","unit":"mg/dL","defaultValue":"24.0","maleMin":15.0,"maleMax":45.0,"femaleMin":15.0,"femaleMax":45.0,"criticalHigh":120.0,"sortOrder":1},{"name":"Serum Creatinine","unit":"mg/dL","defaultValue":"0.90","maleMin":0.70,"maleMax":1.30,"femaleMin":0.60,"femaleMax":1.10,"childMin":0.30,"childMax":0.70,"criticalHigh":5.00,"sortOrder":2},{"name":"Blood Urea Nitrogen (BUN)","unit":"mg/dL","defaultValue":"11.2","maleMin":7.0,"maleMax":20.0,"femaleMin":7.0,"femaleMax":20.0,"criticalHigh":60.0,"sortOrder":3},{"name":"Serum Uric Acid","unit":"mg/dL","defaultValue":"4.80","maleMin":3.50,"maleMax":7.20,"femaleMin":2.60,"femaleMax":6.00,"criticalHigh":12.0,"sortOrder":4},{"name":"Serum Sodium (Na+)","unit":"mmol/L","defaultValue":"140.0","maleMin":135.0,"maleMax":145.0,"femaleMin":135.0,"femaleMax":145.0,"criticalLow":120.0,"criticalHigh":160.0,"sortOrder":5},{"name":"Serum Potassium (K+)","unit":"mmol/L","defaultValue":"4.20","maleMin":3.50,"maleMax":5.00,"femaleMin":3.50,"femaleMax":5.00,"criticalLow":2.80,"criticalHigh":6.50,"sortOrder":6},{"name":"Serum Chloride (Cl-)","unit":"mmol/L","defaultValue":"101.0","maleMin":96.0,"maleMax":106.0,"femaleMin":96.0,"femaleMax":106.0,"criticalLow":80.0,"criticalHigh":125.0,"sortOrder":7},{"name":"Serum Calcium (Total)","unit":"mg/dL","defaultValue":"9.40","maleMin":8.50,"maleMax":10.50,"femaleMin":8.50,"femaleMax":10.50,"criticalLow":6.50,"criticalHigh":13.0,"sortOrder":8}]}'
+WHERE TestCode = N'BIO-KFT' AND ParameterSchemaJson LIKE N'%"Serum Creatinine","unit":"mg/dL","defaultValue":"0.90","maleMin":0.70,"maleMax":1.30,"femaleMin":0.60,"femaleMax":1.10,"criticalHigh":5.00%';
+
+-- BIO-URIC (standalone) -- flat unisex range replaced with the same correctly gender-split range
+-- already used inside BIO-KFT, so a female patient ordering it standalone isn't assessed against
+-- the male range, plus a criticalHigh it previously had none of.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Uric Acid","unit":"mg/dL","defaultValue":"4.80","maleMin":3.50,"maleMax":7.20,"femaleMin":2.60,"femaleMax":6.00,"criticalHigh":12.0,"sortOrder":1}]}'
+WHERE TestCode = N'BIO-URIC' AND ParameterSchemaJson LIKE N'%"min":3.5,"max":7.2%';
+
+-- BIO-CARDIAC -- flat shape -> enriched, plus criticalHigh on all three (Troponin I elevation is
+-- the textbook lab panic value; this panel previously had no critical threshold at all).
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Troponin I","unit":"ng/mL","defaultValue":"0.01","maleMin":0,"maleMax":0.04,"femaleMin":0,"femaleMax":0.04,"criticalHigh":0.5,"sortOrder":1},{"name":"CPK-MB","unit":"U/L","defaultValue":"12","maleMin":0,"maleMax":25,"femaleMin":0,"femaleMax":25,"criticalHigh":100,"sortOrder":2},{"name":"CPK Total","unit":"U/L","defaultValue":"110","maleMin":30,"maleMax":200,"femaleMin":30,"femaleMax":200,"criticalHigh":1000,"sortOrder":3}]}'
+WHERE TestCode = N'BIO-CARDIAC' AND ParameterSchemaJson LIKE N'%"Troponin I","unit":"ng/mL","min":0,"max":0.04%';
+
+-- CP-URINE-R -- flat shape -> enriched for the 4 numeric params only (pH, Specific Gravity, RBCs,
+-- WBCs); the qualitative fields (Color, Protein, Casts, etc.) are untouched.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Color","unit":""},{"name":"Appearance","unit":""},{"name":"pH","unit":"","maleMin":4.5,"maleMax":8.0,"femaleMin":4.5,"femaleMax":8.0},{"name":"Specific Gravity","unit":"","maleMin":1.005,"maleMax":1.030,"femaleMin":1.005,"femaleMax":1.030},{"name":"Protein","unit":""},{"name":"Glucose","unit":""},{"name":"Ketones","unit":""},{"name":"Bilirubin","unit":""},{"name":"Urobilinogen","unit":""},{"name":"RBCs","unit":"/hpf","maleMin":0,"maleMax":2,"femaleMin":0,"femaleMax":2},{"name":"WBCs","unit":"/hpf","maleMin":0,"maleMax":5,"femaleMin":0,"femaleMax":5},{"name":"Epithelial Cells","unit":""},{"name":"Casts","unit":""},{"name":"Crystals","unit":""},{"name":"Bacteria","unit":""}]}'
+WHERE TestCode = N'CP-URINE-R' AND ParameterSchemaJson LIKE N'%"pH","unit":"","min":4.5,"max":8.0%';
+
+-- SER-CRP -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"CRP","unit":"mg/L","maleMin":0,"maleMax":6,"femaleMin":0,"femaleMax":6}]}'
+WHERE TestCode = N'SER-CRP' AND ParameterSchemaJson LIKE N'%"CRP","unit":"mg/L","min":0,"max":6%';
+
+-- SER-RA -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"RA Factor","unit":"IU/mL","maleMin":0,"maleMax":14,"femaleMin":0,"femaleMax":14}]}'
+WHERE TestCode = N'SER-RA' AND ParameterSchemaJson LIKE N'%"RA Factor","unit":"IU/mL","min":0,"max":14%';
+
+-- ENDO-THYROID -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"T3","unit":"ng/dL","maleMin":80,"maleMax":200,"femaleMin":80,"femaleMax":200},{"name":"T4","unit":"Âµg/dL","maleMin":5.1,"maleMax":14.1,"femaleMin":5.1,"femaleMax":14.1},{"name":"TSH","unit":"ÂµIU/mL","maleMin":0.27,"maleMax":4.20,"femaleMin":0.27,"femaleMax":4.20}]}'
+WHERE TestCode = N'ENDO-THYROID' AND ParameterSchemaJson LIKE N'%"T3","unit":"ng/dL","min":80,"max":200%';
+
+-- ENDO-PROLACTIN -- flat shape -> enriched WITH a real gender split (non-pregnant female
+-- prolactin legitimately runs higher than male) -- not just a mechanical copy.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Prolactin","unit":"ng/mL","maleMin":2,"maleMax":18,"femaleMin":2,"femaleMax":29}]}'
+WHERE TestCode = N'ENDO-PROLACTIN' AND ParameterSchemaJson LIKE N'%"Prolactin","unit":"ng/mL","min":2,"max":18%';
+
+-- ENDO-CORTISOL -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Cortisol (AM)","unit":"Âµg/dL","maleMin":6.2,"maleMax":19.4,"femaleMin":6.2,"femaleMax":19.4}]}'
+WHERE TestCode = N'ENDO-CORTISOL' AND ParameterSchemaJson LIKE N'%"Cortisol (AM)","unit":"Âµg/dL","min":6.2,"max":19.4%';
+
+-- ENDO-VITD -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"25-OH Vitamin D","unit":"ng/mL","maleMin":30,"maleMax":100,"femaleMin":30,"femaleMax":100}]}'
+WHERE TestCode = N'ENDO-VITD' AND ParameterSchemaJson LIKE N'%"25-OH Vitamin D","unit":"ng/mL","min":30,"max":100%';
+
+-- ENDO-VITB12 -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Vitamin B12","unit":"pg/mL","maleMin":200,"maleMax":900,"femaleMin":200,"femaleMax":900}]}'
+WHERE TestCode = N'ENDO-VITB12' AND ParameterSchemaJson LIKE N'%"Vitamin B12","unit":"pg/mL","min":200,"max":900%';
 GO
 
 GO
@@ -12393,7 +14039,10 @@ DECLARE @now datetime2(3) = SYSUTCDATETIME();
     (N'Receptionist',N'Limited access to appointment related features'),
     (N'Nurse',       N'Can view and manage scheduling'),
     (N'Doctor',      N'Access limited to doctor board only'),
-    (N'Accountant',  N'Access to billing and financial features')
+    (N'Accountant',  N'Access to billing and financial features'),
+    (N'Lab Technician',N'Access limited to the pathology lab board only'),
+    (N'Pharmacist',  N'Access limited to the pharmacy retail board only'),
+    (N'Coordinator', N'Access to OT, ICU, inventory, and IPD boards only')
   ) s(RoleName,[Description])
 )
 MERGE dbo.Roles AS t
@@ -12416,7 +14065,8 @@ WHEN MATCHED THEN
 INSERT INTO @Roles(RoleName, RoleID)
 SELECT RoleName, RoleID
 FROM dbo.Roles
-WHERE RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor',N'Accountant');
+WHERE RoleName IN (N'Admin',N'AdminDoctor',N'Receptionist',N'Nurse',N'Doctor',N'Accountant',
+                   N'Lab Technician',N'Pharmacist',N'Coordinator');
 
 -- Ensure required permissions exist (already merged above)
 
@@ -12494,6 +14144,38 @@ USING (SELECT r.RoleID, v.PermissionKey
        FROM @Roles r
        CROSS JOIN (VALUES (N'billing'),(N'print_preview')) v(PermissionKey)
        WHERE r.RoleName = N'Accountant') AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- Lab Technician: pathology board only (plus print_preview, same as every other
+-- non-admin/non-doctor operational role, for printing lab reports)
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'pathology'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Lab Technician') AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- Pharmacist: pharmacy retail board only (plus print_preview, for medication labels)
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'pharmacy'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Pharmacist') AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- Coordinator: OT, ICU, inventory, and IPD boards only (plus print_preview, e.g. OT
+-- consent forms / discharge summaries)
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'ot_board'),(N'icu_board'),(N'inventory'),(N'ipd'),(N'print_preview')) v(PermissionKey)
+       WHERE r.RoleName = N'Coordinator') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
@@ -26100,17 +27782,37 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 /* =========================================================
    easyHMS â€“ Seed: Default Pathology Tests with Parameter Schemas
-   Hospital-scoped â€” run ONCE per new hospital during onboarding.
-   Replace @HospitalId with the target hospital GUID.
 
-   These are TEMPLATE tests. Each hospital gets its own copy
-   so they can customize codes, normal ranges, and pricing.
+   Runs automatically for every active hospital on every deploy (idempotent -- only inserts a
+   TestCode that hospital doesn't already have, never updates or removes existing rows). No manual
+   HospitalId substitution needed: previously this script required editing a placeholder GUID and
+   running it once per hospital by hand, which meant NO hospital ever actually got seeded through
+   the normal deploy pipeline. It now cross-joins the active hospital list instead.
+
+   ParameterSchemaJson shape: { "params": [ { "name", "unit", "defaultValue", "maleMin",
+   "maleMax", "femaleMin", "femaleMax", "childMin", "childMax", "criticalLow", "criticalHigh",
+   "sortOrder" } ] }. Any bound left out of a param's JSON is simply absent (no range/threshold
+   in that direction) -- see PathologyResultFlagCalculator for how missing bounds/demographic
+   splits are resolved.
+
+   IMPORTANT: every parameter below MUST use maleMin/maleMax/femaleMin/femaleMax (duplicating the
+   same value into both when there's no real gender difference), never the older flat {min,max}
+   pair. PathologyResultFlagCalculator.cs and its TS port only ever read the six named bounds
+   above -- a plain "min"/"max" key deserializes to nothing and the parameter silently never
+   flags HIGH/LOW/CRITICAL for ANY value, however abnormal (confirmed by reading
+   EnterPathologyResultHandler.cs's ParameterSchemaItem, which has no Min/Max property at all). An
+   earlier version of this file left several panels in that flat shape believing the calculator
+   "fell back" to it; it doesn't, and a full catalog audit + fix converted every one of them (see
+   dml_pathology_test_ranges_fix.sql for the matching one-time backfill of hospitals seeded before
+   this fix). CBC+ESR, Coagulation, LFT, KFT+Electrolytes, Lipid Profile, and Glucose+HbA1c
+   additionally carry childMin/childMax and criticalLow/criticalHigh where clinically meaningful,
+   sourced from the 1Lab PRD v2.4.0 Section 8 reference tables plus the audit's pediatric-gap
+   fixes (ALP, Creatinine). Everything here can still be edited/enriched further per-hospital via
+   the Test Catalog Manager UI without any further migration.
    ========================================================= */
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
 
--- !! Replace with actual hospital ID during onboarding !!
-DECLARE @HospitalId UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
 DECLARE @User NVARCHAR(100) = N'System';
 DECLARE @Now DATETIME2 = SYSUTCDATETIME();
 
@@ -26128,61 +27830,137 @@ BEGIN TRY
       SortOrder           INT           NOT NULL
   );
 
-  /* ===== HEMATOLOGY ===== */
+  /* ===== HEMATOLOGY (enriched: CBC, ESR, BT/CT; unchanged: Reticulocyte Count) ===== */
   INSERT INTO @Tests VALUES
   (N'HEM-CBC', N'Complete Blood Count (CBC)', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
-   N'{"params":[{"name":"Hemoglobin","unit":"g/dL","min":12.0,"max":17.5},{"name":"RBC","unit":"mil/ÂµL","min":4.5,"max":5.5},{"name":"WBC","unit":"cells/ÂµL","min":4000,"max":11000},{"name":"Platelets","unit":"lakh/ÂµL","min":1.5,"max":4.0},{"name":"PCV/HCT","unit":"%","min":36,"max":54},{"name":"MCV","unit":"fL","min":80,"max":100},{"name":"MCH","unit":"pg","min":27,"max":32},{"name":"MCHC","unit":"g/dL","min":32,"max":36},{"name":"Neutrophils","unit":"%","min":40,"max":70},{"name":"Lymphocytes","unit":"%","min":20,"max":40},{"name":"Monocytes","unit":"%","min":2,"max":8},{"name":"Eosinophils","unit":"%","min":1,"max":6},{"name":"Basophils","unit":"%","min":0,"max":1}]}', 10),
+   N'{"params":[
+     {"name":"Hemoglobin (Hb)","unit":"g/dL","defaultValue":"14.5","maleMin":13.5,"maleMax":17.5,"femaleMin":12.0,"femaleMax":15.5,"childMin":11.0,"childMax":14.5,"criticalLow":6.0,"criticalHigh":20.0,"sortOrder":1},
+     {"name":"Total WBC Count (TLC)","unit":"/ÂµL","defaultValue":"7200","maleMin":4000,"maleMax":11000,"femaleMin":4000,"femaleMax":11000,"childMin":5000,"childMax":15500,"criticalLow":2000,"criticalHigh":35000,"sortOrder":2},
+     {"name":"Neutrophils","unit":"%","defaultValue":"60","maleMin":40,"maleMax":75,"femaleMin":40,"femaleMax":75,"childMin":30,"childMax":60,"criticalLow":15,"criticalHigh":90,"sortOrder":3},
+     {"name":"Lymphocytes","unit":"%","defaultValue":"30","maleMin":20,"maleMax":45,"femaleMin":20,"femaleMax":45,"childMin":40,"childMax":70,"criticalLow":10,"criticalHigh":75,"sortOrder":4},
+     {"name":"Monocytes","unit":"%","defaultValue":"5","maleMin":2,"maleMax":10,"femaleMin":2,"femaleMax":10,"childMin":2,"childMax":10,"criticalHigh":18,"sortOrder":5},
+     {"name":"Eosinophils","unit":"%","defaultValue":"4","maleMin":1,"maleMax":6,"femaleMin":1,"femaleMax":6,"childMin":1,"childMax":6,"criticalHigh":20,"sortOrder":6},
+     {"name":"Basophils","unit":"%","defaultValue":"1","maleMin":0,"maleMax":1,"femaleMin":0,"femaleMax":1,"childMin":0,"childMax":1,"criticalHigh":3,"sortOrder":7},
+     {"name":"Platelet Count","unit":"/ÂµL","defaultValue":"250000","maleMin":150000,"maleMax":450000,"femaleMin":150000,"femaleMax":450000,"childMin":150000,"childMax":450000,"criticalLow":25000,"criticalHigh":1000000,"sortOrder":8},
+     {"name":"Total RBC Count","unit":"Mil/ÂµL","defaultValue":"4.80","maleMin":4.50,"maleMax":5.90,"femaleMin":4.00,"femaleMax":5.20,"childMin":3.80,"childMax":5.50,"criticalLow":2.00,"criticalHigh":7.00,"sortOrder":9},
+     {"name":"PCV / Hematocrit","unit":"%","defaultValue":"42.0","maleMin":40.0,"maleMax":50.0,"femaleMin":36.0,"femaleMax":46.0,"childMin":32.0,"childMax":44.0,"criticalLow":20.0,"criticalHigh":60.0,"sortOrder":10},
+     {"name":"MCV","unit":"fL","defaultValue":"88.0","maleMin":80.0,"maleMax":100.0,"femaleMin":80.0,"femaleMax":100.0,"childMin":75.0,"childMax":95.0,"criticalLow":60.0,"criticalHigh":120.0,"sortOrder":11},
+     {"name":"MCH","unit":"pg","defaultValue":"29.5","maleMin":27.0,"maleMax":32.0,"femaleMin":27.0,"femaleMax":32.0,"childMin":24.0,"childMax":30.0,"sortOrder":12},
+     {"name":"MCHC","unit":"g/dL","defaultValue":"33.5","maleMin":32.0,"maleMax":36.0,"femaleMin":32.0,"femaleMax":36.0,"childMin":32.0,"childMax":36.0,"sortOrder":13},
+     {"name":"RDW-CV","unit":"%","defaultValue":"12.8","maleMin":11.5,"maleMax":14.5,"femaleMin":11.5,"femaleMax":14.5,"childMin":11.5,"childMax":15.0,"criticalHigh":20.0,"sortOrder":14}
+   ]}', 10),
 
   (N'HEM-ESR', N'Erythrocyte Sedimentation Rate (ESR)', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
-   N'{"params":[{"name":"ESR","unit":"mm/hr","min":0,"max":20}]}', 20),
+   N'{"params":[{"name":"ESR (Westergren)","unit":"mm/1st hr","defaultValue":"8","maleMin":0,"maleMax":15,"femaleMin":0,"femaleMax":20,"childMin":0,"childMax":10,"criticalHigh":90,"sortOrder":1}]}', 20),
 
   (N'HEM-BT-CT', N'Bleeding Time & Clotting Time', N'HEMATOLOGY', N'Whole Blood', N'Plain',
-   N'{"params":[{"name":"Bleeding Time","unit":"min","min":1,"max":6},{"name":"Clotting Time","unit":"min","min":4,"max":9}]}', 30),
+   N'{"params":[
+     {"name":"Bleeding Time (Duke)","unit":"min","defaultValue":"2.5","maleMin":1.0,"maleMax":5.0,"femaleMin":1.0,"femaleMax":5.0,"criticalHigh":8.0,"sortOrder":1},
+     {"name":"Clotting Time (Lee-White)","unit":"min","defaultValue":"6.0","maleMin":4.0,"maleMax":9.0,"femaleMin":4.0,"femaleMax":9.0,"criticalHigh":15.0,"sortOrder":2}
+   ]}', 30),
 
   (N'HEM-RETIC', N'Reticulocyte Count', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
-   N'{"params":[{"name":"Reticulocyte Count","unit":"%","min":0.5,"max":2.5}]}', 40);
+   N'{"params":[{"name":"Reticulocyte Count","unit":"%","defaultValue":"1.0","maleMin":0.5,"maleMax":2.5,"femaleMin":0.5,"femaleMax":2.5,"sortOrder":1}]}', 40),
 
-  /* ===== COAGULATION ===== */
+  (N'HEM-BLOODGROUP', N'Blood Grouping & Rh Typing', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
+   -- No defaultValue on either param, deliberately -- a blood group is a fixed patient-identity
+   -- field, not a "typical normal." A default here would let 1-Click Autofill Normals write a
+   -- fabricated blood group into a real result.
+   N'{"params":[
+     {"name":"ABO Blood Grouping","unit":"","sortOrder":1},
+     {"name":"Rh Factor (D Antigen)","unit":"","sortOrder":2}
+   ]}', 45);
+
+  /* ===== COAGULATION (enriched) ===== */
   INSERT INTO @Tests VALUES
   (N'COAG-PT', N'Prothrombin Time (PT/INR)', N'COAGULATION', N'Plasma', N'Citrate',
-   N'{"params":[{"name":"PT","unit":"sec","min":11,"max":13.5},{"name":"INR","unit":"ratio","min":0.8,"max":1.2}]}', 50),
+   N'{"params":[
+     {"name":"Prothrombin Time (PT - Test)","unit":"sec","defaultValue":"12.2","maleMin":11.0,"maleMax":14.0,"femaleMin":11.0,"femaleMax":14.0,"criticalHigh":30.0,"sortOrder":1},
+     {"name":"PT Control","unit":"sec","defaultValue":"12.0","maleMin":11.0,"maleMax":13.0,"femaleMin":11.0,"femaleMax":13.0,"sortOrder":2},
+     {"name":"INR","unit":"ratio","defaultValue":"1.02","maleMin":0.85,"maleMax":1.15,"femaleMin":0.85,"femaleMax":1.15,"criticalHigh":4.50,"sortOrder":3}
+   ]}', 50),
 
   (N'COAG-APTT', N'Activated Partial Thromboplastin Time', N'COAGULATION', N'Plasma', N'Citrate',
-   N'{"params":[{"name":"APTT","unit":"sec","min":25,"max":35}]}', 60);
+   N'{"params":[{"name":"aPTT","unit":"sec","defaultValue":"29.0","maleMin":25.0,"maleMax":35.0,"femaleMin":25.0,"femaleMax":35.0,"criticalHigh":70.0,"sortOrder":1}]}', 60);
 
-  /* ===== BIOCHEMISTRY ===== */
+  /* ===== BIOCHEMISTRY (LFT, KFT, Lipid, Glucose series enriched; others unchanged) ===== */
   INSERT INTO @Tests VALUES
   (N'BIO-FBS', N'Fasting Blood Sugar', N'BIOCHEMISTRY', N'Serum', N'Fluoride',
-   N'{"params":[{"name":"Fasting Glucose","unit":"mg/dL","min":70,"max":100}]}', 100),
+   N'{"params":[{"name":"Fasting Plasma Glucose","unit":"mg/dL","defaultValue":"84.0","maleMin":70.0,"maleMax":99.0,"femaleMin":70.0,"femaleMax":99.0,"criticalLow":45.0,"criticalHigh":350.0,"sortOrder":1}]}', 100),
 
   (N'BIO-PPBS', N'Post-Prandial Blood Sugar', N'BIOCHEMISTRY', N'Serum', N'Fluoride',
-   N'{"params":[{"name":"PP Glucose","unit":"mg/dL","min":70,"max":140}]}', 110),
+   N'{"params":[{"name":"Post-Prandial Glucose","unit":"mg/dL","defaultValue":"118.0","maleMax":140.0,"femaleMax":140.0,"criticalLow":45.0,"criticalHigh":400.0,"sortOrder":1}]}', 110),
 
   (N'BIO-RBS', N'Random Blood Sugar', N'BIOCHEMISTRY', N'Serum', N'Fluoride',
-   N'{"params":[{"name":"Random Glucose","unit":"mg/dL","min":70,"max":200}]}', 115),
+   N'{"params":[{"name":"Random Blood Sugar","unit":"mg/dL","defaultValue":"105.0","maleMin":70.0,"maleMax":140.0,"femaleMin":70.0,"femaleMax":140.0,"criticalLow":45.0,"criticalHigh":400.0,"sortOrder":1}]}', 115),
 
   (N'BIO-HBA1C', N'HbA1c (Glycated Hemoglobin)', N'BIOCHEMISTRY', N'Whole Blood', N'EDTA',
-   N'{"params":[{"name":"HbA1c","unit":"%","min":4.0,"max":5.6}]}', 120),
+   N'{"params":[{"name":"HbA1c","unit":"%","defaultValue":"5.3","maleMax":5.7,"femaleMax":5.7,"criticalHigh":12.0,"sortOrder":1}]}', 120),
 
   (N'BIO-LIPID', N'Lipid Profile', N'BIOCHEMISTRY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Total Cholesterol","unit":"mg/dL","min":0,"max":200},{"name":"HDL Cholesterol","unit":"mg/dL","min":40,"max":60},{"name":"LDL Cholesterol","unit":"mg/dL","min":0,"max":100},{"name":"VLDL","unit":"mg/dL","min":5,"max":40},{"name":"Triglycerides","unit":"mg/dL","min":0,"max":150},{"name":"Total/HDL Ratio","unit":"ratio","min":0,"max":5}]}', 130),
+   N'{"params":[
+     {"name":"Serum Total Cholesterol","unit":"mg/dL","defaultValue":"165.0","maleMax":200.0,"femaleMax":200.0,"sortOrder":1},
+     {"name":"Serum Triglycerides","unit":"mg/dL","defaultValue":"115.0","maleMax":150.0,"femaleMax":150.0,"sortOrder":2},
+     {"name":"HDL Cholesterol","unit":"mg/dL","defaultValue":"48.0","maleMin":40.0,"femaleMin":50.0,"sortOrder":3},
+     {"name":"LDL Cholesterol","unit":"mg/dL","defaultValue":"92.0","maleMax":100.0,"femaleMax":100.0,"sortOrder":4},
+     {"name":"VLDL Cholesterol","unit":"mg/dL","defaultValue":"23.0","maleMin":10.0,"maleMax":30.0,"femaleMin":10.0,"femaleMax":30.0,"sortOrder":5},
+     {"name":"Total Cholesterol / HDL Ratio","unit":"ratio","defaultValue":"3.40","maleMax":4.40,"femaleMax":4.40,"sortOrder":6}
+   ]}', 130),
 
+  -- ALP carries a childMin/childMax band (the others in this panel don't) -- bone-growth
+  -- elevation makes a normal child's ALP read HIGH against the adult range, the single most
+  -- clinically significant pediatric difference in this panel.
   (N'BIO-LFT', N'Liver Function Test (LFT)', N'BIOCHEMISTRY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Total Bilirubin","unit":"mg/dL","min":0.1,"max":1.2},{"name":"Direct Bilirubin","unit":"mg/dL","min":0,"max":0.3},{"name":"SGOT (AST)","unit":"U/L","min":0,"max":40},{"name":"SGPT (ALT)","unit":"U/L","min":0,"max":40},{"name":"Alkaline Phosphatase","unit":"U/L","min":44,"max":147},{"name":"GGT","unit":"U/L","min":0,"max":55},{"name":"Total Protein","unit":"g/dL","min":6.0,"max":8.3},{"name":"Albumin","unit":"g/dL","min":3.5,"max":5.5},{"name":"Globulin","unit":"g/dL","min":2.0,"max":3.5},{"name":"A/G Ratio","unit":"ratio","min":1.2,"max":2.2}]}', 140),
+   N'{"params":[
+     {"name":"Bilirubin - Total","unit":"mg/dL","defaultValue":"0.70","maleMin":0.20,"maleMax":1.20,"femaleMin":0.20,"femaleMax":1.20,"criticalHigh":15.0,"sortOrder":1},
+     {"name":"Bilirubin - Direct","unit":"mg/dL","defaultValue":"0.15","maleMin":0.00,"maleMax":0.30,"femaleMin":0.00,"femaleMax":0.30,"criticalHigh":5.0,"sortOrder":2},
+     {"name":"Bilirubin - Indirect","unit":"mg/dL","defaultValue":"0.55","maleMin":0.10,"maleMax":0.90,"femaleMin":0.10,"femaleMax":0.90,"sortOrder":3},
+     {"name":"SGOT / AST","unit":"U/L","defaultValue":"22.0","maleMin":5.0,"maleMax":40.0,"femaleMin":5.0,"femaleMax":40.0,"criticalHigh":500.0,"sortOrder":4},
+     {"name":"SGPT / ALT","unit":"U/L","defaultValue":"24.0","maleMin":5.0,"maleMax":45.0,"femaleMin":5.0,"femaleMax":45.0,"criticalHigh":500.0,"sortOrder":5},
+     {"name":"Alkaline Phosphatase (ALP)","unit":"U/L","defaultValue":"75.0","maleMin":30.0,"maleMax":120.0,"femaleMin":30.0,"femaleMax":120.0,"childMin":100.0,"childMax":350.0,"criticalHigh":700.0,"sortOrder":6},
+     {"name":"Gamma GT (GGT)","unit":"U/L","defaultValue":"28.0","maleMin":10.0,"maleMax":50.0,"femaleMin":5.0,"femaleMax":35.0,"criticalHigh":250.0,"sortOrder":7},
+     {"name":"Total Protein","unit":"g/dL","defaultValue":"7.20","maleMin":6.00,"maleMax":8.30,"femaleMin":6.00,"femaleMax":8.30,"criticalLow":4.5,"sortOrder":8},
+     {"name":"Serum Albumin","unit":"g/dL","defaultValue":"4.20","maleMin":3.50,"maleMax":5.00,"femaleMin":3.50,"femaleMax":5.00,"criticalLow":2.0,"sortOrder":9},
+     {"name":"Serum Globulin","unit":"g/dL","defaultValue":"3.00","maleMin":2.00,"maleMax":3.50,"femaleMin":2.00,"femaleMax":3.50,"sortOrder":10},
+     {"name":"Albumin : Globulin Ratio (A/G)","unit":"ratio","defaultValue":"1.40","maleMin":1.20,"maleMax":2.20,"femaleMin":1.20,"femaleMax":2.20,"sortOrder":11}
+   ]}', 140),
 
+  -- Creatinine carries a childMin/childMax band (the others in this panel don't) -- children run
+  -- substantially lower than adults on lower muscle mass, so a genuinely abnormal pediatric value
+  -- can otherwise still read NORMAL against the adult floor.
   (N'BIO-KFT', N'Kidney Function Test (KFT/RFT)', N'BIOCHEMISTRY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Blood Urea","unit":"mg/dL","min":15,"max":40},{"name":"Serum Creatinine","unit":"mg/dL","min":0.7,"max":1.3},{"name":"Uric Acid","unit":"mg/dL","min":3.5,"max":7.2},{"name":"BUN","unit":"mg/dL","min":7,"max":20},{"name":"Sodium","unit":"mEq/L","min":136,"max":145},{"name":"Potassium","unit":"mEq/L","min":3.5,"max":5.1},{"name":"Chloride","unit":"mEq/L","min":98,"max":106},{"name":"Calcium","unit":"mg/dL","min":8.5,"max":10.5}]}', 150),
+   N'{"params":[
+     {"name":"Blood Urea","unit":"mg/dL","defaultValue":"24.0","maleMin":15.0,"maleMax":45.0,"femaleMin":15.0,"femaleMax":45.0,"criticalHigh":120.0,"sortOrder":1},
+     {"name":"Serum Creatinine","unit":"mg/dL","defaultValue":"0.90","maleMin":0.70,"maleMax":1.30,"femaleMin":0.60,"femaleMax":1.10,"childMin":0.30,"childMax":0.70,"criticalHigh":5.00,"sortOrder":2},
+     {"name":"Blood Urea Nitrogen (BUN)","unit":"mg/dL","defaultValue":"11.2","maleMin":7.0,"maleMax":20.0,"femaleMin":7.0,"femaleMax":20.0,"criticalHigh":60.0,"sortOrder":3},
+     {"name":"Serum Uric Acid","unit":"mg/dL","defaultValue":"4.80","maleMin":3.50,"maleMax":7.20,"femaleMin":2.60,"femaleMax":6.00,"criticalHigh":12.0,"sortOrder":4},
+     {"name":"Serum Sodium (Na+)","unit":"mmol/L","defaultValue":"140.0","maleMin":135.0,"maleMax":145.0,"femaleMin":135.0,"femaleMax":145.0,"criticalLow":120.0,"criticalHigh":160.0,"sortOrder":5},
+     {"name":"Serum Potassium (K+)","unit":"mmol/L","defaultValue":"4.20","maleMin":3.50,"maleMax":5.00,"femaleMin":3.50,"femaleMax":5.00,"criticalLow":2.80,"criticalHigh":6.50,"sortOrder":6},
+     {"name":"Serum Chloride (Cl-)","unit":"mmol/L","defaultValue":"101.0","maleMin":96.0,"maleMax":106.0,"femaleMin":96.0,"femaleMax":106.0,"criticalLow":80.0,"criticalHigh":125.0,"sortOrder":7},
+     {"name":"Serum Calcium (Total)","unit":"mg/dL","defaultValue":"9.40","maleMin":8.50,"maleMax":10.50,"femaleMin":8.50,"femaleMax":10.50,"criticalLow":6.50,"criticalHigh":13.0,"sortOrder":8}
+   ]}', 150),
 
+  -- Same gender-split range as the Uric Acid parameter inside BIO-KFT -- kept in sync
+  -- deliberately, since a hospital/patient can order this standalone instead of the full panel.
   (N'BIO-URIC', N'Serum Uric Acid', N'BIOCHEMISTRY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Uric Acid","unit":"mg/dL","min":3.5,"max":7.2}]}', 155),
+   N'{"params":[{"name":"Uric Acid","unit":"mg/dL","defaultValue":"4.80","maleMin":3.50,"maleMax":7.20,"femaleMin":2.60,"femaleMax":6.00,"criticalHigh":12.0,"sortOrder":1}]}', 155),
 
+  -- criticalHigh added to all three -- Troponin I elevation is the textbook definition of a lab
+  -- panic value (acute MI), and this panel previously had no critical threshold anywhere, so it
+  -- would never trip the critical-value banner/beep in OrderResultEntry.tsx no matter how
+  -- abnormal. Thresholds are standard hospital panic-value defaults, tunable per-hospital via the
+  -- Test Catalog Manager.
   (N'BIO-CARDIAC', N'Cardiac Markers', N'BIOCHEMISTRY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Troponin I","unit":"ng/mL","min":0,"max":0.04},{"name":"CPK-MB","unit":"U/L","min":0,"max":25},{"name":"CPK Total","unit":"U/L","min":30,"max":200}]}', 160);
+   N'{"params":[
+     {"name":"Troponin I","unit":"ng/mL","defaultValue":"0.01","maleMin":0,"maleMax":0.04,"femaleMin":0,"femaleMax":0.04,"criticalHigh":0.5,"sortOrder":1},
+     {"name":"CPK-MB","unit":"U/L","defaultValue":"12","maleMin":0,"maleMax":25,"femaleMin":0,"femaleMax":25,"criticalHigh":100,"sortOrder":2},
+     {"name":"CPK Total","unit":"U/L","defaultValue":"110","maleMin":30,"maleMax":200,"femaleMin":30,"femaleMax":200,"criticalHigh":1000,"sortOrder":3}
+   ]}', 160);
 
-  /* ===== CLINICAL PATHOLOGY ===== */
+  /* ===== CLINICAL PATHOLOGY (unchanged this phase) ===== */
   INSERT INTO @Tests VALUES
   (N'CP-URINE-R', N'Urine Routine & Microscopy', N'CLINICAL_PATHOLOGY', N'Urine', N'Container',
-   N'{"params":[{"name":"Color","unit":""},{"name":"Appearance","unit":""},{"name":"pH","unit":"","min":4.5,"max":8.0},{"name":"Specific Gravity","unit":"","min":1.005,"max":1.030},{"name":"Protein","unit":""},{"name":"Glucose","unit":""},{"name":"Ketones","unit":""},{"name":"Bilirubin","unit":""},{"name":"Urobilinogen","unit":""},{"name":"RBCs","unit":"/hpf","min":0,"max":2},{"name":"WBCs","unit":"/hpf","min":0,"max":5},{"name":"Epithelial Cells","unit":""},{"name":"Casts","unit":""},{"name":"Crystals","unit":""},{"name":"Bacteria","unit":""}]}', 200),
+   N'{"params":[{"name":"Color","unit":""},{"name":"Appearance","unit":""},{"name":"pH","unit":"","maleMin":4.5,"maleMax":8.0,"femaleMin":4.5,"femaleMax":8.0},{"name":"Specific Gravity","unit":"","maleMin":1.005,"maleMax":1.030,"femaleMin":1.005,"femaleMax":1.030},{"name":"Protein","unit":""},{"name":"Glucose","unit":""},{"name":"Ketones","unit":""},{"name":"Bilirubin","unit":""},{"name":"Urobilinogen","unit":""},{"name":"RBCs","unit":"/hpf","maleMin":0,"maleMax":2,"femaleMin":0,"femaleMax":2},{"name":"WBCs","unit":"/hpf","maleMin":0,"maleMax":5,"femaleMin":0,"femaleMax":5},{"name":"Epithelial Cells","unit":""},{"name":"Casts","unit":""},{"name":"Crystals","unit":""},{"name":"Bacteria","unit":""}]}', 200),
 
   (N'CP-STOOL-R', N'Stool Routine & Microscopy', N'CLINICAL_PATHOLOGY', N'Stool', N'Container',
    N'{"params":[{"name":"Color","unit":""},{"name":"Consistency","unit":""},{"name":"Occult Blood","unit":""},{"name":"Ova","unit":""},{"name":"Cysts","unit":""},{"name":"RBCs","unit":""},{"name":"WBCs","unit":""},{"name":"Mucus","unit":""}]}', 210),
@@ -26190,16 +27968,16 @@ BEGIN TRY
   (N'CP-UPT', N'Urine Pregnancy Test', N'CLINICAL_PATHOLOGY', N'Urine', N'Container',
    N'{"params":[{"name":"Î²-hCG (Qualitative)","unit":""}]}', 220);
 
-  /* ===== SEROLOGY / IMMUNOLOGY ===== */
+  /* ===== SEROLOGY / IMMUNOLOGY (unchanged this phase) ===== */
   INSERT INTO @Tests VALUES
   (N'SER-WIDAL', N'Widal Test', N'SEROLOGY', N'Serum', N'Plain',
    N'{"params":[{"name":"S. Typhi O","unit":"titre"},{"name":"S. Typhi H","unit":"titre"},{"name":"S. Paratyphi AO","unit":"titre"},{"name":"S. Paratyphi AH","unit":"titre"}]}', 300),
 
   (N'SER-CRP', N'C-Reactive Protein (CRP)', N'SEROLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"CRP","unit":"mg/L","min":0,"max":6}]}', 310),
+   N'{"params":[{"name":"CRP","unit":"mg/L","maleMin":0,"maleMax":6,"femaleMin":0,"femaleMax":6}]}', 310),
 
   (N'SER-RA', N'Rheumatoid Factor (RA)', N'SEROLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"RA Factor","unit":"IU/mL","min":0,"max":14}]}', 320),
+   N'{"params":[{"name":"RA Factor","unit":"IU/mL","maleMin":0,"maleMax":14,"femaleMin":0,"femaleMax":14}]}', 320),
 
   (N'SER-HIV', N'HIV I & II Antibody', N'SEROLOGY', N'Serum', N'Plain',
    N'{"params":[{"name":"HIV I & II","unit":""}]}', 330),
@@ -26213,37 +27991,41 @@ BEGIN TRY
   (N'SER-DENGUE', N'Dengue NS1 / IgM / IgG', N'SEROLOGY', N'Serum', N'Plain',
    N'{"params":[{"name":"NS1 Antigen","unit":""},{"name":"Dengue IgM","unit":""},{"name":"Dengue IgG","unit":""}]}', 350);
 
-  /* ===== ENDOCRINOLOGY ===== */
+  /* ===== ENDOCRINOLOGY (unchanged this phase) ===== */
   INSERT INTO @Tests VALUES
   (N'ENDO-THYROID', N'Thyroid Profile (T3, T4, TSH)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"T3","unit":"ng/dL","min":80,"max":200},{"name":"T4","unit":"Âµg/dL","min":5.1,"max":14.1},{"name":"TSH","unit":"ÂµIU/mL","min":0.27,"max":4.20}]}', 400),
+   N'{"params":[{"name":"T3","unit":"ng/dL","maleMin":80,"maleMax":200,"femaleMin":80,"femaleMax":200},{"name":"T4","unit":"Âµg/dL","maleMin":5.1,"maleMax":14.1,"femaleMin":5.1,"femaleMax":14.1},{"name":"TSH","unit":"ÂµIU/mL","maleMin":0.27,"maleMax":4.20,"femaleMin":0.27,"femaleMax":4.20}]}', 400),
 
+  -- Female range is a real physiological split (non-pregnant female prolactin legitimately runs
+  -- higher than male), not just a mechanical copy -- see the catalog audit.
   (N'ENDO-PROLACTIN', N'Serum Prolactin', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Prolactin","unit":"ng/mL","min":2,"max":18}]}', 410),
+   N'{"params":[{"name":"Prolactin","unit":"ng/mL","maleMin":2,"maleMax":18,"femaleMin":2,"femaleMax":29}]}', 410),
 
   (N'ENDO-CORTISOL', N'Serum Cortisol (Morning)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Cortisol (AM)","unit":"Âµg/dL","min":6.2,"max":19.4}]}', 420),
+   N'{"params":[{"name":"Cortisol (AM)","unit":"Âµg/dL","maleMin":6.2,"maleMax":19.4,"femaleMin":6.2,"femaleMax":19.4}]}', 420),
 
   (N'ENDO-VITD', N'Vitamin D (25-OH)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"25-OH Vitamin D","unit":"ng/mL","min":30,"max":100}]}', 430),
+   N'{"params":[{"name":"25-OH Vitamin D","unit":"ng/mL","maleMin":30,"maleMax":100,"femaleMin":30,"femaleMax":100}]}', 430),
 
   (N'ENDO-VITB12', N'Vitamin B12', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Vitamin B12","unit":"pg/mL","min":200,"max":900}]}', 440);
+   N'{"params":[{"name":"Vitamin B12","unit":"pg/mL","maleMin":200,"maleMax":900,"femaleMin":200,"femaleMax":900}]}', 440);
 
 
-  /* ===== Insert only missing tests ===== */
+  /* ===== Insert only missing (hospital, TestCode) combinations, for every active hospital ===== */
   INSERT INTO dbo.PathologyTestMaster (
       TestId, HospitalId, TestCode, TestName, Category, SampleType, ContainerType,
       ParameterSchemaJson, IsActive, SortOrder, CreatedAt, CreatedBy, UpdatedAt, UpdatedBy
   )
   SELECT
-      NEWID(), @HospitalId, t.TestCode, t.TestName, t.Category, t.SampleType, t.ContainerType,
+      NEWID(), h.HospitalID, t.TestCode, t.TestName, t.Category, t.SampleType, t.ContainerType,
       t.ParameterSchemaJson, 1, t.SortOrder, @Now, @User, @Now, @User
   FROM @Tests t
-  WHERE NOT EXISTS (
-      SELECT 1 FROM dbo.PathologyTestMaster pm
-      WHERE pm.HospitalId = @HospitalId AND pm.TestCode = t.TestCode
-  );
+  CROSS JOIN dbo.Hospitals h
+  WHERE h.IsArchived = 0
+    AND NOT EXISTS (
+        SELECT 1 FROM dbo.PathologyTestMaster pm
+        WHERE pm.HospitalId = h.HospitalID AND pm.TestCode = t.TestCode
+    );
 
   COMMIT TRAN;
   PRINT N'Default pathology tests seeded successfully.';

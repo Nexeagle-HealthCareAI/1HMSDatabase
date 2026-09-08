@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-09-03 23:58  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-09-08 13:06  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -3233,6 +3233,70 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_free_tier_usage.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Usage-based free tier: replaces the old time-based "1 month trial" lockout. A hospital still
+-- on the Trial subscription status gets a pooled monthly quota of "patient management actions"
+-- (IPD admission, OPD appointment -- online-confirm and walk-in, pathology order, pharmacy
+-- checkout) rather than being cut off once a calendar trial period ends. See
+-- HospitalSubscription.GetEffectiveStatus (easyHMSAPI) -- Trial no longer auto-expires by date.
+
+IF OBJECT_ID('dbo.PlatformSetting', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PlatformSetting (
+        SettingKey NVARCHAR(100) NOT NULL CONSTRAINT PK_PlatformSetting PRIMARY KEY,
+        SettingValue NVARCHAR(500) NOT NULL,
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_PlatformSetting_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedBy NVARCHAR(200) NULL
+    );
+
+    PRINT 'Created table PlatformSetting';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM dbo.PlatformSetting WHERE SettingKey = 'FreeTierMonthlyLimit')
+BEGIN
+    INSERT INTO dbo.PlatformSetting (SettingKey, SettingValue, UpdatedBy) VALUES ('FreeTierMonthlyLimit', '100', 'SYSTEM');
+    PRINT 'Seeded FreeTierMonthlyLimit = 100';
+END
+GO
+
+-- Per-hospital override -- absent row means "use the global PlatformSetting default".
+IF OBJECT_ID('dbo.HospitalFreeTierLimit', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HospitalFreeTierLimit (
+        HospitalId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_HospitalFreeTierLimit PRIMARY KEY CONSTRAINT FK_HospitalFreeTierLimit_Hospitals FOREIGN KEY REFERENCES dbo.Hospitals(HospitalID),
+        MonthlyLimit INT NOT NULL,
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HospitalFreeTierLimit_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedBy NVARCHAR(200) NULL
+    );
+
+    PRINT 'Created table HospitalFreeTierLimit';
+END
+GO
+
+-- One row per (HospitalId, YearMonth), UsedCount incremented atomically (UPDLOCK/HOLDLOCK) by
+-- easyHMSAPI's UsageLimitService on every countable action -- same raw-SQL row-locking
+-- convention as RecordInventoryMovementRequestModel's handler.
+IF OBJECT_ID('dbo.HospitalMonthlyUsage', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HospitalMonthlyUsage (
+        HospitalId UNIQUEIDENTIFIER NOT NULL CONSTRAINT FK_HospitalMonthlyUsage_Hospitals FOREIGN KEY REFERENCES dbo.Hospitals(HospitalID),
+        YearMonth CHAR(7) NOT NULL, -- 'YYYY-MM'
+        UsedCount INT NOT NULL CONSTRAINT DF_HospitalMonthlyUsage_UsedCount DEFAULT (0),
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HospitalMonthlyUsage_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+        CONSTRAINT PK_HospitalMonthlyUsage PRIMARY KEY (HospitalId, YearMonth)
+    );
+
+    PRINT 'Created table HospitalMonthlyUsage';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_hospital_leads.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -4073,7 +4137,7 @@ BEGIN
     CONSTRAINT PK_Indent PRIMARY KEY CLUSTERED (IndentId),
     CONSTRAINT UX_IND_Number UNIQUE (HospitalId, IndentNumber),
     -- FK_IND_Store deferred to create_tables_zz_foreign_keys.sql: Store sorts AFTER this file alphabetically.
-    CONSTRAINT CK_IND_Status CHECK ([Status] IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','CONVERTED_TO_PO','CANCELLED'))
+    CONSTRAINT CK_IND_Status CHECK ([Status] IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','CONVERTED_TO_PO','PARTIALLY_ISSUED','ISSUED','CANCELLED'))
   );
 END
 GO
@@ -9219,6 +9283,29 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_indent_status_add_issued_states.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- CK_IND_Status was created before ISSUED/PARTIALLY_ISSUED existed as Indent statuses (added by
+-- alter_indent_internal_workflow.sql for internal store-to-store transfers via IssueIndent). The
+-- constraint was never updated, so every dispatch of an internal request fails at SaveChangesAsync
+-- with a generic "An error occurred while saving the entity changes" (CHECK constraint violation)
+-- - found live-testing the pharmacy request/dispatch feature.
+
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_IND_Status' AND parent_object_id = OBJECT_ID('dbo.Indent'))
+BEGIN
+  ALTER TABLE dbo.Indent DROP CONSTRAINT CK_IND_Status;
+END
+GO
+
+ALTER TABLE dbo.Indent ADD CONSTRAINT CK_IND_Status
+  CHECK ([Status] IN ('DRAFT','SUBMITTED','APPROVED','REJECTED','CONVERTED_TO_PO','PARTIALLY_ISSUED','ISSUED','CANCELLED'));
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_instrument_set_store_link.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -9429,6 +9516,58 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_labconfiguration_add_identity_and_signoff.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Add lab identity and sign-off name columns to LabConfiguration
+-- Description: LabName/LabAddress/LabRegistrationNumber let a lab override the
+--              hospital's generic identity on its report letterhead; falls back
+--              to the Hospitals table fields when left null. TechnicianName/
+--              PathologistName print as a static manual sign-off line at the
+--              bottom of generated reports.
+-- =============================================================================
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabName')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabName NVARCHAR(200) NULL;
+    PRINT 'Added LabName column to LabConfiguration table';
+END
+ELSE PRINT 'LabName column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabAddress')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabAddress NVARCHAR(500) NULL;
+    PRINT 'Added LabAddress column to LabConfiguration table';
+END
+ELSE PRINT 'LabAddress column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabRegistrationNumber')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabRegistrationNumber NVARCHAR(100) NULL;
+    PRINT 'Added LabRegistrationNumber column to LabConfiguration table';
+END
+ELSE PRINT 'LabRegistrationNumber column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'TechnicianName')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD TechnicianName NVARCHAR(200) NULL;
+    PRINT 'Added TechnicianName column to LabConfiguration table';
+END
+ELSE PRINT 'TechnicianName column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'PathologistName')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD PathologistName NVARCHAR(200) NULL;
+    PRINT 'Added PathologistName column to LabConfiguration table';
+END
+ELSE PRINT 'PathologistName column already exists';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_labconfiguration_add_letterhead_mode.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -9447,6 +9586,107 @@ BEGIN
   ALTER TABLE dbo.LabConfiguration
     ADD LetterheadMode NVARCHAR(30) NOT NULL CONSTRAINT DF_LabConfiguration_LetterheadMode DEFAULT ('SYSTEM_DEFAULT');
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_labconfiguration_add_public_listing.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Add Doctor Dekho public listing columns to LabConfiguration
+-- Description: IsPubliclyListed is an independent opt-in (does not require
+--              Hospitals.IsPubliclyListed) that makes a lab discoverable on
+--              the public directory. LabCity/LabState/LabPincode are
+--              structured location fields (distinct from the freetext
+--              LabAddress column) needed for city/state search, mirroring
+--              Hospitals' own Location + City/State/Pincode split.
+-- =============================================================================
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'IsPubliclyListed')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD IsPubliclyListed BIT NOT NULL CONSTRAINT DF_LabConfiguration_IsPubliclyListed DEFAULT (0);
+    PRINT 'Added IsPubliclyListed column to LabConfiguration table';
+END
+ELSE PRINT 'IsPubliclyListed column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'PublicDescription')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD PublicDescription NVARCHAR(1000) NULL;
+    PRINT 'Added PublicDescription column to LabConfiguration table';
+END
+ELSE PRINT 'PublicDescription column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'PublicContactPhone')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD PublicContactPhone NVARCHAR(20) NULL;
+    PRINT 'Added PublicContactPhone column to LabConfiguration table';
+END
+ELSE PRINT 'PublicContactPhone column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'PublicContactEmail')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD PublicContactEmail NVARCHAR(256) NULL;
+    PRINT 'Added PublicContactEmail column to LabConfiguration table';
+END
+ELSE PRINT 'PublicContactEmail column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabCity')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabCity NVARCHAR(100) NULL;
+    PRINT 'Added LabCity column to LabConfiguration table';
+END
+ELSE PRINT 'LabCity column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabState')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabState NVARCHAR(100) NULL;
+    PRINT 'Added LabState column to LabConfiguration table';
+END
+ELSE PRINT 'LabState column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'LabPincode')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD LabPincode NVARCHAR(20) NULL;
+    PRINT 'Added LabPincode column to LabConfiguration table';
+END
+ELSE PRINT 'LabPincode column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'Latitude')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD Latitude DECIMAL(9,6) NULL;
+    PRINT 'Added Latitude column to LabConfiguration table';
+END
+ELSE PRINT 'Latitude column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'Longitude')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD Longitude DECIMAL(9,6) NULL;
+    PRINT 'Added Longitude column to LabConfiguration table';
+END
+ELSE PRINT 'Longitude column already exists';
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'TestCategoriesJson')
+BEGIN
+    ALTER TABLE dbo.LabConfiguration ADD TestCategoriesJson NVARCHAR(1000) NULL;
+    PRINT 'Added TestCategoriesJson column to LabConfiguration table';
+END
+ELSE PRINT 'TestCategoriesJson column already exists';
+GO
+
+-- Separate batch: CREATE INDEX referencing LabCity/LabState/IsPubliclyListed must compile against
+-- a schema where those columns already exist -- combined into the same batch as the ALTER TABLE
+-- statements above, SQL Server fails to resolve them at compile time and the whole batch never
+-- executes (this is why the columns didn't actually get created on the first attempt at this
+-- migration, despite the deploy pipeline reporting success).
+IF NOT EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.LabConfiguration') AND name = 'IX_LabConfiguration_City_State')
+BEGIN
+    CREATE INDEX IX_LabConfiguration_City_State ON dbo.LabConfiguration (LabCity, LabState) WHERE IsPubliclyListed = 1;
+    PRINT 'Added IX_LabConfiguration_City_State index to LabConfiguration table';
+END
+ELSE PRINT 'IX_LabConfiguration_City_State index already exists';
 GO
 
 GO
@@ -9839,6 +10079,30 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathologyorderline_add_external_lab_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds external-lab send/receive tracking to PathologyOrderLine, for lines whose test is
+-- outsourced (PathologyTestMaster.IsOutsourced). ExternalLabCost snapshots
+-- PathologyTestMaster.CostPrice at send-time (same snapshot pattern BillingChargeEvent already uses
+-- for charge rates) so a later catalog cost edit doesn't retroactively change an already-sent line's
+-- recorded cost. These columns stay NULL for in-house lines -- the existing PENDING /
+-- SAMPLE_COLLECTED / RESULT_ENTERED flow is unaffected.
+IF COL_LENGTH('dbo.PathologyOrderLine', 'ExternalLabId') IS NULL
+BEGIN
+  ALTER TABLE dbo.PathologyOrderLine
+    ADD ExternalLabId UNIQUEIDENTIFIER NULL,
+        SentToExternalLabAt DATETIME2 NULL,
+        ExternalLabRefNo NVARCHAR(100) NULL,
+        ExternalLabReceivedAt DATETIME2 NULL,
+        ExternalLabCost DECIMAL(18,2) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_pathologyreport_add_dual_signature.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -9875,6 +10139,27 @@ IF COL_LENGTH('dbo.PathologyResult', 'HasCriticalFlag') IS NULL
 BEGIN
   ALTER TABLE dbo.PathologyResult
     ADD HasCriticalFlag BIT NOT NULL CONSTRAINT DF_PathologyResult_HasCriticalFlag DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_pathologytestmaster_add_external_lab_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Adds outsourcing fields to PathologyTestMaster: IsOutsourced flags a test as processed by a
+-- third-party lab rather than in-house, DefaultExternalLabId is the routing default (soft link to
+-- PathologyExternalLab -- no FK, same convention as ChargeId), and CostPrice is the hospital's own
+-- cost when sent out. Patient-facing billing is untouched -- ChargeMaster.DefaultRate stays the only
+-- rate PathologyAutoBillingHelper posts; CostPrice is purely for hospital-side margin visibility.
+IF COL_LENGTH('dbo.PathologyTestMaster', 'IsOutsourced') IS NULL
+BEGIN
+  ALTER TABLE dbo.PathologyTestMaster
+    ADD IsOutsourced BIT NOT NULL CONSTRAINT DF_PathologyTestMaster_IsOutsourced DEFAULT (0),
+        DefaultExternalLabId UNIQUEIDENTIFIER NULL,
+        CostPrice DECIMAL(18,2) NULL;
 END
 GO
 
@@ -11961,6 +12246,93 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_pathologyexternallab_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create PathologyExternalLab Table
+-- Description: Hospital-scoped master of third-party labs a pathology test can be
+--              referred/sent out to. Kept separate from dbo.Vendor (procurement's
+--              drug-license/payment-terms-flavored vendor entity) rather than reused,
+--              since there is nothing lab-specific (accreditation, report contact) to
+--              hang off Vendor without polluting the procurement domain.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PathologyExternalLab', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyExternalLab
+    (
+        ExternalLabId    UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PathologyExternalLab_Id DEFAULT NEWID(),
+        HospitalId       UNIQUEIDENTIFIER NOT NULL,
+        LabName          NVARCHAR(200)    NOT NULL,
+        ContactPerson    NVARCHAR(150)    NULL,
+        Phone            NVARCHAR(20)     NULL,
+        Email            NVARCHAR(150)    NULL,
+        Address          NVARCHAR(500)    NULL,
+        AccreditationNo  NVARCHAR(100)    NULL,
+        IsActive         BIT              NOT NULL CONSTRAINT DF_PathologyExternalLab_IsActive DEFAULT (1),
+
+        CreatedAt        DATETIME2        NOT NULL CONSTRAINT DF_PathologyExternalLab_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy        NVARCHAR(100)    NULL,
+        UpdatedAt        DATETIME2        NOT NULL CONSTRAINT DF_PathologyExternalLab_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy        NVARCHAR(100)    NULL,
+        RowVersion       ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_PathologyExternalLab PRIMARY KEY CLUSTERED (ExternalLabId)
+    );
+
+    PRINT 'Created table PathologyExternalLab';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_pathologyreportkeyword_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create PathologyReportKeyword Table
+-- Description: Hospital-scoped "type a keyword, get a formatted paragraph" templates for
+--              pathology report authoring (Interpretation / Notes and paragraph-type custom
+--              fields). TestId is a soft reference (no FK, matching PathologyOrderLine.TestId's
+--              own convention in this module) -- NULL means the keyword is usable while
+--              reporting on any test, not just one. ContentJson holds a StyledRun[] array
+--              (frontend richText.ts), opaque to the backend.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PathologyReportKeyword', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyReportKeyword
+    (
+        KeywordId    UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PathologyReportKeyword_Id DEFAULT NEWID(),
+        HospitalId   UNIQUEIDENTIFIER NOT NULL,
+        TestId       UNIQUEIDENTIFIER NULL,
+        Keyword      NVARCHAR(100)    NOT NULL,
+        ContentJson  NVARCHAR(MAX)    NOT NULL,
+        IsActive     BIT              NOT NULL CONSTRAINT DF_PathologyReportKeyword_IsActive DEFAULT (1),
+
+        CreatedAt    DATETIME2        NOT NULL CONSTRAINT DF_PathologyReportKeyword_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedBy    NVARCHAR(100)    NULL,
+        UpdatedAt    DATETIME2        NOT NULL CONSTRAINT DF_PathologyReportKeyword_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy    NVARCHAR(100)    NULL,
+        RowVersion   ROWVERSION       NOT NULL,
+
+        CONSTRAINT PK_PathologyReportKeyword PRIMARY KEY CLUSTERED (KeywordId)
+    );
+
+    CREATE INDEX IX_PathologyReportKeyword_Hospital_Test
+    ON dbo.PathologyReportKeyword(HospitalId, TestId);
+
+    PRINT 'Created table PathologyReportKeyword';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_patient_nurse_assignment_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -12580,6 +12952,120 @@ GO
 -- Idempotent: safe to re-run, only touches rows still carrying the stale 'AUTO' value.
 
 UPDATE dbo.BillingPolicy SET IpdBedChargeMode = 'DAILY_AUTO' WHERE IpdBedChargeMode = 'AUTO';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/fix_pathology_test_reference_ranges.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Data fix, not a schema change. seed_pathology_default_tests.sql only inserts a (HospitalId,
+-- TestCode) pair that doesn't already exist, so any hospital already onboarded before this fix
+-- landed is stuck with the old, broken ParameterSchemaJson forever unless backfilled here.
+--
+-- The catalog audit found that PathologyResultFlagCalculator.cs and its TS port only ever read
+-- maleMin/maleMax/femaleMin/femaleMax/childMin/childMax -- a parameter authored with the older
+-- flat {"min","max"} pair (EnterPathologyResultHandler.cs's ParameterSchemaItem has no such
+-- property) silently deserializes with every bound null and NEVER flags HIGH/LOW/CRITICAL,
+-- however abnormal the value. Eleven tests were still in that flat shape. Three more had
+-- unrelated data-correctness gaps (an autofillable blood-group default, no critical thresholds on
+-- Cardiac Markers, a clinically backwards Total Cholesterol/HDL Ratio floor) also fixed here. See
+-- seed_pathology_default_tests.sql for the corresponding fix to what NEW hospitals get seeded.
+--
+-- Guarded per TestCode by a LIKE match on a short fragment unique to the ORIGINAL broken JSON
+-- (not a byte-exact whole-string match, which would be fragile against whitespace) -- deliberately
+-- NOT an unconditional overwrite: TestCatalogForm.tsx lets a hospital edit a test's own schema,
+-- and always rewrites it in the maleMin/maleMax shape when it does, so a row that's already been
+-- opened and saved in the Test Catalog Manager will never match these fragments and is left
+-- untouched. Idempotent -- safe to re-run, each UPDATE only touches rows still carrying the exact
+-- pre-fix fragment.
+
+-- HEM-RETIC -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Reticulocyte Count","unit":"%","defaultValue":"1.0","maleMin":0.5,"maleMax":2.5,"femaleMin":0.5,"femaleMax":2.5,"sortOrder":1}]}'
+WHERE TestCode = N'HEM-RETIC' AND ParameterSchemaJson LIKE N'%"min":0.5,"max":2.5%';
+
+-- HEM-BLOODGROUP -- removes the autofillable "B Positive"/"Positive" defaults. A blood group is a
+-- fixed patient-identity field, not a "typical normal" -- leaving a default meant one click of
+-- 1-Click Autofill Normals could write a fabricated blood group into a real result.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"ABO Blood Grouping","unit":"","sortOrder":1},{"name":"Rh Factor (D Antigen)","unit":"","sortOrder":2}]}'
+WHERE TestCode = N'HEM-BLOODGROUP' AND ParameterSchemaJson LIKE N'%B Positive%';
+
+-- BIO-LIPID -- Total Cholesterol/HDL Ratio's lower bound removed (a lower ratio is always more
+-- protective; it should never flag LOW). Rest of the panel unchanged.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Serum Total Cholesterol","unit":"mg/dL","defaultValue":"165.0","maleMax":200.0,"femaleMax":200.0,"sortOrder":1},{"name":"Serum Triglycerides","unit":"mg/dL","defaultValue":"115.0","maleMax":150.0,"femaleMax":150.0,"sortOrder":2},{"name":"HDL Cholesterol","unit":"mg/dL","defaultValue":"48.0","maleMin":40.0,"femaleMin":50.0,"sortOrder":3},{"name":"LDL Cholesterol","unit":"mg/dL","defaultValue":"92.0","maleMax":100.0,"femaleMax":100.0,"sortOrder":4},{"name":"VLDL Cholesterol","unit":"mg/dL","defaultValue":"23.0","maleMin":10.0,"maleMax":30.0,"femaleMin":10.0,"femaleMax":30.0,"sortOrder":5},{"name":"Total Cholesterol / HDL Ratio","unit":"ratio","defaultValue":"3.40","maleMax":4.40,"femaleMax":4.40,"sortOrder":6}]}'
+WHERE TestCode = N'BIO-LIPID' AND ParameterSchemaJson LIKE N'%"Total Cholesterol / HDL Ratio","unit":"ratio","defaultValue":"3.40","maleMin":3.30%';
+
+-- BIO-LFT -- adds a pediatric band to Alkaline Phosphatase only (bone-growth elevation is the
+-- single most clinically significant pediatric difference in this panel). Rest unchanged.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Bilirubin - Total","unit":"mg/dL","defaultValue":"0.70","maleMin":0.20,"maleMax":1.20,"femaleMin":0.20,"femaleMax":1.20,"criticalHigh":15.0,"sortOrder":1},{"name":"Bilirubin - Direct","unit":"mg/dL","defaultValue":"0.15","maleMin":0.00,"maleMax":0.30,"femaleMin":0.00,"femaleMax":0.30,"criticalHigh":5.0,"sortOrder":2},{"name":"Bilirubin - Indirect","unit":"mg/dL","defaultValue":"0.55","maleMin":0.10,"maleMax":0.90,"femaleMin":0.10,"femaleMax":0.90,"sortOrder":3},{"name":"SGOT / AST","unit":"U/L","defaultValue":"22.0","maleMin":5.0,"maleMax":40.0,"femaleMin":5.0,"femaleMax":40.0,"criticalHigh":500.0,"sortOrder":4},{"name":"SGPT / ALT","unit":"U/L","defaultValue":"24.0","maleMin":5.0,"maleMax":45.0,"femaleMin":5.0,"femaleMax":45.0,"criticalHigh":500.0,"sortOrder":5},{"name":"Alkaline Phosphatase (ALP)","unit":"U/L","defaultValue":"75.0","maleMin":30.0,"maleMax":120.0,"femaleMin":30.0,"femaleMax":120.0,"childMin":100.0,"childMax":350.0,"criticalHigh":700.0,"sortOrder":6},{"name":"Gamma GT (GGT)","unit":"U/L","defaultValue":"28.0","maleMin":10.0,"maleMax":50.0,"femaleMin":5.0,"femaleMax":35.0,"criticalHigh":250.0,"sortOrder":7},{"name":"Total Protein","unit":"g/dL","defaultValue":"7.20","maleMin":6.00,"maleMax":8.30,"femaleMin":6.00,"femaleMax":8.30,"criticalLow":4.5,"sortOrder":8},{"name":"Serum Albumin","unit":"g/dL","defaultValue":"4.20","maleMin":3.50,"maleMax":5.00,"femaleMin":3.50,"femaleMax":5.00,"criticalLow":2.0,"sortOrder":9},{"name":"Serum Globulin","unit":"g/dL","defaultValue":"3.00","maleMin":2.00,"maleMax":3.50,"femaleMin":2.00,"femaleMax":3.50,"sortOrder":10},{"name":"Albumin : Globulin Ratio (A/G)","unit":"ratio","defaultValue":"1.40","maleMin":1.20,"maleMax":2.20,"femaleMin":1.20,"femaleMax":2.20,"sortOrder":11}]}'
+WHERE TestCode = N'BIO-LFT' AND ParameterSchemaJson LIKE N'%"Alkaline Phosphatase (ALP)","unit":"U/L","defaultValue":"75.0","maleMin":30.0,"maleMax":120.0,"femaleMin":30.0,"femaleMax":120.0,"criticalHigh":700.0%';
+
+-- BIO-KFT -- adds a pediatric band to Serum Creatinine only (children run substantially lower
+-- than adults on lower muscle mass). Rest unchanged.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Blood Urea","unit":"mg/dL","defaultValue":"24.0","maleMin":15.0,"maleMax":45.0,"femaleMin":15.0,"femaleMax":45.0,"criticalHigh":120.0,"sortOrder":1},{"name":"Serum Creatinine","unit":"mg/dL","defaultValue":"0.90","maleMin":0.70,"maleMax":1.30,"femaleMin":0.60,"femaleMax":1.10,"childMin":0.30,"childMax":0.70,"criticalHigh":5.00,"sortOrder":2},{"name":"Blood Urea Nitrogen (BUN)","unit":"mg/dL","defaultValue":"11.2","maleMin":7.0,"maleMax":20.0,"femaleMin":7.0,"femaleMax":20.0,"criticalHigh":60.0,"sortOrder":3},{"name":"Serum Uric Acid","unit":"mg/dL","defaultValue":"4.80","maleMin":3.50,"maleMax":7.20,"femaleMin":2.60,"femaleMax":6.00,"criticalHigh":12.0,"sortOrder":4},{"name":"Serum Sodium (Na+)","unit":"mmol/L","defaultValue":"140.0","maleMin":135.0,"maleMax":145.0,"femaleMin":135.0,"femaleMax":145.0,"criticalLow":120.0,"criticalHigh":160.0,"sortOrder":5},{"name":"Serum Potassium (K+)","unit":"mmol/L","defaultValue":"4.20","maleMin":3.50,"maleMax":5.00,"femaleMin":3.50,"femaleMax":5.00,"criticalLow":2.80,"criticalHigh":6.50,"sortOrder":6},{"name":"Serum Chloride (Cl-)","unit":"mmol/L","defaultValue":"101.0","maleMin":96.0,"maleMax":106.0,"femaleMin":96.0,"femaleMax":106.0,"criticalLow":80.0,"criticalHigh":125.0,"sortOrder":7},{"name":"Serum Calcium (Total)","unit":"mg/dL","defaultValue":"9.40","maleMin":8.50,"maleMax":10.50,"femaleMin":8.50,"femaleMax":10.50,"criticalLow":6.50,"criticalHigh":13.0,"sortOrder":8}]}'
+WHERE TestCode = N'BIO-KFT' AND ParameterSchemaJson LIKE N'%"Serum Creatinine","unit":"mg/dL","defaultValue":"0.90","maleMin":0.70,"maleMax":1.30,"femaleMin":0.60,"femaleMax":1.10,"criticalHigh":5.00%';
+
+-- BIO-URIC (standalone) -- flat unisex range replaced with the same correctly gender-split range
+-- already used inside BIO-KFT, so a female patient ordering it standalone isn't assessed against
+-- the male range, plus a criticalHigh it previously had none of.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Uric Acid","unit":"mg/dL","defaultValue":"4.80","maleMin":3.50,"maleMax":7.20,"femaleMin":2.60,"femaleMax":6.00,"criticalHigh":12.0,"sortOrder":1}]}'
+WHERE TestCode = N'BIO-URIC' AND ParameterSchemaJson LIKE N'%"min":3.5,"max":7.2%';
+
+-- BIO-CARDIAC -- flat shape -> enriched, plus criticalHigh on all three (Troponin I elevation is
+-- the textbook lab panic value; this panel previously had no critical threshold at all).
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Troponin I","unit":"ng/mL","defaultValue":"0.01","maleMin":0,"maleMax":0.04,"femaleMin":0,"femaleMax":0.04,"criticalHigh":0.5,"sortOrder":1},{"name":"CPK-MB","unit":"U/L","defaultValue":"12","maleMin":0,"maleMax":25,"femaleMin":0,"femaleMax":25,"criticalHigh":100,"sortOrder":2},{"name":"CPK Total","unit":"U/L","defaultValue":"110","maleMin":30,"maleMax":200,"femaleMin":30,"femaleMax":200,"criticalHigh":1000,"sortOrder":3}]}'
+WHERE TestCode = N'BIO-CARDIAC' AND ParameterSchemaJson LIKE N'%"Troponin I","unit":"ng/mL","min":0,"max":0.04%';
+
+-- CP-URINE-R -- flat shape -> enriched for the 4 numeric params only (pH, Specific Gravity, RBCs,
+-- WBCs); the qualitative fields (Color, Protein, Casts, etc.) are untouched.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Color","unit":""},{"name":"Appearance","unit":""},{"name":"pH","unit":"","maleMin":4.5,"maleMax":8.0,"femaleMin":4.5,"femaleMax":8.0},{"name":"Specific Gravity","unit":"","maleMin":1.005,"maleMax":1.030,"femaleMin":1.005,"femaleMax":1.030},{"name":"Protein","unit":""},{"name":"Glucose","unit":""},{"name":"Ketones","unit":""},{"name":"Bilirubin","unit":""},{"name":"Urobilinogen","unit":""},{"name":"RBCs","unit":"/hpf","maleMin":0,"maleMax":2,"femaleMin":0,"femaleMax":2},{"name":"WBCs","unit":"/hpf","maleMin":0,"maleMax":5,"femaleMin":0,"femaleMax":5},{"name":"Epithelial Cells","unit":""},{"name":"Casts","unit":""},{"name":"Crystals","unit":""},{"name":"Bacteria","unit":""}]}'
+WHERE TestCode = N'CP-URINE-R' AND ParameterSchemaJson LIKE N'%"pH","unit":"","min":4.5,"max":8.0%';
+
+-- SER-CRP -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"CRP","unit":"mg/L","maleMin":0,"maleMax":6,"femaleMin":0,"femaleMax":6}]}'
+WHERE TestCode = N'SER-CRP' AND ParameterSchemaJson LIKE N'%"CRP","unit":"mg/L","min":0,"max":6%';
+
+-- SER-RA -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"RA Factor","unit":"IU/mL","maleMin":0,"maleMax":14,"femaleMin":0,"femaleMax":14}]}'
+WHERE TestCode = N'SER-RA' AND ParameterSchemaJson LIKE N'%"RA Factor","unit":"IU/mL","min":0,"max":14%';
+
+-- ENDO-THYROID -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"T3","unit":"ng/dL","maleMin":80,"maleMax":200,"femaleMin":80,"femaleMax":200},{"name":"T4","unit":"Âµg/dL","maleMin":5.1,"maleMax":14.1,"femaleMin":5.1,"femaleMax":14.1},{"name":"TSH","unit":"ÂµIU/mL","maleMin":0.27,"maleMax":4.20,"femaleMin":0.27,"femaleMax":4.20}]}'
+WHERE TestCode = N'ENDO-THYROID' AND ParameterSchemaJson LIKE N'%"T3","unit":"ng/dL","min":80,"max":200%';
+
+-- ENDO-PROLACTIN -- flat shape -> enriched WITH a real gender split (non-pregnant female
+-- prolactin legitimately runs higher than male) -- not just a mechanical copy.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Prolactin","unit":"ng/mL","maleMin":2,"maleMax":18,"femaleMin":2,"femaleMax":29}]}'
+WHERE TestCode = N'ENDO-PROLACTIN' AND ParameterSchemaJson LIKE N'%"Prolactin","unit":"ng/mL","min":2,"max":18%';
+
+-- ENDO-CORTISOL -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Cortisol (AM)","unit":"Âµg/dL","maleMin":6.2,"maleMax":19.4,"femaleMin":6.2,"femaleMax":19.4}]}'
+WHERE TestCode = N'ENDO-CORTISOL' AND ParameterSchemaJson LIKE N'%"Cortisol (AM)","unit":"Âµg/dL","min":6.2,"max":19.4%';
+
+-- ENDO-VITD -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"25-OH Vitamin D","unit":"ng/mL","maleMin":30,"maleMax":100,"femaleMin":30,"femaleMax":100}]}'
+WHERE TestCode = N'ENDO-VITD' AND ParameterSchemaJson LIKE N'%"25-OH Vitamin D","unit":"ng/mL","min":30,"max":100%';
+
+-- ENDO-VITB12 -- flat shape -> enriched, no clinical value change.
+UPDATE dbo.PathologyTestMaster
+SET ParameterSchemaJson = N'{"params":[{"name":"Vitamin B12","unit":"pg/mL","maleMin":200,"maleMax":900,"femaleMin":200,"femaleMax":900}]}'
+WHERE TestCode = N'ENDO-VITB12' AND ParameterSchemaJson LIKE N'%"Vitamin B12","unit":"pg/mL","min":200,"max":900%';
 GO
 
 GO
@@ -27307,11 +27793,22 @@ GO
    "maleMax", "femaleMin", "femaleMax", "childMin", "childMax", "criticalLow", "criticalHigh",
    "sortOrder" } ] }. Any bound left out of a param's JSON is simply absent (no range/threshold
    in that direction) -- see PathologyResultFlagCalculator for how missing bounds/demographic
-   splits are resolved. Six panels below (CBC+ESR, Coagulation+Blood Grouping, LFT,
-   KFT+Electrolytes, Lipid Profile, Glucose+HbA1c) carry the full demographic/critical schema,
-   sourced from the 1Lab PRD v2.4.0 Section 8 reference tables. The remaining panels keep their
-   original flat {min,max} shape (still valid -- the flag calculator falls back to it) and can be
-   enriched incrementally via the Test Catalog Manager UI without any further migration.
+   splits are resolved.
+
+   IMPORTANT: every parameter below MUST use maleMin/maleMax/femaleMin/femaleMax (duplicating the
+   same value into both when there's no real gender difference), never the older flat {min,max}
+   pair. PathologyResultFlagCalculator.cs and its TS port only ever read the six named bounds
+   above -- a plain "min"/"max" key deserializes to nothing and the parameter silently never
+   flags HIGH/LOW/CRITICAL for ANY value, however abnormal (confirmed by reading
+   EnterPathologyResultHandler.cs's ParameterSchemaItem, which has no Min/Max property at all). An
+   earlier version of this file left several panels in that flat shape believing the calculator
+   "fell back" to it; it doesn't, and a full catalog audit + fix converted every one of them (see
+   dml_pathology_test_ranges_fix.sql for the matching one-time backfill of hospitals seeded before
+   this fix). CBC+ESR, Coagulation, LFT, KFT+Electrolytes, Lipid Profile, and Glucose+HbA1c
+   additionally carry childMin/childMax and criticalLow/criticalHigh where clinically meaningful,
+   sourced from the 1Lab PRD v2.4.0 Section 8 reference tables plus the audit's pediatric-gap
+   fixes (ALP, Creatinine). Everything here can still be edited/enriched further per-hospital via
+   the Test Catalog Manager UI without any further migration.
    ========================================================= */
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
@@ -27363,12 +27860,15 @@ BEGIN TRY
    ]}', 30),
 
   (N'HEM-RETIC', N'Reticulocyte Count', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
-   N'{"params":[{"name":"Reticulocyte Count","unit":"%","min":0.5,"max":2.5}]}', 40),
+   N'{"params":[{"name":"Reticulocyte Count","unit":"%","defaultValue":"1.0","maleMin":0.5,"maleMax":2.5,"femaleMin":0.5,"femaleMax":2.5,"sortOrder":1}]}', 40),
 
   (N'HEM-BLOODGROUP', N'Blood Grouping & Rh Typing', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
+   -- No defaultValue on either param, deliberately -- a blood group is a fixed patient-identity
+   -- field, not a "typical normal." A default here would let 1-Click Autofill Normals write a
+   -- fabricated blood group into a real result.
    N'{"params":[
-     {"name":"ABO Blood Grouping","unit":"","defaultValue":"B Positive","sortOrder":1},
-     {"name":"Rh Factor (D Antigen)","unit":"","defaultValue":"Positive","sortOrder":2}
+     {"name":"ABO Blood Grouping","unit":"","sortOrder":1},
+     {"name":"Rh Factor (D Antigen)","unit":"","sortOrder":2}
    ]}', 45);
 
   /* ===== COAGULATION (enriched) ===== */
@@ -27404,9 +27904,12 @@ BEGIN TRY
      {"name":"HDL Cholesterol","unit":"mg/dL","defaultValue":"48.0","maleMin":40.0,"femaleMin":50.0,"sortOrder":3},
      {"name":"LDL Cholesterol","unit":"mg/dL","defaultValue":"92.0","maleMax":100.0,"femaleMax":100.0,"sortOrder":4},
      {"name":"VLDL Cholesterol","unit":"mg/dL","defaultValue":"23.0","maleMin":10.0,"maleMax":30.0,"femaleMin":10.0,"femaleMax":30.0,"sortOrder":5},
-     {"name":"Total Cholesterol / HDL Ratio","unit":"ratio","defaultValue":"3.40","maleMin":3.30,"maleMax":4.40,"femaleMin":3.30,"femaleMax":4.40,"sortOrder":6}
+     {"name":"Total Cholesterol / HDL Ratio","unit":"ratio","defaultValue":"3.40","maleMax":4.40,"femaleMax":4.40,"sortOrder":6}
    ]}', 130),
 
+  -- ALP carries a childMin/childMax band (the others in this panel don't) -- bone-growth
+  -- elevation makes a normal child's ALP read HIGH against the adult range, the single most
+  -- clinically significant pediatric difference in this panel.
   (N'BIO-LFT', N'Liver Function Test (LFT)', N'BIOCHEMISTRY', N'Serum', N'Plain',
    N'{"params":[
      {"name":"Bilirubin - Total","unit":"mg/dL","defaultValue":"0.70","maleMin":0.20,"maleMax":1.20,"femaleMin":0.20,"femaleMax":1.20,"criticalHigh":15.0,"sortOrder":1},
@@ -27414,7 +27917,7 @@ BEGIN TRY
      {"name":"Bilirubin - Indirect","unit":"mg/dL","defaultValue":"0.55","maleMin":0.10,"maleMax":0.90,"femaleMin":0.10,"femaleMax":0.90,"sortOrder":3},
      {"name":"SGOT / AST","unit":"U/L","defaultValue":"22.0","maleMin":5.0,"maleMax":40.0,"femaleMin":5.0,"femaleMax":40.0,"criticalHigh":500.0,"sortOrder":4},
      {"name":"SGPT / ALT","unit":"U/L","defaultValue":"24.0","maleMin":5.0,"maleMax":45.0,"femaleMin":5.0,"femaleMax":45.0,"criticalHigh":500.0,"sortOrder":5},
-     {"name":"Alkaline Phosphatase (ALP)","unit":"U/L","defaultValue":"75.0","maleMin":30.0,"maleMax":120.0,"femaleMin":30.0,"femaleMax":120.0,"criticalHigh":700.0,"sortOrder":6},
+     {"name":"Alkaline Phosphatase (ALP)","unit":"U/L","defaultValue":"75.0","maleMin":30.0,"maleMax":120.0,"femaleMin":30.0,"femaleMax":120.0,"childMin":100.0,"childMax":350.0,"criticalHigh":700.0,"sortOrder":6},
      {"name":"Gamma GT (GGT)","unit":"U/L","defaultValue":"28.0","maleMin":10.0,"maleMax":50.0,"femaleMin":5.0,"femaleMax":35.0,"criticalHigh":250.0,"sortOrder":7},
      {"name":"Total Protein","unit":"g/dL","defaultValue":"7.20","maleMin":6.00,"maleMax":8.30,"femaleMin":6.00,"femaleMax":8.30,"criticalLow":4.5,"sortOrder":8},
      {"name":"Serum Albumin","unit":"g/dL","defaultValue":"4.20","maleMin":3.50,"maleMax":5.00,"femaleMin":3.50,"femaleMax":5.00,"criticalLow":2.0,"sortOrder":9},
@@ -27422,10 +27925,13 @@ BEGIN TRY
      {"name":"Albumin : Globulin Ratio (A/G)","unit":"ratio","defaultValue":"1.40","maleMin":1.20,"maleMax":2.20,"femaleMin":1.20,"femaleMax":2.20,"sortOrder":11}
    ]}', 140),
 
+  -- Creatinine carries a childMin/childMax band (the others in this panel don't) -- children run
+  -- substantially lower than adults on lower muscle mass, so a genuinely abnormal pediatric value
+  -- can otherwise still read NORMAL against the adult floor.
   (N'BIO-KFT', N'Kidney Function Test (KFT/RFT)', N'BIOCHEMISTRY', N'Serum', N'Plain',
    N'{"params":[
      {"name":"Blood Urea","unit":"mg/dL","defaultValue":"24.0","maleMin":15.0,"maleMax":45.0,"femaleMin":15.0,"femaleMax":45.0,"criticalHigh":120.0,"sortOrder":1},
-     {"name":"Serum Creatinine","unit":"mg/dL","defaultValue":"0.90","maleMin":0.70,"maleMax":1.30,"femaleMin":0.60,"femaleMax":1.10,"criticalHigh":5.00,"sortOrder":2},
+     {"name":"Serum Creatinine","unit":"mg/dL","defaultValue":"0.90","maleMin":0.70,"maleMax":1.30,"femaleMin":0.60,"femaleMax":1.10,"childMin":0.30,"childMax":0.70,"criticalHigh":5.00,"sortOrder":2},
      {"name":"Blood Urea Nitrogen (BUN)","unit":"mg/dL","defaultValue":"11.2","maleMin":7.0,"maleMax":20.0,"femaleMin":7.0,"femaleMax":20.0,"criticalHigh":60.0,"sortOrder":3},
      {"name":"Serum Uric Acid","unit":"mg/dL","defaultValue":"4.80","maleMin":3.50,"maleMax":7.20,"femaleMin":2.60,"femaleMax":6.00,"criticalHigh":12.0,"sortOrder":4},
      {"name":"Serum Sodium (Na+)","unit":"mmol/L","defaultValue":"140.0","maleMin":135.0,"maleMax":145.0,"femaleMin":135.0,"femaleMax":145.0,"criticalLow":120.0,"criticalHigh":160.0,"sortOrder":5},
@@ -27434,16 +27940,27 @@ BEGIN TRY
      {"name":"Serum Calcium (Total)","unit":"mg/dL","defaultValue":"9.40","maleMin":8.50,"maleMax":10.50,"femaleMin":8.50,"femaleMax":10.50,"criticalLow":6.50,"criticalHigh":13.0,"sortOrder":8}
    ]}', 150),
 
+  -- Same gender-split range as the Uric Acid parameter inside BIO-KFT -- kept in sync
+  -- deliberately, since a hospital/patient can order this standalone instead of the full panel.
   (N'BIO-URIC', N'Serum Uric Acid', N'BIOCHEMISTRY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Uric Acid","unit":"mg/dL","min":3.5,"max":7.2}]}', 155),
+   N'{"params":[{"name":"Uric Acid","unit":"mg/dL","defaultValue":"4.80","maleMin":3.50,"maleMax":7.20,"femaleMin":2.60,"femaleMax":6.00,"criticalHigh":12.0,"sortOrder":1}]}', 155),
 
+  -- criticalHigh added to all three -- Troponin I elevation is the textbook definition of a lab
+  -- panic value (acute MI), and this panel previously had no critical threshold anywhere, so it
+  -- would never trip the critical-value banner/beep in OrderResultEntry.tsx no matter how
+  -- abnormal. Thresholds are standard hospital panic-value defaults, tunable per-hospital via the
+  -- Test Catalog Manager.
   (N'BIO-CARDIAC', N'Cardiac Markers', N'BIOCHEMISTRY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Troponin I","unit":"ng/mL","min":0,"max":0.04},{"name":"CPK-MB","unit":"U/L","min":0,"max":25},{"name":"CPK Total","unit":"U/L","min":30,"max":200}]}', 160);
+   N'{"params":[
+     {"name":"Troponin I","unit":"ng/mL","defaultValue":"0.01","maleMin":0,"maleMax":0.04,"femaleMin":0,"femaleMax":0.04,"criticalHigh":0.5,"sortOrder":1},
+     {"name":"CPK-MB","unit":"U/L","defaultValue":"12","maleMin":0,"maleMax":25,"femaleMin":0,"femaleMax":25,"criticalHigh":100,"sortOrder":2},
+     {"name":"CPK Total","unit":"U/L","defaultValue":"110","maleMin":30,"maleMax":200,"femaleMin":30,"femaleMax":200,"criticalHigh":1000,"sortOrder":3}
+   ]}', 160);
 
   /* ===== CLINICAL PATHOLOGY (unchanged this phase) ===== */
   INSERT INTO @Tests VALUES
   (N'CP-URINE-R', N'Urine Routine & Microscopy', N'CLINICAL_PATHOLOGY', N'Urine', N'Container',
-   N'{"params":[{"name":"Color","unit":""},{"name":"Appearance","unit":""},{"name":"pH","unit":"","min":4.5,"max":8.0},{"name":"Specific Gravity","unit":"","min":1.005,"max":1.030},{"name":"Protein","unit":""},{"name":"Glucose","unit":""},{"name":"Ketones","unit":""},{"name":"Bilirubin","unit":""},{"name":"Urobilinogen","unit":""},{"name":"RBCs","unit":"/hpf","min":0,"max":2},{"name":"WBCs","unit":"/hpf","min":0,"max":5},{"name":"Epithelial Cells","unit":""},{"name":"Casts","unit":""},{"name":"Crystals","unit":""},{"name":"Bacteria","unit":""}]}', 200),
+   N'{"params":[{"name":"Color","unit":""},{"name":"Appearance","unit":""},{"name":"pH","unit":"","maleMin":4.5,"maleMax":8.0,"femaleMin":4.5,"femaleMax":8.0},{"name":"Specific Gravity","unit":"","maleMin":1.005,"maleMax":1.030,"femaleMin":1.005,"femaleMax":1.030},{"name":"Protein","unit":""},{"name":"Glucose","unit":""},{"name":"Ketones","unit":""},{"name":"Bilirubin","unit":""},{"name":"Urobilinogen","unit":""},{"name":"RBCs","unit":"/hpf","maleMin":0,"maleMax":2,"femaleMin":0,"femaleMax":2},{"name":"WBCs","unit":"/hpf","maleMin":0,"maleMax":5,"femaleMin":0,"femaleMax":5},{"name":"Epithelial Cells","unit":""},{"name":"Casts","unit":""},{"name":"Crystals","unit":""},{"name":"Bacteria","unit":""}]}', 200),
 
   (N'CP-STOOL-R', N'Stool Routine & Microscopy', N'CLINICAL_PATHOLOGY', N'Stool', N'Container',
    N'{"params":[{"name":"Color","unit":""},{"name":"Consistency","unit":""},{"name":"Occult Blood","unit":""},{"name":"Ova","unit":""},{"name":"Cysts","unit":""},{"name":"RBCs","unit":""},{"name":"WBCs","unit":""},{"name":"Mucus","unit":""}]}', 210),
@@ -27457,10 +27974,10 @@ BEGIN TRY
    N'{"params":[{"name":"S. Typhi O","unit":"titre"},{"name":"S. Typhi H","unit":"titre"},{"name":"S. Paratyphi AO","unit":"titre"},{"name":"S. Paratyphi AH","unit":"titre"}]}', 300),
 
   (N'SER-CRP', N'C-Reactive Protein (CRP)', N'SEROLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"CRP","unit":"mg/L","min":0,"max":6}]}', 310),
+   N'{"params":[{"name":"CRP","unit":"mg/L","maleMin":0,"maleMax":6,"femaleMin":0,"femaleMax":6}]}', 310),
 
   (N'SER-RA', N'Rheumatoid Factor (RA)', N'SEROLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"RA Factor","unit":"IU/mL","min":0,"max":14}]}', 320),
+   N'{"params":[{"name":"RA Factor","unit":"IU/mL","maleMin":0,"maleMax":14,"femaleMin":0,"femaleMax":14}]}', 320),
 
   (N'SER-HIV', N'HIV I & II Antibody', N'SEROLOGY', N'Serum', N'Plain',
    N'{"params":[{"name":"HIV I & II","unit":""}]}', 330),
@@ -27477,19 +27994,21 @@ BEGIN TRY
   /* ===== ENDOCRINOLOGY (unchanged this phase) ===== */
   INSERT INTO @Tests VALUES
   (N'ENDO-THYROID', N'Thyroid Profile (T3, T4, TSH)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"T3","unit":"ng/dL","min":80,"max":200},{"name":"T4","unit":"Âµg/dL","min":5.1,"max":14.1},{"name":"TSH","unit":"ÂµIU/mL","min":0.27,"max":4.20}]}', 400),
+   N'{"params":[{"name":"T3","unit":"ng/dL","maleMin":80,"maleMax":200,"femaleMin":80,"femaleMax":200},{"name":"T4","unit":"Âµg/dL","maleMin":5.1,"maleMax":14.1,"femaleMin":5.1,"femaleMax":14.1},{"name":"TSH","unit":"ÂµIU/mL","maleMin":0.27,"maleMax":4.20,"femaleMin":0.27,"femaleMax":4.20}]}', 400),
 
+  -- Female range is a real physiological split (non-pregnant female prolactin legitimately runs
+  -- higher than male), not just a mechanical copy -- see the catalog audit.
   (N'ENDO-PROLACTIN', N'Serum Prolactin', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Prolactin","unit":"ng/mL","min":2,"max":18}]}', 410),
+   N'{"params":[{"name":"Prolactin","unit":"ng/mL","maleMin":2,"maleMax":18,"femaleMin":2,"femaleMax":29}]}', 410),
 
   (N'ENDO-CORTISOL', N'Serum Cortisol (Morning)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Cortisol (AM)","unit":"Âµg/dL","min":6.2,"max":19.4}]}', 420),
+   N'{"params":[{"name":"Cortisol (AM)","unit":"Âµg/dL","maleMin":6.2,"maleMax":19.4,"femaleMin":6.2,"femaleMax":19.4}]}', 420),
 
   (N'ENDO-VITD', N'Vitamin D (25-OH)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"25-OH Vitamin D","unit":"ng/mL","min":30,"max":100}]}', 430),
+   N'{"params":[{"name":"25-OH Vitamin D","unit":"ng/mL","maleMin":30,"maleMax":100,"femaleMin":30,"femaleMax":100}]}', 430),
 
   (N'ENDO-VITB12', N'Vitamin B12', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Vitamin B12","unit":"pg/mL","min":200,"max":900}]}', 440);
+   N'{"params":[{"name":"Vitamin B12","unit":"pg/mL","maleMin":200,"maleMax":900,"femaleMin":200,"femaleMax":900}]}', 440);
 
 
   /* ===== Insert only missing (hospital, TestCode) combinations, for every active hospital ===== */

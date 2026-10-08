@@ -256,6 +256,18 @@ USING (SELECT r.RoleID, v.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
 
+-- HR suite (1HR): the API gates HrController / HrBiometricController on these two keys
+-- (RequiresPermission("hr.manage_employees", "hr.view_dashboard")). They were never seeded, so no
+-- role could reach HR through the normal permission path. Admin + AdminDoctor only.
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'hr.manage_employees'),(N'hr.view_dashboard')) v(PermissionKey)
+       WHERE r.RoleName IN (N'Admin', N'AdminDoctor')) AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET t.IsAllowed = 1;
+
 ------------------------------------------------------------
 -- 5) Hospital Types (global)
 ------------------------------------------------------------

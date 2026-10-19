@@ -16,7 +16,9 @@ BEGIN
     OccurredAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_AE_OccurredAt DEFAULT SYSUTCDATETIME(),
 
     SessionId     NVARCHAR(64)     NULL,
+    -- Masked copy only (98XXXXXX10) since 2026-10; MobileHash is the keyed hash used to group/search.
     Mobile        NVARCHAR(20)     NULL,
+    MobileHash    NVARCHAR(64)     NULL,
     DoctorId      UNIQUEIDENTIFIER NULL,
     -- Frontend-only category slug (e.g. "cardiology") from NexEagleWebsite's static specialty
     -- catalog — NOT MedicalSpecialities.SpecialityId (a different, DB-side GUID concept).
@@ -37,5 +39,7 @@ BEGIN
   CREATE INDEX IX_AnalyticsEvents_EventType_OccurredAt ON dbo.AnalyticsEvents (EventType, OccurredAt);
   CREATE INDEX IX_AnalyticsEvents_SessionId ON dbo.AnalyticsEvents (SessionId);
   CREATE INDEX IX_AnalyticsEvents_Mobile ON dbo.AnalyticsEvents (Mobile);
+  CREATE INDEX IX_AnalyticsEvents_MobileHash ON dbo.AnalyticsEvents (MobileHash) WHERE MobileHash IS NOT NULL;
+  CREATE INDEX IX_AnalyticsEvents_OccurredAt ON dbo.AnalyticsEvents (OccurredAt);
 END
 GO

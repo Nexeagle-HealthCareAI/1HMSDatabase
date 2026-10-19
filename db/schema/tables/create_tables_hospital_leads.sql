@@ -39,5 +39,6 @@ BEGIN
 
   CREATE INDEX IX_HospitalLeads_HospitalId_OccurredAt ON dbo.HospitalLeads (HospitalId, OccurredAt);
   CREATE INDEX IX_HospitalLeads_SessionId ON dbo.HospitalLeads (SessionId);
+  CREATE INDEX IX_HospitalLeads_OccurredAt ON dbo.HospitalLeads (OccurredAt);
 END
 GO

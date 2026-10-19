@@ -25,11 +25,17 @@ BEGIN
     -- Client-generated (localStorage-persisted) id grouping page views into one visit/session —
     -- lets the CMS report distinguish unique visitors from raw page-view counts.
     SessionId     NVARCHAR(64)     NULL,
+    -- Bot / crawler / data-centre traffic (tracking_traffic_quality_2026_10.sql); excluded from reports.
+    IsAutomated   BIT              NOT NULL CONSTRAINT DF_WV_IsAutomated DEFAULT 0,
+    -- Which website sent the page view: 'doctordekho' | 'nexeagle' (NULL = before 2026-10, unknown).
+    Site          NVARCHAR(20)     NULL,
 
     CONSTRAINT PK_WebsiteVisits PRIMARY KEY CLUSTERED (VisitId)
   );
 
   CREATE INDEX IX_WebsiteVisits_VisitedAt ON dbo.WebsiteVisits (VisitedAt);
   CREATE INDEX IX_WebsiteVisits_SessionId ON dbo.WebsiteVisits (SessionId);
+  CREATE INDEX IX_WebsiteVisits_IsAutomated_VisitedAt ON dbo.WebsiteVisits (IsAutomated, VisitedAt)
+    INCLUDE (SessionId, Site, Country, Region, City, PagePath);
 END
 GO

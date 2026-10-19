@@ -33,6 +33,9 @@ BEGIN
     -- count, AI-fallback flag).
     MetadataJson  NVARCHAR(MAX)    NULL,
 
+    -- Bot / data-centre traffic (tracking_traffic_quality_2026_10.sql); excluded from reports.
+    IsAutomated   BIT              NOT NULL CONSTRAINT DF_AE_IsAutomated DEFAULT 0,
+
     CONSTRAINT PK_AnalyticsEvents PRIMARY KEY CLUSTERED (EventId)
   );
 

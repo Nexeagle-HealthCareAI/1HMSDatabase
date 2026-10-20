@@ -35,7 +35,8 @@ BEGIN
 
   CREATE INDEX IX_WebsiteVisits_VisitedAt ON dbo.WebsiteVisits (VisitedAt);
   CREATE INDEX IX_WebsiteVisits_SessionId ON dbo.WebsiteVisits (SessionId);
-  CREATE INDEX IX_WebsiteVisits_IsAutomated_VisitedAt ON dbo.WebsiteVisits (IsAutomated, VisitedAt)
-    INCLUDE (SessionId, Site, Country, Region, City, PagePath);
+  -- IX_WebsiteVisits_IsAutomated_VisitedAt is created by migrations/tracking_traffic_quality_2026_10.sql, not
+  -- here: this batch re-runs every deploy and SQL Server compiles it whole, so on a pre-2026-10 table (no
+  -- IsAutomated / Site yet) an index on those columns fails with Msg 207 even inside this skipped IF.
 END
 GO

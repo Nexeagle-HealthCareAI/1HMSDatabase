@@ -42,7 +42,9 @@ BEGIN
   CREATE INDEX IX_AnalyticsEvents_EventType_OccurredAt ON dbo.AnalyticsEvents (EventType, OccurredAt);
   CREATE INDEX IX_AnalyticsEvents_SessionId ON dbo.AnalyticsEvents (SessionId);
   CREATE INDEX IX_AnalyticsEvents_Mobile ON dbo.AnalyticsEvents (Mobile);
-  CREATE INDEX IX_AnalyticsEvents_MobileHash ON dbo.AnalyticsEvents (MobileHash) WHERE MobileHash IS NOT NULL;
+  -- IX_AnalyticsEvents_MobileHash is created by migrations/tracking_privacy_2026_10.sql, not here: this batch
+  -- re-runs every deploy and SQL Server compiles it whole, so on a pre-2026-10 table (no MobileHash yet) an
+  -- index on that column fails with Msg 207 even inside this skipped IF.
   CREATE INDEX IX_AnalyticsEvents_OccurredAt ON dbo.AnalyticsEvents (OccurredAt);
 END
 GO

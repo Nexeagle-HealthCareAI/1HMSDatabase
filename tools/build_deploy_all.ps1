@@ -23,10 +23,10 @@ $root = Split-Path -Parent $PSScriptRoot
 if (-not $OutFile) { $OutFile = Join-Path $PSScriptRoot 'deploy_all.sql' }
 
 $order = @(
-    @{ Dir = 'db\schema\tables';     Label = 'TABLES' },
-    @{ Dir = 'db\schema\migrations'; Label = 'MIGRATIONS (column ALTERs)' },
-    @{ Dir = 'db\schema\indexes';    Label = 'INDEXES' },
-    @{ Dir = 'db\data\seed';         Label = 'SEED DATA' }
+    @{ Dir = 'db/schema/tables';     Label = 'TABLES' },
+    @{ Dir = 'db/schema/migrations'; Label = 'MIGRATIONS (column ALTERs)' },
+    @{ Dir = 'db/schema/indexes';    Label = 'INDEXES' },
+    @{ Dir = 'db/data/seed';         Label = 'SEED DATA' }
 )
 
 $sb = New-Object System.Text.StringBuilder

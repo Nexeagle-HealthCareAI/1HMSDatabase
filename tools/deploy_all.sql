@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-09-08 13:49  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-10-24 19:14  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -25,7 +25,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 /* =========================================================
-   easyHMS â€“ Live Chat Tables
+   easyHMS – Live Chat Tables
    ========================================================= */
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
@@ -397,7 +397,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 /* =========================================================
-   easyHMS â€“ Database Deployment Script (Dev/QA)
+   easyHMS – Database Deployment Script (Dev/QA)
    Safe to re-run; creates objects if missing.
    ========================================================= */
 SET NOCOUNT ON;
@@ -1202,6 +1202,285 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_abdm_care_context.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- ABDM M2: care contexts (one per OPD visit and one per IPD admission, as ABDM recommends) and
+-- the link tokens that let us link them to a patient's ABHA. Where a link has got to lives on
+-- the row, so reopening the app shows it without calling ABDM again.
+IF OBJECT_ID('dbo.AbdmCareContext','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AbdmCareContext
+  (
+    CareContextId       UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_AbdmCareContext_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId          UNIQUEIDENTIFIER NOT NULL,
+    PatientId           NVARCHAR(50)     NOT NULL,
+    -- 'OPD' (SourceId = Appointment.ApptId) | 'IPD' (SourceId = Admission.AdmissionId)
+    SourceType          NVARCHAR(10)     NOT NULL,
+    SourceId            UNIQUEIDENTIFIER NOT NULL,
+
+    -- What ABDM sees: our own reference, and a patient-facing title with no diagnosis or result.
+    ReferenceNumber     NVARCHAR(100)    NOT NULL,
+    Display             NVARCHAR(200)    NOT NULL,
+    -- Comma-separated HI types the visit actually holds records for, e.g. 'Prescription,WellnessRecord'.
+    HiTypes             NVARCHAR(200)    NOT NULL,
+
+    AbhaNumber          NVARCHAR(20)     NULL,
+    AbhaAddress         NVARCHAR(200)    NULL,
+
+    -- NOT_LINKED | TOKEN_REQUESTED | LINK_REQUESTED | LINKED | FAILED
+    LinkStatus          NVARCHAR(20)     NOT NULL CONSTRAINT DF_AbdmCareContext_Status DEFAULT ('NOT_LINKED'),
+    TokenExchangeId     UNIQUEIDENTIFIER NULL,
+    LinkExchangeId      UNIQUEIDENTIFIER NULL,
+    LastErrorCode       NVARCHAR(50)     NULL,
+    LastErrorMessage    NVARCHAR(500)    NULL,
+    LinkedAt            DATETIME2(3)     NULL,
+
+    CreatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_AbdmCareContext_CreatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_AbdmCareContext_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy           NVARCHAR(100)    NULL,
+
+    CONSTRAINT PK_AbdmCareContext PRIMARY KEY CLUSTERED (CareContextId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_AbdmCareContext_Source' AND object_id=OBJECT_ID('dbo.AbdmCareContext'))
+BEGIN
+  CREATE UNIQUE INDEX UX_AbdmCareContext_Source ON dbo.AbdmCareContext(HospitalId, SourceType, SourceId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_AbdmCareContext_Reference' AND object_id=OBJECT_ID('dbo.AbdmCareContext'))
+BEGIN
+  CREATE UNIQUE INDEX UX_AbdmCareContext_Reference ON dbo.AbdmCareContext(HospitalId, ReferenceNumber);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AbdmCareContext_Patient' AND object_id=OBJECT_ID('dbo.AbdmCareContext'))
+BEGIN
+  CREATE INDEX IX_AbdmCareContext_Patient ON dbo.AbdmCareContext(HospitalId, PatientId);
+END
+GO
+
+IF OBJECT_ID('dbo.AbdmLinkToken','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AbdmLinkToken
+  (
+    LinkTokenId         UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_AbdmLinkToken_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId          UNIQUEIDENTIFIER NOT NULL,
+    HipId               NVARCHAR(100)    NOT NULL,
+    -- A link token is bound to one ABHA address and one HIP (ABDM-1038 / ABDM-1063 otherwise).
+    AbhaAddress         NVARCHAR(200)    NOT NULL,
+    Token               NVARCHAR(MAX)    NOT NULL,
+    -- From the token's own "exp" claim; NULL when it carries none.
+    ExpiresAt           DATETIME2(3)     NULL,
+    SourceExchangeId    UNIQUEIDENTIFIER NULL,
+    ReceivedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_AbdmLinkToken_ReceivedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_AbdmLinkToken PRIMARY KEY CLUSTERED (LinkTokenId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AbdmLinkToken_Address' AND object_id=OBJECT_ID('dbo.AbdmLinkToken'))
+BEGIN
+  CREATE INDEX IX_AbdmLinkToken_Address ON dbo.AbdmLinkToken(HospitalId, AbhaAddress, ReceivedAt DESC);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_abdm_exchange.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- ABDM M2: one row per outbound HIE-CM call and one per inbound ABDM callback. M2 calls answer
+-- twice (a 202 now, a callback later), so the REQUEST-ID we send is the join key between them.
+-- No foreign keys to other ABDM tables, so file order against create_tables_abdm*.sql is free.
+IF OBJECT_ID('dbo.AbdmExchange','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AbdmExchange
+  (
+    ExchangeId          UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_AbdmExchange_Id DEFAULT NEWSEQUENTIALID(),
+
+    -- The REQUEST-ID header we sent; a callback's response.requestId matches it.
+    RequestId           NVARCHAR(100)    NOT NULL,
+    HospitalId          UNIQUEIDENTIFIER NULL,
+    FacilityId          NVARCHAR(100)    NULL,
+
+    -- What the call was for, e.g. 'link-token', 'link-carecontext', 'hi-notify'.
+    Kind                NVARCHAR(60)     NOT NULL,
+    Path                NVARCHAR(300)    NOT NULL,
+    -- What the call was about (an ABHA address or a care context reference), for the panel.
+    SubjectRef          NVARCHAR(200)    NULL,
+    ExpectsCallback     BIT              NOT NULL CONSTRAINT DF_AbdmExchange_Expects DEFAULT (0),
+
+    -- SENT | ACCEPTED (202, waiting) | DONE (no callback expected) | REFUSED | ANSWERED
+    Status              NVARCHAR(20)     NOT NULL CONSTRAINT DF_AbdmExchange_Status DEFAULT ('SENT'),
+    HttpStatus          INT              NULL,
+    ErrorCode           NVARCHAR(50)     NULL,
+    ErrorMessage        NVARCHAR(500)    NULL,
+
+    SentAt              DATETIME2(3)     NOT NULL CONSTRAINT DF_AbdmExchange_SentAt DEFAULT SYSUTCDATETIME(),
+    AcceptedAt          DATETIME2(3)     NULL,
+    AnsweredAt          DATETIME2(3)     NULL,
+    AnsweredByInboundId UNIQUEIDENTIFIER NULL,
+
+    CONSTRAINT PK_AbdmExchange PRIMARY KEY CLUSTERED (ExchangeId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_AbdmExchange_RequestId' AND object_id=OBJECT_ID('dbo.AbdmExchange'))
+BEGIN
+  CREATE UNIQUE INDEX UX_AbdmExchange_RequestId ON dbo.AbdmExchange(RequestId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AbdmExchange_HospitalSent' AND object_id=OBJECT_ID('dbo.AbdmExchange'))
+BEGIN
+  CREATE INDEX IX_AbdmExchange_HospitalSent ON dbo.AbdmExchange(HospitalId, SentAt DESC);
+END
+GO
+
+IF OBJECT_ID('dbo.AbdmInbound','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AbdmInbound
+  (
+    InboundId           UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_AbdmInbound_Id DEFAULT NEWSEQUENTIALID(),
+
+    -- Path ABDM appended to our bridge URL, e.g. 'api/v3/hip/token/on-generate-token'.
+    Path                NVARCHAR(300)    NOT NULL,
+    HeaderRequestId     NVARCHAR(100)    NULL,
+    -- response.requestId in the body: the outbound call this delivery answers, if any.
+    AnswersRequestId    NVARCHAR(100)    NULL,
+    -- X-HIP-ID or X-HIU-ID as sent, and the hospital it resolved to.
+    FacilityId          NVARCHAR(100)    NULL,
+    HospitalId          UNIQUEIDENTIFIER NULL,
+    -- Header NAMES and value lengths only, never values: the name is the finding, the value
+    -- can be a credential.
+    HeaderNames         NVARCHAR(1000)   NOT NULL,
+    -- Verbatim body for accepted deliveries, so a handler can be corrected from real traffic.
+    -- Never stored for a rejected delivery.
+    RawBody             NVARCHAR(MAX)    NULL,
+
+    -- ACCEPTED | DUPLICATE | REJECTED_NO_BEARER | REJECTED_UNKNOWN_FACILITY | REJECTED_UNKNOWN_REQUEST
+    Verdict             NVARCHAR(40)     NOT NULL,
+    ProcessError        NVARCHAR(500)    NULL,
+    ReceivedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_AbdmInbound_ReceivedAt DEFAULT SYSUTCDATETIME(),
+    ProcessedAt         DATETIME2(3)     NULL,
+
+    CONSTRAINT PK_AbdmInbound PRIMARY KEY CLUSTERED (InboundId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AbdmInbound_Received' AND object_id=OBJECT_ID('dbo.AbdmInbound'))
+BEGIN
+  CREATE INDEX IX_AbdmInbound_Received ON dbo.AbdmInbound(ReceivedAt DESC);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_abdm_profile_share.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- ABDM M1 "Scan Health Facility QR" — profiles a patient shared by scanning the counter QR in
+-- their ABHA/PHR app. ABDM's HIE-CM POSTs each share to our /v3/hip/patient/profile/share
+-- callback; one row per share. Named to sort after create_tables_abdm.sql.
+IF OBJECT_ID('dbo.AbdmProfileShare','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AbdmProfileShare
+  (
+    ProfileShareId  UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_AbdmProfileShare_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId      UNIQUEIDENTIFIER NOT NULL,
+    HipId           NVARCHAR(100)    NOT NULL,
+    CounterId       NVARCHAR(100)    NULL,
+
+    -- ABDM's REQUEST-ID for the callback; makes ABDM retries idempotent per hospital.
+    RequestId       NVARCHAR(100)    NOT NULL,
+
+    AbhaNumber      NVARCHAR(20)     NULL,
+    AbhaAddress     NVARCHAR(200)    NULL,
+    FullName        NVARCHAR(200)    NULL,
+    Gender          NVARCHAR(10)     NULL,
+    DateOfBirth     NVARCHAR(20)     NULL,
+    Mobile          NVARCHAR(20)     NULL,
+    Address         NVARCHAR(500)    NULL,
+
+    -- V3 linking token delivered at share time; must be persisted for HIP-initiated linking later.
+    LinkToken       NVARCHAR(MAX)    NULL,
+
+    -- 'NEW' (not yet seen by staff) | 'HANDLED'
+    StatusCode      NVARCHAR(20)     NOT NULL CONSTRAINT DF_AbdmProfileShare_Status DEFAULT ('NEW'),
+    HandledAt       DATETIME2(3)     NULL,
+    HandledBy       NVARCHAR(100)    NULL,
+
+    -- Verbatim callback body, kept so the tolerant parser can be corrected from real sandbox
+    -- traffic without needing ABDM to resend.
+    RawPayload      NVARCHAR(MAX)    NULL,
+
+    ReceivedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_AbdmProfileShare_ReceivedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_AbdmProfileShare PRIMARY KEY CLUSTERED (ProfileShareId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_AbdmProfileShare_HospitalRequest' AND object_id=OBJECT_ID('dbo.AbdmProfileShare'))
+BEGIN
+  CREATE UNIQUE INDEX UX_AbdmProfileShare_HospitalRequest
+  ON dbo.AbdmProfileShare(HospitalId, RequestId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AbdmProfileShare_HospitalStatus' AND object_id=OBJECT_ID('dbo.AbdmProfileShare'))
+BEGIN
+  CREATE INDEX IX_AbdmProfileShare_HospitalStatus
+  ON dbo.AbdmProfileShare(HospitalId, StatusCode, ReceivedAt DESC);
+END
+GO
+
+-- Hospital -> HFR/HIP ID mapping. Deliberately its own small table rather than a column on the
+-- hot dbo.Hospitals table: an API deployed a few minutes ahead of this DB script then only breaks
+-- ABDM queries, not every hospital read in the app. ABDM's profile-share callback identifies the
+-- facility only by this id, so it is how an inbound share is routed to a hospital.
+IF OBJECT_ID('dbo.AbdmFacility','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AbdmFacility
+  (
+    HospitalId  UNIQUEIDENTIFIER NOT NULL,
+    HipId       NVARCHAR(100)    NOT NULL,
+    UpdatedAt   DATETIME2(3)     NOT NULL CONSTRAINT DF_AbdmFacility_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy   NVARCHAR(100)    NULL,
+    CONSTRAINT PK_AbdmFacility PRIMARY KEY CLUSTERED (HospitalId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_AbdmFacility_HipId' AND object_id=OBJECT_ID('dbo.AbdmFacility'))
+BEGIN
+  CREATE UNIQUE INDEX UX_AbdmFacility_HipId ON dbo.AbdmFacility(HipId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_abdm.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -1241,6 +1520,131 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AbhaAccount_HospitalAbha
 BEGIN
   CREATE UNIQUE INDEX IX_AbhaAccount_HospitalAbha
   ON dbo.AbhaAccount(HospitalId, AbhaNumber);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_agent_monitoring.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- AI Agents dashboard (CMS) and the router's human-approved learning loop (2026-10-19).
+-- Written by NexeagleCMSAPI (AgentMonitorController ingest endpoints, fed by 1HMS-NLP-Router's
+-- hms_router/telemetry.py); read by the CMS "AI Agents" tab. Run BEFORE deploying the matching
+-- NexeagleCMSAPI. Idempotent.
+--
+--   AgentDecisions       one row per agent decision (/route-symptom or /chat). No patient text except
+--                        ReviewText, kept only for outcomes a person has to look at (no match, clarify,
+--                        low confidence, emergency). Rows older than 365 days are deleted by the CMS API.
+--   AgentLearningItems   the review queue: mistakes and doubtful answers. An admin approves the correct
+--                        specialty (the phrase is then added to SymptomTrainingExamples) or rejects it.
+--                        ModelVersionLearned is set once a promoted model was trained with it.
+--   AgentModelVersions   every rebuild of the route model: validation metrics, promoted or not, and why.
+
+IF OBJECT_ID('dbo.AgentDecisions','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AgentDecisions
+  (
+    DecisionId       UNIQUEIDENTIFIER NOT NULL,
+    OccurredAt       DATETIME2(3)     NOT NULL,
+    Agent            NVARCHAR(20)     NOT NULL,           -- route | chat
+    Caller           NVARCHAR(50)     NULL,               -- API client name: doctordekho, whatsapp, voicerx...
+    RequestId        NVARCHAR(64)     NULL,
+    Decision         NVARCHAR(20)     NOT NULL,           -- answer | clarify | abstain | emergency | follow_up | recommendation
+    RouteDecision    NVARCHAR(20)     NULL,
+    TopSpecialtyId   NVARCHAR(60)     NULL,
+    TopSpecialist    NVARCHAR(100)    NULL,               -- chat agent: specialist label
+    CandidateIds     NVARCHAR(400)    NULL,               -- comma-separated
+    Confidence       FLOAT            NULL,
+    MatchScore       FLOAT            NULL,
+    IsEmergency      BIT              NOT NULL CONSTRAINT DF_AD_IsEmergency DEFAULT 0,
+    EmergencySource  NVARCHAR(20)     NULL,
+    ClarifyKind      NVARCHAR(30)     NULL,
+    NoMatch          BIT              NOT NULL CONSTRAINT DF_AD_NoMatch DEFAULT 0,
+    Method           NVARCHAR(40)     NULL,
+    UsedReasoner     BIT              NOT NULL CONSTRAINT DF_AD_UsedReasoner DEFAULT 0,
+    LatencyMs        FLOAT            NULL,
+    ModelVersion     NVARCHAR(60)     NULL,
+    QueryLength      INT              NULL,
+    QueryHash        NVARCHAR(64)     NULL,
+    SessionRef       NVARCHAR(64)     NULL,
+    Turn             INT              NULL,
+    Degraded         NVARCHAR(200)    NULL,
+    ReviewText       NVARCHAR(300)    NULL,
+    Notes            NVARCHAR(400)    NULL,
+    ReceivedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_AD_ReceivedAt DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_AgentDecisions PRIMARY KEY CLUSTERED (DecisionId)
+  );
+  CREATE INDEX IX_AgentDecisions_OccurredAt ON dbo.AgentDecisions (OccurredAt)
+    INCLUDE (Agent, Caller, Decision, TopSpecialtyId, Confidence, IsEmergency, NoMatch, UsedReasoner, LatencyMs, ModelVersion);
+  CREATE INDEX IX_AgentDecisions_QueryHash ON dbo.AgentDecisions (QueryHash);
+END
+GO
+
+IF OBJECT_ID('dbo.AgentLearningItems','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AgentLearningItems
+  (
+    ItemId               UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ALI_Id DEFAULT NEWSEQUENTIALID(),
+    CreatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_ALI_CreatedAt DEFAULT SYSUTCDATETIME(),
+    LastSeenAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_ALI_LastSeenAt DEFAULT SYSUTCDATETIME(),
+    Occurrences          INT              NOT NULL CONSTRAINT DF_ALI_Occurrences DEFAULT 1,
+    -- booking_correction | no_match | low_confidence | clarify | emergency_check | user_feedback
+    Source               NVARCHAR(30)     NOT NULL,
+    Agent                NVARCHAR(20)     NOT NULL,
+    QueryText            NVARCHAR(500)    NOT NULL,
+    QueryHash            NVARCHAR(64)     NOT NULL,
+    PredictedSpecialtyId NVARCHAR(60)     NULL,
+    ActualSpecialtyId    NVARCHAR(60)     NULL,           -- what the patient booked / said was right
+    Confidence           FLOAT            NULL,
+    ModelVersion         NVARCHAR(60)     NULL,
+    Status               NVARCHAR(20)     NOT NULL CONSTRAINT DF_ALI_Status DEFAULT 'pending', -- pending | approved | rejected
+    ApprovedSpecialtyId  NVARCHAR(60)     NULL,
+    ReviewNote           NVARCHAR(400)    NULL,
+    ReviewedBy           NVARCHAR(200)    NULL,
+    ReviewedAt           DATETIME2(3)     NULL,
+    TrainingExampleId    UNIQUEIDENTIFIER NULL,           -- SymptomTrainingExamples.Id created on approval
+    ModelVersionLearned  NVARCHAR(60)     NULL,
+    LearnedAt            DATETIME2(3)     NULL,
+    CONSTRAINT PK_AgentLearningItems PRIMARY KEY CLUSTERED (ItemId)
+  );
+  CREATE INDEX IX_AgentLearningItems_Status ON dbo.AgentLearningItems (Status, LastSeenAt);
+  CREATE INDEX IX_AgentLearningItems_Hash ON dbo.AgentLearningItems (QueryHash, Source);
+  CREATE INDEX IX_AgentLearningItems_TrainingExample ON dbo.AgentLearningItems (TrainingExampleId) WHERE TrainingExampleId IS NOT NULL;
+END
+GO
+
+IF OBJECT_ID('dbo.AgentModelVersions','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AgentModelVersions
+  (
+    Id                 UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_AMV_Id DEFAULT NEWSEQUENTIALID(),
+    ModelVersion       NVARCHAR(60)     NULL,             -- NULL when the rebuild failed
+    PreviousVersion    NVARCHAR(60)     NULL,
+    BuiltAt            DATETIME2(3)     NOT NULL,
+    TriggerReason      NVARCHAR(30)     NULL,             -- manual | deploy
+    Promoted           BIT              NOT NULL,
+    Verdict            NVARCHAR(1000)   NULL,
+    TrainingRows       INT              NULL,
+    CmsRows            INT              NULL,
+    LearnedItems       INT              NULL,             -- approved review items first included in this version
+    ValidationRows     INT              NULL,
+    Top1               FLOAT            NULL,
+    Top3               FLOAT            NULL,
+    Answered           FLOAT            NULL,
+    AnsweredAccuracy   FLOAT            NULL,
+    ConfidentlyWrong   FLOAT            NULL,
+    Abstain            FLOAT            NULL,
+    Clarify            FLOAT            NULL,
+    EmergencyFlagRate  FLOAT            NULL,
+    PrevTop1           FLOAT            NULL,
+    PrevConfidentlyWrong FLOAT          NULL,
+    DetailsJson        NVARCHAR(MAX)    NULL,
+    CONSTRAINT PK_AgentModelVersions PRIMARY KEY CLUSTERED (Id)
+  );
+  CREATE INDEX IX_AgentModelVersions_BuiltAt ON dbo.AgentModelVersions (BuiltAt);
 END
 GO
 
@@ -1353,7 +1757,7 @@ GO
 -- Generic funnel/behavior event log fired by NexEagleWebsite (see /public/track-event) for the CMS
 -- "Insights" tab's Auth Funnel / Booking Funnel / All Searches reports. One table for every event
 -- type (login_initiated, otp_sent, otp_verified, otp_verify_failed, search_performed,
--- doctor_profile_viewed, booking_step_reached) rather than a bespoke table per metric â€” SessionId
+-- doctor_profile_viewed, booking_step_reached) rather than a bespoke table per metric — SessionId
 -- correlates events within one visit (e.g. search -> profile view), Mobile correlates the auth
 -- funnel once a number is known, DoctorId/SpecialtyId are promoted out of MetadataJson into real
 -- columns so specialty-demand/booking-funnel queries can GROUP BY them directly in SQL.
@@ -1368,10 +1772,12 @@ BEGIN
     OccurredAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_AE_OccurredAt DEFAULT SYSUTCDATETIME(),
 
     SessionId     NVARCHAR(64)     NULL,
+    -- Masked copy only (98XXXXXX10) since 2026-10; MobileHash is the keyed hash used to group/search.
     Mobile        NVARCHAR(20)     NULL,
+    MobileHash    NVARCHAR(64)     NULL,
     DoctorId      UNIQUEIDENTIFIER NULL,
     -- Frontend-only category slug (e.g. "cardiology") from NexEagleWebsite's static specialty
-    -- catalog â€” NOT MedicalSpecialities.SpecialityId (a different, DB-side GUID concept).
+    -- catalog — NOT MedicalSpecialities.SpecialityId (a different, DB-side GUID concept).
     SpecialtyId   NVARCHAR(100)    NULL,
 
     IpAddress     NVARCHAR(64)     NULL,
@@ -1383,12 +1789,19 @@ BEGIN
     -- count, AI-fallback flag).
     MetadataJson  NVARCHAR(MAX)    NULL,
 
+    -- Bot / data-centre traffic (tracking_traffic_quality_2026_10.sql); excluded from reports.
+    IsAutomated   BIT              NOT NULL CONSTRAINT DF_AE_IsAutomated DEFAULT 0,
+
     CONSTRAINT PK_AnalyticsEvents PRIMARY KEY CLUSTERED (EventId)
   );
 
   CREATE INDEX IX_AnalyticsEvents_EventType_OccurredAt ON dbo.AnalyticsEvents (EventType, OccurredAt);
   CREATE INDEX IX_AnalyticsEvents_SessionId ON dbo.AnalyticsEvents (SessionId);
   CREATE INDEX IX_AnalyticsEvents_Mobile ON dbo.AnalyticsEvents (Mobile);
+  -- IX_AnalyticsEvents_MobileHash is created by migrations/tracking_privacy_2026_10.sql, not here: this batch
+  -- re-runs every deploy and SQL Server compiles it whole, so on a pre-2026-10 table (no MobileHash yet) an
+  -- index on that column fails with Msg 207 even inside this skipped IF.
+  CREATE INDEX IX_AnalyticsEvents_OccurredAt ON dbo.AnalyticsEvents (OccurredAt);
 END
 GO
 
@@ -1461,7 +1874,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- QA sweep, Phase C items 16/18. BillingPaymentAllocation only ties a payment to an invoice as
--- a lump sum â€” there was no way to tell which specific charge(s) within that invoice the money
+-- a lump sum — there was no way to tell which specific charge(s) within that invoice the money
 -- actually covered, so cancelling one charge on a partially-paid multi-service invoice couldn't
 -- safely reverse just that charge's share of a payment. This table is that missing breakdown.
 
@@ -2031,7 +2444,7 @@ BEGIN
 END
 GO
 
--- â”€â”€ Admission day-wise interim billing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ── Admission day-wise interim billing ─────────────────────────────────────
 -- One locked, numbered interim bill per admission "billing day" (admission-anchored
 -- 24h window). Closing a day snapshots that day's charges into AdmissionDayBillLine.
 IF OBJECT_ID('dbo.AdmissionDayBill','U') IS NULL
@@ -2517,13 +2930,13 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- CSSD (Central Sterile Supply Department) â€” instrument set/tray master, sterilization cycle
+-- CSSD (Central Sterile Supply Department) — instrument set/tray master, sterilization cycle
 -- log (biological/chemical indicator results), and a movement/audit-trail table mirroring
 -- InventoryMovement's shape (issue-to-OT -> return -> wash -> pack -> sterilize -> store loop).
--- Set/tray granularity, not individual-instrument â€” matches real CSSD operating practice.
+-- Set/tray granularity, not individual-instrument — matches real CSSD operating practice.
 --
 -- NOTE: InstrumentSetMovement.SurgeryCaseId FK to dbo.SurgeryCase is deferred to
--- create_tables_zz_foreign_keys.sql â€” this file (create_tables_cssd.sql, 'c') sorts before
+-- create_tables_zz_foreign_keys.sql — this file (create_tables_cssd.sql, 'c') sorts before
 -- create_tables_ot.sql ('o') in deploy order, so SurgeryCase doesn't exist yet when this file runs.
 
 IF OBJECT_ID('dbo.InstrumentSet','U') IS NULL
@@ -2537,7 +2950,7 @@ BEGIN
 
     SetCode              NVARCHAR(50)     NOT NULL,
     SetName               NVARCHAR(200)   NOT NULL,
-    Category               NVARCHAR(50)   NULL,   -- free text e.g. GENERAL/ORTHO/CARDIAC â€” hospitals vary, not a fixed enum
+    Category               NVARCHAR(50)   NULL,   -- free text e.g. GENERAL/ORTHO/CARDIAC — hospitals vary, not a fixed enum
     ItemComposition        NVARCHAR(1000) NULL,   -- free text description of contents
 
     CurrentStatus          NVARCHAR(20)   NOT NULL CONSTRAINT DF_ISET_Status DEFAULT 'AVAILABLE',
@@ -2766,6 +3179,37 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_DC_HospitalDay' AND obje
 BEGIN
   CREATE UNIQUE INDEX UX_DC_HospitalDay
   ON dbo.DayClose(HospitalId, BusinessDate);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_discharge_summary_custom_fields.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Values of hospital/doctor-defined custom discharge-summary fields, one JSON document per admission.
+-- Previously held only in the browser's localStorage, so they never reached the saved/printed
+-- summary and were invisible on other devices. A separate table (rather than a new column on
+-- dbo.DischargeSummary) keeps the existing summary queries untouched.
+
+IF OBJECT_ID('dbo.DischargeSummaryCustomField', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DischargeSummaryCustomField (
+        AdmissionId UNIQUEIDENTIFIER NOT NULL,
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        FieldsJson NVARCHAR(MAX) NOT NULL CONSTRAINT DF_DSCF_FieldsJson DEFAULT '{}',
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_DSCF_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedBy NVARCHAR(100) NULL,
+        CONSTRAINT PK_DischargeSummaryCustomField PRIMARY KEY CLUSTERED (AdmissionId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DSCF_Hospital' AND object_id = OBJECT_ID('dbo.DischargeSummaryCustomField'))
+BEGIN
+    CREATE INDEX IX_DSCF_Hospital ON dbo.DischargeSummaryCustomField (HospitalId);
 END
 GO
 
@@ -3297,6 +3741,58 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_health_article.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Health Wiki articles (served read-only to Doctor Dekho via GET /public/health-articles).
+-- Authored in the CMS, reviewed by a doctor in EasyHMS, written here through the internal
+-- POST/PATCH /internal/health-articles endpoints. Slug is the public id used in
+-- /health/conditions/{slug}. Only Status = 'PUBLISHED' rows are ever exposed publicly.
+-- AuthorDoctorId/ReviewerDoctorId match the doctorId returned by /public/doctors.
+-- =============================================================================
+IF OBJECT_ID('dbo.HealthArticle','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.HealthArticle
+  (
+    ArticleId            UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_HealthArticle_Id DEFAULT NEWSEQUENTIALID(),
+
+    Slug                 NVARCHAR(200)    NOT NULL,
+    Title                NVARCHAR(300)    NOT NULL,
+    [Description]        NVARCHAR(1000)   NULL,
+    Content              NVARCHAR(MAX)    NOT NULL,   -- markdown
+    RelatedConditionSlug NVARCHAR(200)    NULL,
+
+    AuthorDoctorId       UNIQUEIDENTIFIER NULL,
+    ReviewerDoctorId     UNIQUEIDENTIFIER NULL,
+
+    [Status]             NVARCHAR(20)     NOT NULL CONSTRAINT DF_HealthArticle_Status DEFAULT 'DRAFT',
+    PublishedAt          DATETIME2(3)     NULL,
+
+    CreatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_HealthArticle_CreatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_HealthArticle_UpdatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_HealthArticle PRIMARY KEY CLUSTERED (ArticleId),
+    CONSTRAINT CK_HealthArticle_Status CHECK ([Status] IN ('DRAFT','IN_REVIEW','PUBLISHED')),
+    CONSTRAINT FK_HealthArticle_Author   FOREIGN KEY (AuthorDoctorId)   REFERENCES dbo.Doctors(DoctorID),
+    CONSTRAINT FK_HealthArticle_Reviewer FOREIGN KEY (ReviewerDoctorId) REFERENCES dbo.Doctors(DoctorID)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_HealthArticle_Slug' AND object_id=OBJECT_ID('dbo.HealthArticle'))
+  CREATE UNIQUE INDEX UX_HealthArticle_Slug ON dbo.HealthArticle (Slug);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_HealthArticle_Status_PublishedAt' AND object_id=OBJECT_ID('dbo.HealthArticle'))
+  CREATE INDEX IX_HealthArticle_Status_PublishedAt ON dbo.HealthArticle ([Status], PublishedAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_hospital_leads.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -3336,12 +3832,301 @@ BEGIN
     City          NVARCHAR(100)    NULL,
 
     OccurredAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_HL_OccurredAt DEFAULT SYSUTCDATETIME(),
+    -- Bot / data-centre traffic (tracking_traffic_quality_2026_10.sql); hidden from hospitals' lead lists.
+    IsAutomated   BIT              NOT NULL CONSTRAINT DF_HL_IsAutomated DEFAULT 0,
 
     CONSTRAINT PK_HospitalLeads PRIMARY KEY CLUSTERED (LeadId)
   );
 
   CREATE INDEX IX_HospitalLeads_HospitalId_OccurredAt ON dbo.HospitalLeads (HospitalId, OccurredAt);
   CREATE INDEX IX_HospitalLeads_SessionId ON dbo.HospitalLeads (SessionId);
+  CREATE INDEX IX_HospitalLeads_OccurredAt ON dbo.HospitalLeads (OccurredAt);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_hr__attendance_dailyclose_jobsetting.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Off by default (IsActive = 0): this job WRITES ABSENT/ON_LEAVE rows that feed straight into
+-- payroll (SalariedPayrollStrategy counts payable days off HrAttendanceLogs.Status), and it is new,
+-- unverified-at-hospital-scale behaviour. A hospital opts in explicitly with:
+--   UPDATE dbo.JobSettings SET IsActive = 1 WHERE JobName = 'AttendanceDailyClose';
+-- Matches the existing inventory-scan jobs' opt-in pattern (Executor.IsProcessEligibleToRun reads
+-- JobSettings.IsActive; those jobs are simply never seeded so they default to off). Seeded
+-- explicitly here instead so this job's existence and default-off state are visible in
+-- dbo.JobSettings from day one rather than only appearing once someone turns it on.
+
+IF OBJECT_ID('dbo.JobSettings', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM dbo.JobSettings WHERE JobName = N'AttendanceDailyClose')
+BEGIN
+    INSERT INTO dbo.JobSettings (JobName, IsActive, LastExecutionDateUTC)
+    VALUES (N'AttendanceDailyClose', 0, CAST(SYSDATETIMEOFFSET() AT TIME ZONE 'India Standard Time' AS DATETIME2(3)));
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_hr__attendance_override_columns.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Guarded ALTER: dbo.HrAttendanceLogs already exists (create_tables_hr.sql is committed+deployed),
+-- so these audit columns for a manual correction are added here, not by editing that file in place.
+-- Stamped by EasyHMSAPI's SetAttendanceOverrideHandler (an HR-typed correction) and the nightly
+-- AttendanceDailyClose job (a system-generated ABSENT/ON_LEAVE row) alike, so every non-biometric
+-- row on this table says who or what put it there, and why.
+
+IF OBJECT_ID('dbo.HrAttendanceLogs', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.HrAttendanceLogs') AND name = 'OverriddenByUserId')
+BEGIN
+    ALTER TABLE dbo.HrAttendanceLogs ADD OverriddenByUserId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+IF OBJECT_ID('dbo.HrAttendanceLogs', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.HrAttendanceLogs') AND name = 'OverriddenAt')
+BEGIN
+    ALTER TABLE dbo.HrAttendanceLogs ADD OverriddenAt DATETIME2(3) NULL;
+END
+GO
+
+IF OBJECT_ID('dbo.HrAttendanceLogs', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.HrAttendanceLogs') AND name = 'OverrideReason')
+BEGIN
+    ALTER TABLE dbo.HrAttendanceLogs ADD OverrideReason NVARCHAR(300) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_hr__payroll_settings.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Per-hospital payroll calendar policy + holiday calendar for the 1HR payroll run.
+-- New tables (nothing existing is edited). Defaults keep weekly offs and holidays PAYABLE, so a
+-- hospital with no row behaves as "Sunday off, paid; declared holidays paid".
+
+IF OBJECT_ID('dbo.HrPayrollSettings', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrPayrollSettings (
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        -- Comma-separated weekday codes, e.g. 'SUN' or 'SAT,SUN'. Empty string = no weekly off.
+        WeeklyOffDays NVARCHAR(40) NOT NULL CONSTRAINT DF_HrPayrollSettings_WeeklyOffDays DEFAULT 'SUN',
+        WeeklyOffPayable BIT NOT NULL CONSTRAINT DF_HrPayrollSettings_WeeklyOffPayable DEFAULT 1,
+        HolidayPayable BIT NOT NULL CONSTRAINT DF_HrPayrollSettings_HolidayPayable DEFAULT 1,
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HrPayrollSettings_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedByUserId UNIQUEIDENTIFIER NULL,
+        CONSTRAINT PK_HrPayrollSettings PRIMARY KEY CLUSTERED (HospitalId)
+    );
+END
+GO
+
+IF OBJECT_ID('dbo.HrHolidays', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HrHolidays (
+        HrHolidayId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrHoliday_Id DEFAULT NEWSEQUENTIALID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        HolidayDate DATE NOT NULL,
+        [Name] NVARCHAR(120) NOT NULL,
+        CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_HrHoliday_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedByUserId UNIQUEIDENTIFIER NULL,
+        CONSTRAINT PK_HrHolidays PRIMARY KEY CLUSTERED (HrHolidayId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_HrHolidays_Hospital_Date' AND object_id = OBJECT_ID('dbo.HrHolidays'))
+BEGIN
+    CREATE UNIQUE INDEX UX_HrHolidays_Hospital_Date ON dbo.HrHolidays (HospitalId, HolidayDate);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_hr_biometric.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- HR biometric attendance: device registry, raw punch log, and PIN -> employee mapping.
+-- Named to sort after create_tables_hr.sql (HrEmployees / HrAttendanceLogs). Foreign keys live in
+-- create_tables_zz_hr_biometric_foreign_keys.sql (deferred, like the rest of the HR suite).
+--
+-- Why raw punches are kept: attendance is REBUILT from them (shift-aware, night shifts, late/overtime),
+-- so a retried batch, an out-of-order batch, or a PIN mapped after the fact all produce the same
+-- correct result, and every attendance row can be traced back to the scans behind it.
+--
+-- No fingerprint/face templates are stored here or anywhere in EasyHMS: enrolment stays on the device.
+-- All the platform ever sees is the user's PIN on the device and the timestamp of each scan.
+
+-- 1. HrBiometricDevices -----------------------------------------------------------------------------
+IF OBJECT_ID('dbo.HrBiometricDevices', 'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.HrBiometricDevices
+  (
+    HrBiometricDeviceId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_HrBiometricDevice_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId      UNIQUEIDENTIFIER NOT NULL,
+    Name            NVARCHAR(100)    NOT NULL,   -- e.g. "Main gate", "Ward 2 nurses' station"
+
+    -- ZKTeco terminals identify themselves by hardware serial number on every request, so this is
+    -- how an inbound push is routed to a hospital. A physical device belongs to exactly one hospital.
+    SerialNumber    NVARCHAR(64)     NOT NULL,
+    Vendor          NVARCHAR(50)     NOT NULL CONSTRAINT DF_HrBiometricDevice_Vendor DEFAULT ('ZKTECO'),
+    Model           NVARCHAR(100)    NULL,       -- e.g. "K40 Pro"
+    Location        NVARCHAR(200)    NULL,
+
+    -- SHA-256 (hex) of the device's access token, used by the JSON push endpoint / an on-site bridge.
+    -- The token itself is shown once at registration and never stored. (The ZKTeco push protocol has
+    -- no token field, so that path authenticates by registered serial number only.)
+    TokenHash       NVARCHAR(128)    NOT NULL,
+
+    IsActive        BIT              NOT NULL CONSTRAINT DF_HrBiometricDevice_IsActive DEFAULT (1),
+
+    -- Health: the last time the device talked to us, from where, and the latest scan it has delivered.
+    LastSeenAt      DATETIME2(3)     NULL,
+    LastSeenIp      NVARCHAR(64)     NULL,
+    LastPunchTime   DATETIME2(0)     NULL,
+
+    -- ZKTeco push protocol: the highest attendance-log stamp we acknowledged, so a device that was
+    -- offline resumes from where it stopped instead of re-sending everything.
+    LastAttlogStamp NVARCHAR(50)     NULL,
+
+    CreatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_HrBiometricDevice_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy       NVARCHAR(100)    NULL,
+
+    CONSTRAINT PK_HrBiometricDevices PRIMARY KEY CLUSTERED (HrBiometricDeviceId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_HrBiometricDevice_SerialNumber' AND object_id=OBJECT_ID('dbo.HrBiometricDevices'))
+BEGIN
+  CREATE UNIQUE INDEX UX_HrBiometricDevice_SerialNumber ON dbo.HrBiometricDevices(SerialNumber);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_HrBiometricDevice_Hospital' AND object_id=OBJECT_ID('dbo.HrBiometricDevices'))
+BEGIN
+  CREATE INDEX IX_HrBiometricDevice_Hospital ON dbo.HrBiometricDevices(HospitalId, IsActive);
+END
+GO
+
+-- 2. HrEmployeeDeviceUsers --------------------------------------------------------------------------
+-- The PIN ("User ID") an employee was enrolled under on the device(s) -> the EasyHMS employee.
+-- Its own small table (not a column on HrEmployees) so an API deployed a few minutes ahead of this
+-- script only breaks biometric features, not every employee read. A PIN is unique per hospital:
+-- the same person keeps the same PIN across that hospital's devices, and different hospitals
+-- legitimately reuse PINs.
+IF OBJECT_ID('dbo.HrEmployeeDeviceUsers', 'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.HrEmployeeDeviceUsers
+  (
+    HrEmployeeDeviceUserId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_HrEmployeeDeviceUser_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId      UNIQUEIDENTIFIER NOT NULL,
+    HrEmployeeId    UNIQUEIDENTIFIER NOT NULL,
+    DeviceUserId    NVARCHAR(50)     NOT NULL,
+
+    CreatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_HrEmployeeDeviceUser_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy       NVARCHAR(100)    NULL,
+
+    CONSTRAINT PK_HrEmployeeDeviceUsers PRIMARY KEY CLUSTERED (HrEmployeeDeviceUserId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_HrEmployeeDeviceUser_HospitalPin' AND object_id=OBJECT_ID('dbo.HrEmployeeDeviceUsers'))
+BEGIN
+  CREATE UNIQUE INDEX UX_HrEmployeeDeviceUser_HospitalPin ON dbo.HrEmployeeDeviceUsers(HospitalId, DeviceUserId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_HrEmployeeDeviceUser_Employee' AND object_id=OBJECT_ID('dbo.HrEmployeeDeviceUsers'))
+BEGIN
+  CREATE INDEX IX_HrEmployeeDeviceUser_Employee ON dbo.HrEmployeeDeviceUsers(HrEmployeeId);
+END
+GO
+
+-- 3. HrBiometricPunches -----------------------------------------------------------------------------
+IF OBJECT_ID('dbo.HrBiometricPunches', 'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.HrBiometricPunches
+  (
+    HrBiometricPunchId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_HrBiometricPunch_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId          UNIQUEIDENTIFIER NOT NULL,
+    HrBiometricDeviceId UNIQUEIDENTIFIER NOT NULL,
+    DeviceUserId        NVARCHAR(50)     NOT NULL,
+
+    -- NULL while the PIN is not yet mapped to an employee ("unmapped"); filled in (and attendance
+    -- rebuilt) as soon as an admin maps it.
+    HrEmployeeId        UNIQUEIDENTIFIER NULL,
+
+    -- The device's own wall-clock time for the scan, exactly as sent (devices send local time with no
+    -- timezone). Shift start/end and attendance dates are wall-clock too, so they compare directly.
+    PunchTime           DATETIME2(0)     NOT NULL,
+
+    -- Informational only: the device's check-in/out key and verify method (fingerprint/card/face/PIN).
+    -- In/out is inferred from the order of a person's scans, not trusted from StateCode.
+    StateCode           INT              NULL,
+    VerifyType          INT              NULL,
+
+    -- The verbatim record as received, so the parser can be corrected from real device traffic.
+    RawLine             NVARCHAR(500)    NULL,
+
+    ReceivedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_HrBiometricPunch_ReceivedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_HrBiometricPunches PRIMARY KEY CLUSTERED (HrBiometricPunchId)
+  );
+END
+GO
+
+-- Idempotency: a device that re-sends a batch (retry, reconnect, re-sync) can never double-count.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_HrBiometricPunch_DeviceUserTime' AND object_id=OBJECT_ID('dbo.HrBiometricPunches'))
+BEGIN
+  CREATE UNIQUE INDEX UX_HrBiometricPunch_DeviceUserTime
+  ON dbo.HrBiometricPunches(HrBiometricDeviceId, DeviceUserId, PunchTime);
+END
+GO
+
+-- Rebuilding one employee's attendance reads their scans in a time window.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_HrBiometricPunch_EmployeeTime' AND object_id=OBJECT_ID('dbo.HrBiometricPunches'))
+BEGIN
+  CREATE INDEX IX_HrBiometricPunch_EmployeeTime
+  ON dbo.HrBiometricPunches(HospitalId, HrEmployeeId, PunchTime);
+END
+GO
+
+-- "Which PINs have scanned but aren't mapped to anyone yet?"
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_HrBiometricPunch_Unmapped' AND object_id=OBJECT_ID('dbo.HrBiometricPunches'))
+BEGIN
+  CREATE INDEX IX_HrBiometricPunch_Unmapped
+  ON dbo.HrBiometricPunches(HospitalId, DeviceUserId)
+  WHERE HrEmployeeId IS NULL;
+END
+GO
+
+-- 4. One attendance row per employee per day ---------------------------------------------------------
+-- Attendance is rebuilt per (employee, day) from the raw scans; this makes "one row per day" a
+-- database guarantee rather than an application assumption (two devices delivering at the same
+-- moment can't create duplicates). Created only if the existing data is already clean, so a
+-- deploy can never fail on historic duplicate rows.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_HrAttendanceLog_EmployeeDate' AND object_id=OBJECT_ID('dbo.HrAttendanceLogs'))
+   AND OBJECT_ID('dbo.HrAttendanceLogs', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM dbo.HrAttendanceLogs GROUP BY HrEmployeeId, AttendanceDate HAVING COUNT(*) > 1)
+BEGIN
+  CREATE UNIQUE INDEX UX_HrAttendanceLog_EmployeeDate ON dbo.HrAttendanceLogs(HrEmployeeId, AttendanceDate);
 END
 GO
 
@@ -3604,7 +4389,7 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- ICU â€” level-of-care tracking + APACHE II / SOFA critical-care scoring. Continuous vitals
+-- ICU — level-of-care tracking + APACHE II / SOFA critical-care scoring. Continuous vitals
 -- time-series reuses the existing VitalReading table as-is (no schema change needed there).
 
 IF OBJECT_ID('dbo.IcuLevelOfCare','U') IS NULL
@@ -3640,7 +4425,7 @@ BEGIN
 END
 GO
 
--- Raw APS inputs are stored alongside the computed TotalScore â€” ApacheIIScoreCalculator (API side)
+-- Raw APS inputs are stored alongside the computed TotalScore — ApacheIIScoreCalculator (API side)
 -- is the single source of truth for how inputs map to points, so the DB never re-derives them.
 IF OBJECT_ID('dbo.ApacheIIScore','U') IS NULL
 BEGIN
@@ -3699,7 +4484,7 @@ BEGIN
 END
 GO
 
--- Component scores (0-4 each) are computed+persisted alongside raw inputs â€” SofaScoreCalculator
+-- Component scores (0-4 each) are computed+persisted alongside raw inputs — SofaScoreCalculator
 -- (API side) is the single source of truth for how inputs map to each component's score.
 IF OBJECT_ID('dbo.SofaScore','U') IS NULL
 BEGIN
@@ -3766,134 +4551,6 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
--- FILE: db/schema/tables/create_tables_inventory.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
-IF OBJECT_ID('dbo.InventoryItem','U') IS NULL
-BEGIN
-  CREATE TABLE dbo.InventoryItem
-  (
-    InventoryItemId   UNIQUEIDENTIFIER NOT NULL
-      CONSTRAINT DF_II_Id DEFAULT NEWSEQUENTIALID(),
-
-    HospitalId        UNIQUEIDENTIFIER NOT NULL,
-
-    ItemCode          NVARCHAR(50)     NOT NULL,
-    ItemName          NVARCHAR(200)    NOT NULL,
-    GenericName       NVARCHAR(200)    NULL,
-    Manufacturer      NVARCHAR(200)    NULL,
-
-    Category          NVARCHAR(20)     NOT NULL CONSTRAINT DF_II_Category DEFAULT 'CONSUMABLE',
-    Unit              NVARCHAR(10)     NOT NULL CONSTRAINT DF_II_Unit DEFAULT 'PCS',
-
-    DefaultRate       DECIMAL(18,2)    NULL,
-    HsnSacCode        NVARCHAR(10)     NULL,
-    GstSlabPercent    DECIMAL(5,2)     NULL,
-    IsTaxable         BIT              NOT NULL CONSTRAINT DF_II_IsTaxable DEFAULT (0),
-
-    ChargeId          UNIQUEIDENTIFIER NULL,
-
-    CurrentStock      DECIMAL(18,3)    NOT NULL CONSTRAINT DF_II_CurrentStock DEFAULT (0),
-    MinStockLevel     DECIMAL(18,3)    NOT NULL CONSTRAINT DF_II_MinStock DEFAULT (0),
-    StoreLocation     NVARCHAR(100)    NULL,
-
-    IsActive          BIT              NOT NULL CONSTRAINT DF_II_IsActive DEFAULT (1),
-
-    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_II_CreatedAt DEFAULT SYSUTCDATETIME(),
-    CreatedBy         NVARCHAR(100)    NULL,
-    UpdatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_II_UpdatedAt DEFAULT SYSUTCDATETIME(),
-    UpdatedBy         NVARCHAR(100)    NULL,
-
-    RowVersion        ROWVERSION       NOT NULL,
-
-    CONSTRAINT PK_InventoryItem PRIMARY KEY CLUSTERED (InventoryItemId),
-    CONSTRAINT CK_II_Category CHECK (Category IN ('CONSUMABLE','DRUG','DISPOSABLE','SURGICAL','IMPLANT','OTHER')),
-    CONSTRAINT CK_II_GstSlab  CHECK (GstSlabPercent IS NULL OR (GstSlabPercent >= 0 AND GstSlabPercent <= 100))
-  );
-END
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_II_HospitalCode' AND object_id=OBJECT_ID('dbo.InventoryItem'))
-BEGIN
-  CREATE UNIQUE INDEX UX_II_HospitalCode
-  ON dbo.InventoryItem(HospitalId, ItemCode);
-END
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_II_HospitalActiveCategory' AND object_id=OBJECT_ID('dbo.InventoryItem'))
-BEGIN
-  CREATE INDEX IX_II_HospitalActiveCategory
-  ON dbo.InventoryItem(HospitalId, IsActive, Category)
-  INCLUDE (ItemName, CurrentStock, MinStockLevel, Unit, DefaultRate);
-END
-GO
-
-IF OBJECT_ID('dbo.InventoryMovement','U') IS NULL
-BEGIN
-  CREATE TABLE dbo.InventoryMovement
-  (
-    InventoryMovementId UNIQUEIDENTIFIER NOT NULL
-      CONSTRAINT DF_IM_Id DEFAULT NEWSEQUENTIALID(),
-
-    HospitalId          UNIQUEIDENTIFIER NOT NULL,
-    InventoryItemId     UNIQUEIDENTIFIER NOT NULL,
-
-    MovementType        NVARCHAR(20)     NOT NULL,
-
-    Qty                 DECIMAL(18,3)    NOT NULL,
-    UnitCost            DECIMAL(18,2)    NULL,
-    BatchNumber         NVARCHAR(50)     NULL,
-    ExpiryDate          DATETIME2(3)     NULL,
-
-    EncounterId         UNIQUEIDENTIFIER NULL,
-    PatientId           NVARCHAR(50)     NULL,
-    ChargeEventId       UNIQUEIDENTIFIER NULL,
-    SourceModule        NVARCHAR(30)     NULL,
-    SourceRefId         NVARCHAR(100)    NULL,
-
-    Reason              NVARCHAR(500)    NULL,
-    Notes               NVARCHAR(500)    NULL,
-
-    MovedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_IM_MovedAt DEFAULT SYSUTCDATETIME(),
-    MovedBy             NVARCHAR(200)    NULL,
-    MovedByUserId       UNIQUEIDENTIFIER NULL,
-
-    CreatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_IM_CreatedAt DEFAULT SYSUTCDATETIME(),
-
-    CONSTRAINT PK_InventoryMovement PRIMARY KEY CLUSTERED (InventoryMovementId),
-    CONSTRAINT FK_IM_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
-    CONSTRAINT CK_IM_Type CHECK (MovementType IN ('RECEIVE','ISSUE','RETURN','ADJUST_IN','ADJUST_OUT'))
-  );
-END
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_IM_ItemTimeline' AND object_id=OBJECT_ID('dbo.InventoryMovement'))
-BEGIN
-  CREATE INDEX IX_IM_ItemTimeline
-  ON dbo.InventoryMovement(HospitalId, InventoryItemId, MovedAt DESC)
-  INCLUDE (MovementType, Qty, EncounterId);
-END
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_IM_HospitalTime' AND object_id=OBJECT_ID('dbo.InventoryMovement'))
-BEGIN
-  CREATE INDEX IX_IM_HospitalTime
-  ON dbo.InventoryMovement(HospitalId, MovedAt DESC);
-END
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_IM_Encounter' AND object_id=OBJECT_ID('dbo.InventoryMovement'))
-BEGIN
-  CREATE INDEX IX_IM_Encounter
-  ON dbo.InventoryMovement(EncounterId)
-  WHERE EncounterId IS NOT NULL;
-END
-GO
-
-GO
-
--- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_inventory_batch.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -3922,7 +4579,7 @@ BEGIN
     ReceivedQty       DECIMAL(18,3)    NOT NULL,
     RemainingQty      DECIMAL(18,3)    NOT NULL,
 
-    -- Forward references to procurement (INV-6/INV-7) â€” plain columns for now, no FK constraint
+    -- Forward references to procurement (INV-6/INV-7) — plain columns for now, no FK constraint
     -- until Vendor/GoodsReceiptNoteLine tables exist; a later guarded ALTER adds the FK.
     VendorId          UNIQUEIDENTIFIER NULL,
     GrnLineId         UNIQUEIDENTIFIER NULL,
@@ -4002,7 +4659,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Inventory Management (INV-8): India regulatory compliance. NarcoticRegisterEntry is one table
--- with a FormType discriminator (3D/3E/3H) rather than three tables â€” the three NDPS registers
+-- with a FormType discriminator (3D/3E/3H) rather than three tables — the three NDPS registers
 -- share an identical shape (drug/batch/qty in-out/running balance/two-person sign-off), differing
 -- only in which statutory report they feed; insert-only, no RowVersion (immutable audit trail,
 -- same discipline as InventoryMovement). ColdChainTempLog flags a breach at insert time against the
@@ -4096,10 +4753,10 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Inventory Management (INV-7): procurement backbone â€” Indent (department request) -> Purchase
+-- Inventory Management (INV-7): procurement backbone — Indent (department request) -> Purchase
 -- Order -> Goods Receipt Note. GRN is where Batch rows actually get created (batch/expiry captured
 -- at receipt) and stock gets incremented via the same RecordInventoryMovement handler used
--- everywhere else â€” no separate stock-mutation logic here. Single-level approval only this phase
+-- everywhere else — no separate stock-mutation logic here. Single-level approval only this phase
 -- (not a configurable multi-tier workflow engine).
 
 IF OBJECT_ID('dbo.Indent','U') IS NULL
@@ -4419,7 +5076,7 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Inventory Management (INV-6): vendor/supplier master â€” feeds the procurement backbone (INV-7:
+-- Inventory Management (INV-6): vendor/supplier master — feeds the procurement backbone (INV-7:
 -- Indent/PO/GRN) and Batch.VendorId (already nullable from INV-2).
 
 IF OBJECT_ID('dbo.Vendor','U') IS NULL
@@ -4468,6 +5125,134 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BATCH_Vendor')
   ALTER TABLE dbo.Batch
     ADD CONSTRAINT FK_BATCH_Vendor FOREIGN KEY (VendorId) REFERENCES dbo.Vendor(VendorId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_inventory.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+IF OBJECT_ID('dbo.InventoryItem','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.InventoryItem
+  (
+    InventoryItemId   UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_II_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+
+    ItemCode          NVARCHAR(50)     NOT NULL,
+    ItemName          NVARCHAR(200)    NOT NULL,
+    GenericName       NVARCHAR(200)    NULL,
+    Manufacturer      NVARCHAR(200)    NULL,
+
+    Category          NVARCHAR(20)     NOT NULL CONSTRAINT DF_II_Category DEFAULT 'CONSUMABLE',
+    Unit              NVARCHAR(10)     NOT NULL CONSTRAINT DF_II_Unit DEFAULT 'PCS',
+
+    DefaultRate       DECIMAL(18,2)    NULL,
+    HsnSacCode        NVARCHAR(10)     NULL,
+    GstSlabPercent    DECIMAL(5,2)     NULL,
+    IsTaxable         BIT              NOT NULL CONSTRAINT DF_II_IsTaxable DEFAULT (0),
+
+    ChargeId          UNIQUEIDENTIFIER NULL,
+
+    CurrentStock      DECIMAL(18,3)    NOT NULL CONSTRAINT DF_II_CurrentStock DEFAULT (0),
+    MinStockLevel     DECIMAL(18,3)    NOT NULL CONSTRAINT DF_II_MinStock DEFAULT (0),
+    StoreLocation     NVARCHAR(100)    NULL,
+
+    IsActive          BIT              NOT NULL CONSTRAINT DF_II_IsActive DEFAULT (1),
+
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_II_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy         NVARCHAR(100)    NULL,
+    UpdatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_II_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy         NVARCHAR(100)    NULL,
+
+    RowVersion        ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_InventoryItem PRIMARY KEY CLUSTERED (InventoryItemId),
+    CONSTRAINT CK_II_Category CHECK (Category IN ('CONSUMABLE','DRUG','DISPOSABLE','SURGICAL','IMPLANT','OTHER')),
+    CONSTRAINT CK_II_GstSlab  CHECK (GstSlabPercent IS NULL OR (GstSlabPercent >= 0 AND GstSlabPercent <= 100))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_II_HospitalCode' AND object_id=OBJECT_ID('dbo.InventoryItem'))
+BEGIN
+  CREATE UNIQUE INDEX UX_II_HospitalCode
+  ON dbo.InventoryItem(HospitalId, ItemCode);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_II_HospitalActiveCategory' AND object_id=OBJECT_ID('dbo.InventoryItem'))
+BEGIN
+  CREATE INDEX IX_II_HospitalActiveCategory
+  ON dbo.InventoryItem(HospitalId, IsActive, Category)
+  INCLUDE (ItemName, CurrentStock, MinStockLevel, Unit, DefaultRate);
+END
+GO
+
+IF OBJECT_ID('dbo.InventoryMovement','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.InventoryMovement
+  (
+    InventoryMovementId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_IM_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId          UNIQUEIDENTIFIER NOT NULL,
+    InventoryItemId     UNIQUEIDENTIFIER NOT NULL,
+
+    MovementType        NVARCHAR(20)     NOT NULL,
+
+    Qty                 DECIMAL(18,3)    NOT NULL,
+    UnitCost            DECIMAL(18,2)    NULL,
+    BatchNumber         NVARCHAR(50)     NULL,
+    ExpiryDate          DATETIME2(3)     NULL,
+
+    EncounterId         UNIQUEIDENTIFIER NULL,
+    PatientId           NVARCHAR(50)     NULL,
+    ChargeEventId       UNIQUEIDENTIFIER NULL,
+    SourceModule        NVARCHAR(30)     NULL,
+    SourceRefId         NVARCHAR(100)    NULL,
+
+    Reason              NVARCHAR(500)    NULL,
+    Notes               NVARCHAR(500)    NULL,
+
+    MovedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_IM_MovedAt DEFAULT SYSUTCDATETIME(),
+    MovedBy             NVARCHAR(200)    NULL,
+    MovedByUserId       UNIQUEIDENTIFIER NULL,
+
+    CreatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_IM_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_InventoryMovement PRIMARY KEY CLUSTERED (InventoryMovementId),
+    CONSTRAINT FK_IM_Item FOREIGN KEY (InventoryItemId) REFERENCES dbo.InventoryItem(InventoryItemId),
+    CONSTRAINT CK_IM_Type CHECK (MovementType IN ('RECEIVE','ISSUE','RETURN','ADJUST_IN','ADJUST_OUT'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_IM_ItemTimeline' AND object_id=OBJECT_ID('dbo.InventoryMovement'))
+BEGIN
+  CREATE INDEX IX_IM_ItemTimeline
+  ON dbo.InventoryMovement(HospitalId, InventoryItemId, MovedAt DESC)
+  INCLUDE (MovementType, Qty, EncounterId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_IM_HospitalTime' AND object_id=OBJECT_ID('dbo.InventoryMovement'))
+BEGIN
+  CREATE INDEX IX_IM_HospitalTime
+  ON dbo.InventoryMovement(HospitalId, MovedAt DESC);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_IM_Encounter' AND object_id=OBJECT_ID('dbo.InventoryMovement'))
+BEGIN
+  CREATE INDEX IX_IM_Encounter
+  ON dbo.InventoryMovement(EncounterId)
+  WHERE EncounterId IS NOT NULL;
+END
 GO
 
 GO
@@ -4638,7 +5423,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_ADM_ClientRequest' AND o
   WHERE ClientRequestId IS NOT NULL;
 GO
 
--- AdmissionCoverage â€” payer/policy/scheme detail. Populated for TPA/SCHEME;
+-- AdmissionCoverage — payer/policy/scheme detail. Populated for TPA/SCHEME;
 -- gives pre-auth / enhancement (later phases) a home so it isn't a retrofit.
 IF OBJECT_ID('dbo.AdmissionCoverage','U') IS NULL
 BEGIN
@@ -4679,7 +5464,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ACOV_Admission' AND obje
   CREATE INDEX IX_ACOV_Admission ON dbo.AdmissionCoverage(AdmissionId);
 GO
 
--- AdmissionStatusHistory â€” immutable transition log. Also the source for
+-- AdmissionStatusHistory — immutable transition log. Also the source for
 -- BOR / bed-turnaround / discharge-TAT KPIs (compute off this, not snapshots).
 IF OBJECT_ID('dbo.AdmissionStatusHistory','U') IS NULL
 BEGIN
@@ -4708,7 +5493,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ASH_Admission' AND objec
 GO
 
 -- ============================================================================
--- IPD Phase 3: CPOE â€” clinical orders. One generic header+line schema covers
+-- IPD Phase 3: CPOE — clinical orders. One generic header+line schema covers
 -- every order type (OrderType discriminator); Phase 3 only exercises MEDICATION.
 -- Charge-on-event: a chargeable line gets its own BillingChargeEvent posted at
 -- order time (ChargeEventId back-fill), reusing the existing charge-posting
@@ -4822,6 +5607,150 @@ GO
 
 IF COL_LENGTH('dbo.ClinicalOrderLine','ScheduledAt') IS NULL
   ALTER TABLE dbo.ClinicalOrderLine ADD ScheduledAt DATETIME2(3) NULL;   -- when a Procedure/Surgery order is planned for
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_magic_login_token.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- One-tap "magic link" sign-in for staff notification messages (WhatsApp / email). A link carries
+-- a random token; only its SHA-256 hash is stored here, so a database read never yields a usable
+-- link. Each token is bound to ONE user + ONE hospital + ONE in-app landing path, is single-use
+-- (ConsumedAt), and expires (ExpiresAt). Redeemed by POST auth/magic-link/exchange in easyHMSAPI.
+-- Rows past their expiry are pruned opportunistically by the API when it creates new links.
+IF OBJECT_ID('dbo.MagicLoginToken','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.MagicLoginToken
+  (
+    TokenId      UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_MagicLoginToken_Id DEFAULT NEWSEQUENTIALID(),
+
+    -- Lower-case hex SHA-256 of the raw token (64 chars). The raw token is never persisted.
+    TokenHash    CHAR(64)         NOT NULL,
+
+    UserId       UNIQUEIDENTIFIER NOT NULL,
+    HospitalId   UNIQUEIDENTIFIER NOT NULL,
+
+    -- In-app route the recipient lands on after sign-in (always a relative path, validated by the API).
+    TargetPath   NVARCHAR(200)    NOT NULL,
+    -- What produced the link, e.g. 'ONLINE_APPOINTMENT_REQUEST'. Audit/diagnostics only.
+    Purpose      NVARCHAR(60)     NOT NULL,
+
+    CreatedAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_MagicLoginToken_CreatedAt DEFAULT SYSUTCDATETIME(),
+    ExpiresAt    DATETIME2(3)     NOT NULL,
+
+    -- Set when the link is redeemed. NULL = still usable (until ExpiresAt).
+    ConsumedAt   DATETIME2(3)     NULL,
+    ConsumedIp   NVARCHAR(64)     NULL,
+
+    -- Optimistic-concurrency token: two simultaneous redemptions of the same link cannot both win.
+    RowVersion   ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_MagicLoginToken PRIMARY KEY CLUSTERED (TokenId)
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_MagicLoginToken_TokenHash' AND object_id=OBJECT_ID('dbo.MagicLoginToken'))
+BEGIN
+  CREATE UNIQUE INDEX UX_MagicLoginToken_TokenHash
+  ON dbo.MagicLoginToken(TokenHash);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MagicLoginToken_ExpiresAt' AND object_id=OBJECT_ID('dbo.MagicLoginToken'))
+BEGIN
+  CREATE INDEX IX_MagicLoginToken_ExpiresAt
+  ON dbo.MagicLoginToken(ExpiresAt);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_medication_safety.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+IF OBJECT_ID('dbo.PatientAllergy','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PatientAllergy
+  (
+    PatientAllergyId  UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PA_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+    PatientId         NVARCHAR(50)     NOT NULL,
+
+    AllergyType       NVARCHAR(20)     NOT NULL CONSTRAINT DF_PA_Type DEFAULT 'DRUG',
+    Allergen          NVARCHAR(200)    NOT NULL,
+    Severity          NVARCHAR(20)     NOT NULL CONSTRAINT DF_PA_Severity DEFAULT 'MODERATE',
+    Reaction          NVARCHAR(500)    NULL,
+    Notes             NVARCHAR(1000)   NULL,
+
+    OnsetDate         DATETIME2(3)     NULL,
+    IsActive          BIT              NOT NULL CONSTRAINT DF_PA_IsActive DEFAULT (1),
+
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PA_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy         NVARCHAR(100)    NULL,
+    UpdatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PA_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy         NVARCHAR(100)    NULL,
+
+    RowVersion        ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_PatientAllergy PRIMARY KEY CLUSTERED (PatientAllergyId),
+    CONSTRAINT CK_PA_Type     CHECK (AllergyType IN ('DRUG','FOOD','ENVIRONMENT','OTHER')),
+    CONSTRAINT CK_PA_Severity CHECK (Severity IN ('MILD','MODERATE','SEVERE','ANAPHYLAXIS'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PA_PatientActive' AND object_id=OBJECT_ID('dbo.PatientAllergy'))
+BEGIN
+  CREATE INDEX IX_PA_PatientActive
+  ON dbo.PatientAllergy(HospitalId, PatientId, IsActive)
+  INCLUDE (Allergen, Severity, AllergyType);
+END
+GO
+
+IF OBJECT_ID('dbo.DrugInteraction','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.DrugInteraction
+  (
+    DrugInteractionId UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_DI_Id DEFAULT NEWSEQUENTIALID(),
+
+    -- Stored lowercase to allow case-insensitive equality on lookup.
+    DrugA             NVARCHAR(200)    NOT NULL,
+    DrugB             NVARCHAR(200)    NOT NULL,
+
+    Severity          NVARCHAR(20)     NOT NULL CONSTRAINT DF_DI_Severity DEFAULT 'MODERATE',
+    Effect            NVARCHAR(500)    NULL,
+    Management        NVARCHAR(500)    NULL,
+    Source            NVARCHAR(100)    NULL,
+
+    IsActive          BIT              NOT NULL CONSTRAINT DF_DI_IsActive DEFAULT (1),
+
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_DI_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy         NVARCHAR(100)    NULL,
+
+    RowVersion        ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_DrugInteraction PRIMARY KEY CLUSTERED (DrugInteractionId),
+    CONSTRAINT CK_DI_Severity CHECK (Severity IN ('MINOR','MODERATE','MAJOR','CONTRAINDICATED'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_DI_Pair' AND object_id=OBJECT_ID('dbo.DrugInteraction'))
+BEGIN
+  CREATE INDEX IX_DI_Pair
+  ON dbo.DrugInteraction(DrugA, DrugB)
+  INCLUDE (Severity, Effect, Management, IsActive);
+END
 GO
 
 GO
@@ -4958,91 +5887,6 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MA_OrderSlot' AND object
 BEGIN
   CREATE INDEX IX_MA_OrderSlot
   ON dbo.MedicationAdministration(MedicationOrderId, ScheduledFor);
-END
-GO
-
-GO
-
--- ---------------------------------------------------------------------
--- FILE: db/schema/tables/create_tables_medication_safety.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
-IF OBJECT_ID('dbo.PatientAllergy','U') IS NULL
-BEGIN
-  CREATE TABLE dbo.PatientAllergy
-  (
-    PatientAllergyId  UNIQUEIDENTIFIER NOT NULL
-      CONSTRAINT DF_PA_Id DEFAULT NEWSEQUENTIALID(),
-
-    HospitalId        UNIQUEIDENTIFIER NOT NULL,
-    PatientId         NVARCHAR(50)     NOT NULL,
-
-    AllergyType       NVARCHAR(20)     NOT NULL CONSTRAINT DF_PA_Type DEFAULT 'DRUG',
-    Allergen          NVARCHAR(200)    NOT NULL,
-    Severity          NVARCHAR(20)     NOT NULL CONSTRAINT DF_PA_Severity DEFAULT 'MODERATE',
-    Reaction          NVARCHAR(500)    NULL,
-    Notes             NVARCHAR(1000)   NULL,
-
-    OnsetDate         DATETIME2(3)     NULL,
-    IsActive          BIT              NOT NULL CONSTRAINT DF_PA_IsActive DEFAULT (1),
-
-    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PA_CreatedAt DEFAULT SYSUTCDATETIME(),
-    CreatedBy         NVARCHAR(100)    NULL,
-    UpdatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PA_UpdatedAt DEFAULT SYSUTCDATETIME(),
-    UpdatedBy         NVARCHAR(100)    NULL,
-
-    RowVersion        ROWVERSION       NOT NULL,
-
-    CONSTRAINT PK_PatientAllergy PRIMARY KEY CLUSTERED (PatientAllergyId),
-    CONSTRAINT CK_PA_Type     CHECK (AllergyType IN ('DRUG','FOOD','ENVIRONMENT','OTHER')),
-    CONSTRAINT CK_PA_Severity CHECK (Severity IN ('MILD','MODERATE','SEVERE','ANAPHYLAXIS'))
-  );
-END
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PA_PatientActive' AND object_id=OBJECT_ID('dbo.PatientAllergy'))
-BEGIN
-  CREATE INDEX IX_PA_PatientActive
-  ON dbo.PatientAllergy(HospitalId, PatientId, IsActive)
-  INCLUDE (Allergen, Severity, AllergyType);
-END
-GO
-
-IF OBJECT_ID('dbo.DrugInteraction','U') IS NULL
-BEGIN
-  CREATE TABLE dbo.DrugInteraction
-  (
-    DrugInteractionId UNIQUEIDENTIFIER NOT NULL
-      CONSTRAINT DF_DI_Id DEFAULT NEWSEQUENTIALID(),
-
-    -- Stored lowercase to allow case-insensitive equality on lookup.
-    DrugA             NVARCHAR(200)    NOT NULL,
-    DrugB             NVARCHAR(200)    NOT NULL,
-
-    Severity          NVARCHAR(20)     NOT NULL CONSTRAINT DF_DI_Severity DEFAULT 'MODERATE',
-    Effect            NVARCHAR(500)    NULL,
-    Management        NVARCHAR(500)    NULL,
-    Source            NVARCHAR(100)    NULL,
-
-    IsActive          BIT              NOT NULL CONSTRAINT DF_DI_IsActive DEFAULT (1),
-
-    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_DI_CreatedAt DEFAULT SYSUTCDATETIME(),
-    CreatedBy         NVARCHAR(100)    NULL,
-
-    RowVersion        ROWVERSION       NOT NULL,
-
-    CONSTRAINT PK_DrugInteraction PRIMARY KEY CLUSTERED (DrugInteractionId),
-    CONSTRAINT CK_DI_Severity CHECK (Severity IN ('MINOR','MODERATE','MAJOR','CONTRAINDICATED'))
-  );
-END
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_DI_Pair' AND object_id=OBJECT_ID('dbo.DrugInteraction'))
-BEGIN
-  CREATE INDEX IX_DI_Pair
-  ON dbo.DrugInteraction(DrugA, DrugB)
-  INCLUDE (Severity, Effect, Management, IsActive);
 END
 GO
 
@@ -5320,7 +6164,7 @@ BEGIN
     EncounterId          UNIQUEIDENTIFIER NULL,
     PatientId            NVARCHAR(20)     NULL,
 
-    -- Free-text, NOT a NANDA-I coded taxonomy â€” same spirit as ClinicalOrderLine.ItemName.
+    -- Free-text, NOT a NANDA-I coded taxonomy — same spirit as ClinicalOrderLine.ItemName.
     NursingDiagnosis     NVARCHAR(500)    NOT NULL,
     Goal                 NVARCHAR(1000)   NULL,
     PlannedInterventions NVARCHAR(MAX)    NULL,
@@ -5376,11 +6220,47 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_nursing_shift.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Per-hospital nursing shift definitions (Morning / Evening / Night / custom).
+-- Previously kept only in each browser's localStorage, so shifts differed per device and vanished
+-- on cache clear while NurseShiftAssignment rows (server-side) referenced the shift codes.
+-- New table; nothing existing is edited.
+
+IF OBJECT_ID('dbo.NursingShift', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.NursingShift (
+        NursingShiftId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_NursingShift_Id DEFAULT NEWSEQUENTIALID(),
+        HospitalId UNIQUEIDENTIFIER NOT NULL,
+        ShiftCode NVARCHAR(30) NOT NULL,
+        Label NVARCHAR(60) NOT NULL,
+        StartTime NVARCHAR(5) NULL,   -- 'HH:mm'
+        EndTime NVARCHAR(5) NULL,     -- 'HH:mm'
+        IsActive BIT NOT NULL CONSTRAINT DF_NursingShift_IsActive DEFAULT 1,
+        SortOrder INT NOT NULL CONSTRAINT DF_NursingShift_SortOrder DEFAULT 0,
+        UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_NursingShift_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedByUserId UNIQUEIDENTIFIER NULL,
+        CONSTRAINT PK_NursingShift PRIMARY KEY CLUSTERED (NursingShiftId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_NursingShift_Hospital_Code' AND object_id = OBJECT_ID('dbo.NursingShift'))
+BEGIN
+    CREATE UNIQUE INDEX UX_NursingShift_Hospital_Code ON dbo.NursingShift (HospitalId, ShiftCode);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_ot.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Operation Theatre (OT) â€” full scope: theatre resource + booking, surgery case lifecycle,
+-- Operation Theatre (OT) — full scope: theatre resource + booking, surgery case lifecycle,
 -- pre-op assessment, WHO Surgical Safety Checklist, intra-op record, and intra-op item usage
 -- (which doubles as the pharmacy-deduct trigger, billing source, and CSSD implant log).
 -- Tables declared in dependency order since they're all new in this one file.
@@ -5532,7 +6412,7 @@ BEGIN
 END
 GO
 
--- One active (SCHEDULED/IN_PROGRESS) booking per case at a time â€” mirrors UX_RO_AdmissionActive
+-- One active (SCHEDULED/IN_PROGRESS) booking per case at a time — mirrors UX_RO_AdmissionActive
 -- on RestraintOrder. Rescheduling updates this row in place rather than inserting a new one.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_OTB_CaseActive' AND object_id=OBJECT_ID('dbo.OTBooking'))
 BEGIN
@@ -5586,9 +6466,9 @@ BEGIN
 END
 GO
 
--- Fixed WHO 2009 Surgical Safety Checklist â€” 3 phases, one row per case. Each phase's item
+-- Fixed WHO 2009 Surgical Safety Checklist — 3 phases, one row per case. Each phase's item
 -- answers are a compact JSON blob against a fixed item list (IpdConstants.WhoChecklistItems on
--- the API side) rather than ~25 boolean columns â€” the item list itself isn't DB-enforced or
+-- the API side) rather than ~25 boolean columns — the item list itself isn't DB-enforced or
 -- per-hospital-customizable this phase, same soft-validation posture as ConsentTemplate.TypeCode.
 IF OBJECT_ID('dbo.SurgicalSafetyChecklist','U') IS NULL
 BEGIN
@@ -5682,10 +6562,10 @@ BEGIN
 END
 GO
 
--- Items actually used during surgery â€” descriptive (recorded after use), distinct from CPOE's
+-- Items actually used during surgery — descriptive (recorded after use), distinct from CPOE's
 -- prescriptive ClinicalOrder. One row here can simultaneously drive an InventoryMovement/stock
 -- deduction, a billing charge event, and (Category=IMPLANT) serve as the implant traceability
--- log CSSD needs â€” no separate ImplantLog table.
+-- log CSSD needs — no separate ImplantLog table.
 IF OBJECT_ID('dbo.IntraOpItemUsage','U') IS NULL
 BEGIN
   CREATE TABLE dbo.IntraOpItemUsage
@@ -5733,6 +6613,75 @@ BEGIN
   CREATE INDEX IX_IOU_ImplantTrace
   ON dbo.IntraOpItemUsage(HospitalId, Category, LotNumber, SerialNumber)
   WHERE Category = 'IMPLANT';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_pathology_sample_rejection.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Rejected lab samples (haemolysed, clotted, too little, wrong tube, mislabelled ...). Rejecting sends the
+-- test back to Pending for a new sample; each rejection is kept here as the lab's rejection register and
+-- rejection-rate quality indicator. Written by easyHMSAPI PathologySampleRejectionHandlers.
+-- OrderId / OrderLineId / TestId are soft links (no FK), like PathologyOrderLine.ExternalLabId.
+IF OBJECT_ID('dbo.PathologySampleRejection','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PathologySampleRejection
+  (
+    SampleRejectionId  UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PSR_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
+    OrderId            UNIQUEIDENTIFIER NOT NULL,
+    OrderLineId        UNIQUEIDENTIFIER NOT NULL,
+    TestId             UNIQUEIDENTIFIER NOT NULL,
+    PatientId          NVARCHAR(50)     NOT NULL,
+
+    ReasonCode         NVARCHAR(40)     NOT NULL,
+    Notes              NVARCHAR(500)    NULL,
+
+    PreviousStatus     NVARCHAR(40)     NOT NULL,
+    PreviousBarcode    NVARCHAR(100)    NULL,
+    SampleCollectedAt  DATETIME2(3)     NULL,
+
+    RejectedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PSR_RejectedAt DEFAULT SYSUTCDATETIME(),
+    RejectedByUserId   UNIQUEIDENTIFIER NULL,
+    RejectedByName     NVARCHAR(200)    NULL,
+
+    CONSTRAINT PK_PathologySampleRejection PRIMARY KEY CLUSTERED (SampleRejectionId),
+    CONSTRAINT CK_PSR_Reason CHECK (ReasonCode IN ('HAEMOLYSED','CLOTTED','INSUFFICIENT','WRONG_CONTAINER','MISLABELLED','LIPAEMIC','LEAKED_OR_DAMAGED','DELAYED','OTHER')),
+    CONSTRAINT CK_PSR_PreviousStatus CHECK (PreviousStatus IN ('SAMPLE_COLLECTED','SENT_TO_EXTERNAL_LAB'))
+  );
+END
+GO
+
+-- Rejection register / rejection rate by date.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PSR_HospitalRejectedAt' AND object_id=OBJECT_ID('dbo.PathologySampleRejection'))
+BEGIN
+  CREATE INDEX IX_PSR_HospitalRejectedAt
+  ON dbo.PathologySampleRejection(HospitalId, RejectedAt)
+  INCLUDE (OrderId, OrderLineId, TestId, PatientId, ReasonCode, SampleCollectedAt);
+END
+GO
+
+-- "Was this test rejected before?" (order view, no second charge on recollection).
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PSR_OrderLine' AND object_id=OBJECT_ID('dbo.PathologySampleRejection'))
+BEGIN
+  CREATE INDEX IX_PSR_OrderLine
+  ON dbo.PathologySampleRejection(HospitalId, OrderLineId)
+  INCLUDE (OrderId, ReasonCode, RejectedAt);
+END
+GO
+
+-- Order list counts tests awaiting recollection per order.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PSR_Order' AND object_id=OBJECT_ID('dbo.PathologySampleRejection'))
+BEGIN
+  CREATE INDEX IX_PSR_Order
+  ON dbo.PathologySampleRejection(HospitalId, OrderId)
+  INCLUDE (OrderLineId);
 END
 GO
 
@@ -5903,15 +6852,158 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_patient_account_profile.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- The details a patient keeps on their own Doctor Dekho account, edited by themselves (Personal Information on the profile page).
+-- Kept apart from dbo.PatientRegistrations on purpose: those rows belong to the hospital that registered the patient (one per hospital),
+-- and a patient changing their name there would change a hospital's record. This row belongs to the patient, is keyed by the same
+-- OTP-verified mobile as the Health Locker (dbo.PatientHealthLockerDocuments), and only fills what the profile page shows. Idempotent.
+IF OBJECT_ID('dbo.PatientAccountProfiles','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PatientAccountProfiles
+  (
+    Mobile           NVARCHAR(20)  NOT NULL,
+    FullName         NVARCHAR(200) NOT NULL,
+    Age              SMALLINT      NULL,
+    AgeUnit          NVARCHAR(5)   NULL,
+    Sex              NVARCHAR(10)  NULL,
+    Email            NVARCHAR(200) NULL,
+    GuardianName     NVARCHAR(200) NULL,
+    GuardianRelation NVARCHAR(50)  NULL,
+    UpdatedAt        DATETIME2(3)  NOT NULL CONSTRAINT DF_PAP_UpdatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_PatientAccountProfiles PRIMARY KEY CLUSTERED (Mobile),
+    CONSTRAINT CK_PAP_AgeUnit CHECK (AgeUnit IS NULL OR AgeUnit IN ('Y','M','D')),
+    CONSTRAINT CK_PAP_Sex CHECK (Sex IS NULL OR Sex IN ('Male','Female','Other')),
+    CONSTRAINT CK_PAP_Age CHECK (Age IS NULL OR (Age >= 0 AND Age <= 120))
+  );
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_patient_app.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Doctor Dekho mobile app (Android / iOS, Expo) — 2026-10-21.
+-- Read and written by 1HMSAPI PublicController (patients/me/app-profile, patients/me/devices) with the
+-- same WhatsApp-OTP patient token the website uses. Run BEFORE deploying the matching 1HMSAPI. Idempotent.
+--
+-- The patient's short profile (name, age, sex, blood group, email, guardian) is NOT here: it stays in
+-- dbo.PatientAccountProfiles so the website and the app share one profile. These tables hold only what the
+-- app adds on top of it, all keyed by the OTP-verified mobile like PatientAccountProfiles.
+--
+--   PatientAppProfiles   one row per mobile: the app's quick-booking preferences (language, home city and
+--                        its coordinates, who the patient usually books for, preferred time window, the last
+--                        doctor booked) and whether they agreed to WhatsApp / push reminders.
+--   PatientAppDevices    one row per app install per mobile: platform, app version and the Expo push token,
+--                        so reminders can reach the phone. Deactivated on logout.
+
+IF OBJECT_ID('dbo.PatientAppProfiles','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PatientAppProfiles
+  (
+    Mobile                 NVARCHAR(20)     NOT NULL,
+    PreferredLanguage      NVARCHAR(5)      NULL,             -- en | hi | bn | hg
+    HomeCity               NVARCHAR(100)    NULL,
+    HomeState              NVARCHAR(100)    NULL,
+    HomeLatitude           DECIMAL(9,6)     NULL,
+    HomeLongitude          DECIMAL(9,6)     NULL,
+    DefaultMemberId        UNIQUEIDENTIFIER NULL,             -- NULL = the account holder; else a PatientFamilyMembers row
+    PreferredTimeWindow    NVARCHAR(10)     NULL,             -- MORNING | AFTERNOON | EVENING | NIGHT
+    LastDoctorId           UNIQUEIDENTIFIER NULL,
+    LastBookedAt           DATETIME2(3)     NULL,
+    RemindersOptIn         BIT              NOT NULL CONSTRAINT DF_PAPP_RemindersOptIn DEFAULT 0,
+    RemindersOptInAt       DATETIME2(3)     NULL,
+    OnboardingCompletedAt  DATETIME2(3)     NULL,
+    CreatedAt              DATETIME2(3)     NOT NULL CONSTRAINT DF_PAPP_CreatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedAt              DATETIME2(3)     NOT NULL CONSTRAINT DF_PAPP_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_PatientAppProfiles PRIMARY KEY CLUSTERED (Mobile),
+    CONSTRAINT CK_PAPP_Language   CHECK (PreferredLanguage IS NULL OR PreferredLanguage IN ('en','hi','bn','hg')),
+    CONSTRAINT CK_PAPP_TimeWindow CHECK (PreferredTimeWindow IS NULL OR PreferredTimeWindow IN ('MORNING','AFTERNOON','EVENING','NIGHT')),
+    CONSTRAINT CK_PAPP_Latitude   CHECK (HomeLatitude IS NULL OR (HomeLatitude BETWEEN -90 AND 90)),
+    CONSTRAINT CK_PAPP_Longitude  CHECK (HomeLongitude IS NULL OR (HomeLongitude BETWEEN -180 AND 180))
+  );
+END
+GO
+
+IF OBJECT_ID('dbo.PatientAppDevices','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PatientAppDevices
+  (
+    DeviceId         UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PADV_Id DEFAULT NEWSEQUENTIALID(),
+    Mobile           NVARCHAR(20)     NOT NULL,
+    InstallationId   NVARCHAR(64)     NOT NULL,              -- random id the app creates once per install
+    Platform         NVARCHAR(10)     NOT NULL,              -- android | ios
+    AppVersion       NVARCHAR(20)     NULL,
+    OsVersion        NVARCHAR(40)     NULL,
+    DeviceModel      NVARCHAR(100)    NULL,
+    PushToken        NVARCHAR(256)    NULL,                  -- ExponentPushToken[...]
+    IsActive         BIT              NOT NULL CONSTRAINT DF_PADV_IsActive DEFAULT 1,
+    FirstSeenAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_PADV_FirstSeenAt DEFAULT SYSUTCDATETIME(),
+    LastSeenAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_PADV_LastSeenAt DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_PatientAppDevices PRIMARY KEY CLUSTERED (DeviceId),
+    CONSTRAINT UQ_PADV_Mobile_Installation UNIQUE (Mobile, InstallationId),
+    CONSTRAINT CK_PADV_Platform CHECK (Platform IN ('android','ios'))
+  );
+  CREATE INDEX IX_PADV_Mobile_Active ON dbo.PatientAppDevices (Mobile) INCLUDE (PushToken) WHERE IsActive = 1;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_patient_family_members.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- People a patient looks after on their own Doctor Dekho account (a child, a parent, a spouse) so their health records can be kept and
+-- opened in one place. Owned by the account's OTP-verified mobile (like dbo.PatientAccountProfiles and the Health Locker); a member is not a
+-- login and not a hospital registration. Records for a member live in dbo.PatientHealthLockerDocuments (MemberId). Idempotent.
+IF OBJECT_ID('dbo.PatientFamilyMembers','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PatientFamilyMembers
+  (
+    MemberId     UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PFM_Id DEFAULT NEWSEQUENTIALID(),
+    OwnerMobile  NVARCHAR(20)     NOT NULL,
+    FirstName    NVARCHAR(100)    NOT NULL,
+    LastName     NVARCHAR(100)    NULL,
+    Relation     NVARCHAR(50)     NOT NULL,
+    Age          SMALLINT         NULL,
+    AgeUnit      NVARCHAR(5)      NULL,
+    Sex          NVARCHAR(10)     NULL,
+    BloodGroup   NVARCHAR(5)      NULL,
+    Allergies    NVARCHAR(500)    NULL,
+    CreatedAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_PFM_CreatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_PFM_UpdatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_PatientFamilyMembers PRIMARY KEY CLUSTERED (MemberId),
+    CONSTRAINT CK_PFM_AgeUnit CHECK (AgeUnit IS NULL OR AgeUnit IN ('Y','M','D')),
+    CONSTRAINT CK_PFM_Sex CHECK (Sex IS NULL OR Sex IN ('Male','Female','Other')),
+    CONSTRAINT CK_PFM_Age CHECK (Age IS NULL OR (Age >= 0 AND Age <= 120)),
+    CONSTRAINT CK_PFM_Blood CHECK (BloodGroup IS NULL OR BloodGroup IN ('A+','A-','B+','B-','AB+','AB-','O+','O-'))
+  );
+
+  CREATE INDEX IX_PatientFamilyMembers_Owner ON dbo.PatientFamilyMembers (OwnerMobile, CreatedAt);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/tables/create_tables_patient_health_locker_documents.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Patient-initiated document uploads for Doctor Dekho's "Health Locker" â€” kept separate from
+-- Patient-initiated document uploads for Doctor Dekho's "Health Locker" — kept separate from
 -- dbo.PrescriptionAttachments deliberately: those are hospital/appointment/doctor-scoped (uploaded
 -- by staff during a consultation), while these are owned by the patient's own OTP-verified Mobile
 -- (see dbo.PublicPatientAuth), independent of ever having a PatientRegistration/appointment at all.
--- ApptId is optional â€” a patient MAY tag an upload to a past appointment for their own context, but
+-- ApptId is optional — a patient MAY tag an upload to a past appointment for their own context, but
 -- it is never required to have one.
 IF OBJECT_ID('dbo.PatientHealthLockerDocuments','U') IS NULL
 BEGIN
@@ -6049,7 +7141,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Pharmacy Phase 3b: statutory/print fields for pharmacy bills (Drug License numbers, FSSAI,
 -- registered pharmacist, return policy). Separate from InvoicePrintSettings (generic font/margin
--- config for the hospital's general invoice) â€” pharmacy bills carry Drugs & Cosmetics Act-mandated
+-- config for the hospital's general invoice) — pharmacy bills carry Drugs & Cosmetics Act-mandated
 -- fields no other bill type needs. One row per hospital.
 
 IF OBJECT_ID('dbo.PharmacyPrintSettings','U') IS NULL
@@ -6090,7 +7182,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Pharmacy Phase 3d: patient return/restock ledger. Deliberately separate from
--- BillingInvoice/BillingChargeEvent â€” no partial-qty adjustment primitive exists on a charge event
+-- BillingInvoice/BillingChargeEvent — no partial-qty adjustment primitive exists on a charge event
 -- today, and voiding+reposting the whole line was rejected, so the return and its refund amount
 -- live entirely here. The original invoice rows are never touched by this workflow.
 
@@ -6165,7 +7257,7 @@ END
 GO
 
 -- Re-validation of the returnable ceiling (dispensed minus already-returned) filters on
--- (ChargeEventId, BatchId) on every call â€” see GetReturnableInvoiceLinesHandler / CreatePharmacyReturnHandler.
+-- (ChargeEventId, BatchId) on every call — see GetReturnableInvoiceLinesHandler / CreatePharmacyReturnHandler.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PHRETL_ChargeEventBatch' AND object_id=OBJECT_ID('dbo.PharmacyReturnLine'))
 BEGIN
   CREATE INDEX IX_PHRETL_ChargeEventBatch
@@ -6181,7 +7273,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Pharmacy Phase 3c: normalized Molecule/SaltComposition catalog driving 1-click generic
--- substitution. Global (not per-hospital) â€” a composition like "Amoxicillin 500mg + Clavulanic
+-- substitution. Global (not per-hospital) — a composition like "Amoxicillin 500mg + Clavulanic
 -- Acid 125mg" is the same everywhere, only which brands/items a hospital stocks differs.
 
 IF OBJECT_ID('dbo.Molecule','U') IS NULL
@@ -6287,7 +7379,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Pharmacy Phase 3d: return-to-vendor (RTV) debit note. Stock is deducted for real via the shared
--- InventoryMovement handler (ADJUST_OUT) before this note is written â€” these two tables are the
+-- InventoryMovement handler (ADJUST_OUT) before this note is written — these two tables are the
 -- vendor-facing paper trail, not the source of truth for stock.
 
 IF OBJECT_ID('dbo.VendorReturnNote','U') IS NULL
@@ -6365,7 +7457,7 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Billing phase (revenue engine) â€” "Tariff = f(service, payer, room class)". ChargeMaster keeps
+-- Billing phase (revenue engine) — "Tariff = f(service, payer, room class)". ChargeMaster keeps
 -- one DefaultRate; these two small tables layer payer-specific overrides and a room-class
 -- multiplier on top, rather than a full (item x payer x room) rate matrix.
 
@@ -6444,9 +7536,9 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- ============================================================================
 -- Referral / Incentive schema
---   1. dbo.Referrer          â€” referee master (who earns incentives)
---   2. dbo.ReferralIncentive â€” accrual ledger, accrued on payment, sliceable by module
---   3. ALTER dbo.Encounter   â€” ReferredByReferrerId (attribution captured at booking)
+--   1. dbo.Referrer          — referee master (who earns incentives)
+--   2. dbo.ReferralIncentive — accrual ledger, accrued on payment, sliceable by module
+--   3. ALTER dbo.Encounter   — ReferredByReferrerId (attribution captured at booking)
 --
 -- Internal ledger only. Incentive amounts NEVER appear on the patient's GST invoice.
 -- Deploys after create_tables_billing_scripts.sql (alphabetical), so Encounter /
@@ -6602,7 +7694,7 @@ END
 GO
 
 
--- â”€â”€ Attribution: which referrer sent this visit (captured at booking/admission) â”€â”€
+-- ── Attribution: which referrer sent this visit (captured at booking/admission) ──
 IF COL_LENGTH('dbo.Encounter','ReferredByReferrerId') IS NULL
 BEGIN
   ALTER TABLE dbo.Encounter
@@ -6630,7 +7722,7 @@ GO
 IF COL_LENGTH('dbo.Appointments','ReferrerRelation') IS NULL
 BEGIN
   ALTER TABLE dbo.Appointments
-    ADD ReferrerRelation NVARCHAR(10) NULL;   -- C/O, S/O, D/O, W/O â€¦ referrer's relation to patient
+    ADD ReferrerRelation NVARCHAR(10) NULL;   -- C/O, S/O, D/O, W/O … referrer's relation to patient
 END
 GO
 
@@ -6716,7 +7808,7 @@ END
 GO
 
 -- Only one ACTIVE restraint order per admission at a time (mirrors UX_BA_BedActive on
--- BedAssignment) â€” a patient under an existing active restraint must have it released before a
+-- BedAssignment) — a patient under an existing active restraint must have it released before a
 -- new one is opened.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_RO_AdmissionActive' AND object_id=OBJECT_ID('dbo.RestraintOrder'))
 BEGIN
@@ -6742,7 +7834,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Configuration: Room master. Previously a room was just a free-text RoomCode duplicated on every
 -- BedMaster row, with no entity of its own and nothing enforcing how many beds it actually holds.
--- This table is the real "room" record â€” you set the room number/ward/type/rate/capacity once,
+-- This table is the real "room" record — you set the room number/ward/type/rate/capacity once,
 -- then beds are created against it (BedMaster.RoomId), with capacity enforced at bed-creation time.
 
 IF OBJECT_ID('dbo.Room','U') IS NULL
@@ -6888,7 +7980,7 @@ BEGIN
     IncomingAckAt        DATETIME2(3)     NULL,
 
     -- Free-text fallback: when IsFreeText = 1, FreeTextNote carries the whole handover and the
-    -- 4 SBAR fields are ignored/NULL. When IsFreeText = 0, only Situation is mandatory â€” nurses
+    -- 4 SBAR fields are ignored/NULL. When IsFreeText = 0, only Situation is mandatory — nurses
     -- are never forced to fill Background/Assessment/Recommendation. See CK_SHN_FreeTextOrSbar.
     IsFreeText           BIT              NOT NULL CONSTRAINT DF_SHN_FreeText DEFAULT (0),
     FreeTextNote         NVARCHAR(MAX)    NULL,
@@ -6969,7 +8061,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Training data for the Hinglish symptom -> specialist NLP router (see 1HMS-NLP-Router
--- repo). This is the LIVE, CMS-editable source of truth for the training set â€” the
+-- repo). This is the LIVE, CMS-editable source of truth for the training set — the
 -- deployed model itself still reads a git-committed CSV; the offline retrain pipeline is
 -- the only thing that reads this table, regenerating that CSV from whatever is IsActive=1
 -- here plus correlated production feedback (see dbo.AnalyticsEvents' search_performed /
@@ -6983,13 +8075,13 @@ BEGIN
 
     Text          NVARCHAR(500)    NOT NULL,
     -- One of the 32 canonical patient-facing specialist labels the router outputs (see
-    -- MODEL_OUTPUT_MERGES / LABEL_TO_NEXEAGLE_SPECIALTY_ID in the NLP repo) â€” not
+    -- MODEL_OUTPUT_MERGES / LABEL_TO_NEXEAGLE_SPECIALTY_ID in the NLP repo) — not
     -- validated against a lookup table here since the taxonomy lives in that repo's code,
     -- not the DB; CMSAPI validates against the same fixed list before insert/update.
     Specialist    NVARCHAR(100)    NOT NULL,
     -- Provenance tag (Original / Specialist Term / Keyword Phrase / Spelling Variation of: .../
     -- Variation of: ... / Production Feedback - Correction / Production Feedback - Accepted /
-    -- Manual Edit) â€” free-form, same convention the CSV's own "type" column already used.
+    -- Manual Edit) — free-form, same convention the CSV's own "type" column already used.
     Type          NVARCHAR(200)    NULL,
     -- How this row entered the table.
     Source        NVARCHAR(50)     NOT NULL CONSTRAINT DF_STE_Source DEFAULT 'Seed',
@@ -7255,7 +8347,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Page-view beacons fired by NexEagleWebsite (see /public/track-visit) for the CMS "Site Visits"
--- report â€” one row per page view, region resolved server-side from the visitor's real IP
+-- report — one row per page view, region resolved server-side from the visitor's real IP
 -- (TrustedProxyIpResolver) via a best-effort GeoIP lookup at write time.
 IF OBJECT_ID('dbo.WebsiteVisits','U') IS NULL
 BEGIN
@@ -7278,15 +8370,22 @@ BEGIN
     UtmCampaign   NVARCHAR(100)    NULL,
 
     UserAgent     NVARCHAR(500)    NULL,
-    -- Client-generated (localStorage-persisted) id grouping page views into one visit/session â€”
+    -- Client-generated (localStorage-persisted) id grouping page views into one visit/session —
     -- lets the CMS report distinguish unique visitors from raw page-view counts.
     SessionId     NVARCHAR(64)     NULL,
+    -- Bot / crawler / data-centre traffic (tracking_traffic_quality_2026_10.sql); excluded from reports.
+    IsAutomated   BIT              NOT NULL CONSTRAINT DF_WV_IsAutomated DEFAULT 0,
+    -- Which website sent the page view: 'doctordekho' | 'nexeagle' (NULL = before 2026-10, unknown).
+    Site          NVARCHAR(20)     NULL,
 
     CONSTRAINT PK_WebsiteVisits PRIMARY KEY CLUSTERED (VisitId)
   );
 
   CREATE INDEX IX_WebsiteVisits_VisitedAt ON dbo.WebsiteVisits (VisitedAt);
   CREATE INDEX IX_WebsiteVisits_SessionId ON dbo.WebsiteVisits (SessionId);
+  -- IX_WebsiteVisits_IsAutomated_VisitedAt is created by migrations/tracking_traffic_quality_2026_10.sql, not
+  -- here: this batch re-runs every deploy and SQL Server compiles it whole, so on a pre-2026-10 table (no
+  -- IsAutomated / Site yet) an index on those columns fails with Msg 207 even inside this skipped IF.
 END
 GO
 
@@ -7310,10 +8409,10 @@ GO
 -- exist by the time it runs.
 --
 -- Each ADD CONSTRAINT block is guarded by a sys.foreign_keys lookup so the
--- whole script is idempotent â€” safe to re-run on any environment.
+-- whole script is idempotent — safe to re-run on any environment.
 -- ============================================================================
 
--- ConsentRecord â†’ Admission
+-- ConsentRecord → Admission
 IF OBJECT_ID('dbo.ConsentRecord','U') IS NOT NULL
    AND OBJECT_ID('dbo.Admission','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_CR_Admission')
@@ -7324,7 +8423,7 @@ BEGIN
 END
 GO
 
--- DischargeSummary â†’ Admission
+-- DischargeSummary → Admission
 IF OBJECT_ID('dbo.DischargeSummary','U') IS NOT NULL
    AND OBJECT_ID('dbo.Admission','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_DS_Admission')
@@ -7335,7 +8434,7 @@ BEGIN
 END
 GO
 
--- FluidEntry â†’ Admission
+-- FluidEntry → Admission
 IF OBJECT_ID('dbo.FluidEntry','U') IS NOT NULL
    AND OBJECT_ID('dbo.Admission','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_FE_Admission')
@@ -7346,7 +8445,7 @@ BEGIN
 END
 GO
 
--- GlucoseReading â†’ Admission
+-- GlucoseReading → Admission
 IF OBJECT_ID('dbo.GlucoseReading','U') IS NOT NULL
    AND OBJECT_ID('dbo.Admission','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_GR_Admission')
@@ -7357,7 +8456,7 @@ BEGIN
 END
 GO
 
--- InstrumentSetMovement â†’ SurgeryCase (create_tables_cssd.sql sorts before create_tables_ot.sql)
+-- InstrumentSetMovement → SurgeryCase (create_tables_cssd.sql sorts before create_tables_ot.sql)
 IF OBJECT_ID('dbo.InstrumentSetMovement','U') IS NOT NULL
    AND OBJECT_ID('dbo.SurgeryCase','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_ISM_SurgeryCase')
@@ -7372,7 +8471,7 @@ GO
 -- sort AFTER create_tables_inventory_batch.sql/_compliance.sql/_procurement.sql alphabetically, so every
 -- FK from those earlier files to Store/Vendor is deferred here instead of inline.
 
--- Batch â†’ Store
+-- Batch → Store
 IF OBJECT_ID('dbo.Batch','U') IS NOT NULL
    AND OBJECT_ID('dbo.Store','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_BATCH_Store')
@@ -7383,7 +8482,7 @@ BEGIN
 END
 GO
 
--- StockLevel â†’ Store
+-- StockLevel → Store
 IF OBJECT_ID('dbo.StockLevel','U') IS NOT NULL
    AND OBJECT_ID('dbo.Store','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_SL_Store')
@@ -7394,7 +8493,7 @@ BEGIN
 END
 GO
 
--- NarcoticRegisterEntry â†’ Store
+-- NarcoticRegisterEntry → Store
 IF OBJECT_ID('dbo.NarcoticRegisterEntry','U') IS NOT NULL
    AND OBJECT_ID('dbo.Store','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_NRE_Store')
@@ -7405,7 +8504,7 @@ BEGIN
 END
 GO
 
--- ColdChainTempLog â†’ Store
+-- ColdChainTempLog → Store
 IF OBJECT_ID('dbo.ColdChainTempLog','U') IS NOT NULL
    AND OBJECT_ID('dbo.Store','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_CCTL_Store')
@@ -7416,7 +8515,7 @@ BEGIN
 END
 GO
 
--- Indent â†’ Store
+-- Indent → Store
 IF OBJECT_ID('dbo.Indent','U') IS NOT NULL
    AND OBJECT_ID('dbo.Store','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_IND_Store')
@@ -7427,7 +8526,7 @@ BEGIN
 END
 GO
 
--- PurchaseOrder â†’ Vendor
+-- PurchaseOrder → Vendor
 IF OBJECT_ID('dbo.PurchaseOrder','U') IS NOT NULL
    AND OBJECT_ID('dbo.Vendor','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_PO_Vendor')
@@ -7438,7 +8537,7 @@ BEGIN
 END
 GO
 
--- GoodsReceiptNote â†’ Vendor
+-- GoodsReceiptNote → Vendor
 IF OBJECT_ID('dbo.GoodsReceiptNote','U') IS NOT NULL
    AND OBJECT_ID('dbo.Vendor','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_GRN_Vendor')
@@ -7449,7 +8548,7 @@ BEGIN
 END
 GO
 
--- GoodsReceiptNote â†’ Store
+-- GoodsReceiptNote → Store
 IF OBJECT_ID('dbo.GoodsReceiptNote','U') IS NOT NULL
    AND OBJECT_ID('dbo.Store','U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_GRN_Store')
@@ -7560,6 +8659,60 @@ GO
  G O 
   
  
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_zz_hr_biometric_foreign_keys.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- HR biometric Foreign Keys (Deferred). Separate file from create_tables_zz_hr_foreign_keys.sql so the
+-- already-deployed script is left untouched; sorts after it. Each block is guarded and idempotent.
+
+-- HrBiometricDevice -> Hospital
+IF OBJECT_ID('dbo.HrBiometricDevices','U') IS NOT NULL
+   AND OBJECT_ID('dbo.Hospital','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrBiometricDevice_Hospital')
+BEGIN
+  ALTER TABLE dbo.HrBiometricDevices
+    ADD CONSTRAINT FK_HrBiometricDevice_Hospital FOREIGN KEY (HospitalId)
+    REFERENCES dbo.Hospital(HospitalId);
+END
+GO
+
+-- HrEmployeeDeviceUser -> HrEmployee
+IF OBJECT_ID('dbo.HrEmployeeDeviceUsers','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrEmployeeDeviceUser_Employee')
+BEGIN
+  ALTER TABLE dbo.HrEmployeeDeviceUsers
+    ADD CONSTRAINT FK_HrEmployeeDeviceUser_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
+
+-- HrBiometricPunch -> HrBiometricDevice
+IF OBJECT_ID('dbo.HrBiometricPunches','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrBiometricDevices','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrBiometricPunch_Device')
+BEGIN
+  ALTER TABLE dbo.HrBiometricPunches
+    ADD CONSTRAINT FK_HrBiometricPunch_Device FOREIGN KEY (HrBiometricDeviceId)
+    REFERENCES dbo.HrBiometricDevices(HrBiometricDeviceId);
+END
+GO
+
+-- HrBiometricPunch -> HrEmployee (nullable: NULL = PIN not mapped yet)
+IF OBJECT_ID('dbo.HrBiometricPunches','U') IS NOT NULL
+   AND OBJECT_ID('dbo.HrEmployees','U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HrBiometricPunch_Employee')
+BEGIN
+  ALTER TABLE dbo.HrBiometricPunches
+    ADD CONSTRAINT FK_HrBiometricPunch_Employee FOREIGN KEY (HrEmployeeId)
+    REFERENCES dbo.HrEmployees(HrEmployeeId);
+END
+GO
 
 GO
 
@@ -7838,6 +8991,131 @@ GO
 -- #####################################################################
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/agent_monitoring_2026_10.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- AI Agents dashboard (CMS) and the router's human-approved learning loop (2026-10-19).
+-- Written by NexeagleCMSAPI (AgentMonitorController ingest endpoints, fed by 1HMS-NLP-Router's
+-- hms_router/telemetry.py); read by the CMS "AI Agents" tab. Run BEFORE deploying the matching
+-- NexeagleCMSAPI. Idempotent.
+--
+--   AgentDecisions       one row per agent decision (/route-symptom or /chat). No patient text except
+--                        ReviewText, kept only for outcomes a person has to look at (no match, clarify,
+--                        low confidence, emergency). Rows older than 365 days are deleted by the CMS API.
+--   AgentLearningItems   the review queue: mistakes and doubtful answers. An admin approves the correct
+--                        specialty (the phrase is then added to SymptomTrainingExamples) or rejects it.
+--                        ModelVersionLearned is set once a promoted model was trained with it.
+--   AgentModelVersions   every rebuild of the route model: validation metrics, promoted or not, and why.
+
+IF OBJECT_ID('dbo.AgentDecisions','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AgentDecisions
+  (
+    DecisionId       UNIQUEIDENTIFIER NOT NULL,
+    OccurredAt       DATETIME2(3)     NOT NULL,
+    Agent            NVARCHAR(20)     NOT NULL,           -- route | chat
+    Caller           NVARCHAR(50)     NULL,               -- API client name: doctordekho, whatsapp, voicerx...
+    RequestId        NVARCHAR(64)     NULL,
+    Decision         NVARCHAR(20)     NOT NULL,           -- answer | clarify | abstain | emergency | follow_up | recommendation
+    RouteDecision    NVARCHAR(20)     NULL,
+    TopSpecialtyId   NVARCHAR(60)     NULL,
+    TopSpecialist    NVARCHAR(100)    NULL,               -- chat agent: specialist label
+    CandidateIds     NVARCHAR(400)    NULL,               -- comma-separated
+    Confidence       FLOAT            NULL,
+    MatchScore       FLOAT            NULL,
+    IsEmergency      BIT              NOT NULL CONSTRAINT DF_AD_IsEmergency DEFAULT 0,
+    EmergencySource  NVARCHAR(20)     NULL,
+    ClarifyKind      NVARCHAR(30)     NULL,
+    NoMatch          BIT              NOT NULL CONSTRAINT DF_AD_NoMatch DEFAULT 0,
+    Method           NVARCHAR(40)     NULL,
+    UsedReasoner     BIT              NOT NULL CONSTRAINT DF_AD_UsedReasoner DEFAULT 0,
+    LatencyMs        FLOAT            NULL,
+    ModelVersion     NVARCHAR(60)     NULL,
+    QueryLength      INT              NULL,
+    QueryHash        NVARCHAR(64)     NULL,
+    SessionRef       NVARCHAR(64)     NULL,
+    Turn             INT              NULL,
+    Degraded         NVARCHAR(200)    NULL,
+    ReviewText       NVARCHAR(300)    NULL,
+    Notes            NVARCHAR(400)    NULL,
+    ReceivedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_AD_ReceivedAt DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_AgentDecisions PRIMARY KEY CLUSTERED (DecisionId)
+  );
+  CREATE INDEX IX_AgentDecisions_OccurredAt ON dbo.AgentDecisions (OccurredAt)
+    INCLUDE (Agent, Caller, Decision, TopSpecialtyId, Confidence, IsEmergency, NoMatch, UsedReasoner, LatencyMs, ModelVersion);
+  CREATE INDEX IX_AgentDecisions_QueryHash ON dbo.AgentDecisions (QueryHash);
+END
+GO
+
+IF OBJECT_ID('dbo.AgentLearningItems','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AgentLearningItems
+  (
+    ItemId               UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ALI_Id DEFAULT NEWSEQUENTIALID(),
+    CreatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_ALI_CreatedAt DEFAULT SYSUTCDATETIME(),
+    LastSeenAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_ALI_LastSeenAt DEFAULT SYSUTCDATETIME(),
+    Occurrences          INT              NOT NULL CONSTRAINT DF_ALI_Occurrences DEFAULT 1,
+    -- booking_correction | no_match | low_confidence | clarify | emergency_check | user_feedback
+    Source               NVARCHAR(30)     NOT NULL,
+    Agent                NVARCHAR(20)     NOT NULL,
+    QueryText            NVARCHAR(500)    NOT NULL,
+    QueryHash            NVARCHAR(64)     NOT NULL,
+    PredictedSpecialtyId NVARCHAR(60)     NULL,
+    ActualSpecialtyId    NVARCHAR(60)     NULL,           -- what the patient booked / said was right
+    Confidence           FLOAT            NULL,
+    ModelVersion         NVARCHAR(60)     NULL,
+    Status               NVARCHAR(20)     NOT NULL CONSTRAINT DF_ALI_Status DEFAULT 'pending', -- pending | approved | rejected
+    ApprovedSpecialtyId  NVARCHAR(60)     NULL,
+    ReviewNote           NVARCHAR(400)    NULL,
+    ReviewedBy           NVARCHAR(200)    NULL,
+    ReviewedAt           DATETIME2(3)     NULL,
+    TrainingExampleId    UNIQUEIDENTIFIER NULL,           -- SymptomTrainingExamples.Id created on approval
+    ModelVersionLearned  NVARCHAR(60)     NULL,
+    LearnedAt            DATETIME2(3)     NULL,
+    CONSTRAINT PK_AgentLearningItems PRIMARY KEY CLUSTERED (ItemId)
+  );
+  CREATE INDEX IX_AgentLearningItems_Status ON dbo.AgentLearningItems (Status, LastSeenAt);
+  CREATE INDEX IX_AgentLearningItems_Hash ON dbo.AgentLearningItems (QueryHash, Source);
+  CREATE INDEX IX_AgentLearningItems_TrainingExample ON dbo.AgentLearningItems (TrainingExampleId) WHERE TrainingExampleId IS NOT NULL;
+END
+GO
+
+IF OBJECT_ID('dbo.AgentModelVersions','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AgentModelVersions
+  (
+    Id                 UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_AMV_Id DEFAULT NEWSEQUENTIALID(),
+    ModelVersion       NVARCHAR(60)     NULL,             -- NULL when the rebuild failed
+    PreviousVersion    NVARCHAR(60)     NULL,
+    BuiltAt            DATETIME2(3)     NOT NULL,
+    TriggerReason      NVARCHAR(30)     NULL,             -- manual | deploy
+    Promoted           BIT              NOT NULL,
+    Verdict            NVARCHAR(1000)   NULL,
+    TrainingRows       INT              NULL,
+    CmsRows            INT              NULL,
+    LearnedItems       INT              NULL,             -- approved review items first included in this version
+    ValidationRows     INT              NULL,
+    Top1               FLOAT            NULL,
+    Top3               FLOAT            NULL,
+    Answered           FLOAT            NULL,
+    AnsweredAccuracy   FLOAT            NULL,
+    ConfidentlyWrong   FLOAT            NULL,
+    Abstain            FLOAT            NULL,
+    Clarify            FLOAT            NULL,
+    EmergencyFlagRate  FLOAT            NULL,
+    PrevTop1           FLOAT            NULL,
+    PrevConfidentlyWrong FLOAT          NULL,
+    DetailsJson        NVARCHAR(MAX)    NULL,
+    CONSTRAINT PK_AgentModelVersions PRIMARY KEY CLUSTERED (Id)
+  );
+  CREATE INDEX IX_AgentModelVersions_BuiltAt ON dbo.AgentModelVersions (BuiltAt);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_admission_add_token.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -7862,7 +9140,7 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Snapshot of the OT Plan picked at admit time (if any) â€” kept as plain nullable columns, not an
+-- Snapshot of the OT Plan picked at admit time (if any) — kept as plain nullable columns, not an
 -- enforced FK to OTPlan, so this migration doesn't need to run after create_ot_plans_table.sql.
 -- ProcedureName/SuggestedIcuLevel are frozen at admit time (not a live join) so editing or
 -- retiring the plan later never changes what an already-admitted patient's record shows.
@@ -7887,7 +9165,7 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Snapshot of the Package Type picked at admit time (if any) â€” kept as plain nullable columns,
+-- Snapshot of the Package Type picked at admit time (if any) — kept as plain nullable columns,
 -- not an enforced FK to PackageType, so this migration doesn't need to run after
 -- create_package_types_table.sql. Name is frozen at admit time (not a live join) so editing or
 -- retiring the package type later never changes what an already-admitted patient's record shows.
@@ -7910,7 +9188,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Admission phase (admission-flow spec).
--- Structured "referred/transferred in from an outside facility" capture â€” distinct from the
+-- Structured "referred/transferred in from an outside facility" capture — distinct from the
 -- existing ReferralSource/ReferralName/ReferredByReferrerId, which track referral COMMISSION
 -- (the Referrer entity), not which PHC/nursing home/hospital physically sent the patient in.
 -- Needed for PM-JAY referral rules and the hospital's own referral-network analytics. Idempotent.
@@ -7969,9 +9247,9 @@ GO
 -- Pre-auth enhancement tracking: when utilization approaches the sanctioned amount, the
 -- billing desk requests a higher sanction from the insurer/TPA and later records approval.
 -- EnhancedSanctionedAmount holds the PROPOSED new total sanctioned amount (not an incremental
--- add-on) â€” it only becomes the effective sanctioned amount once EnhancementApprovedAt is set;
+-- add-on) — it only becomes the effective sanctioned amount once EnhancementApprovedAt is set;
 -- until then, utilization still compares against the original SanctionedAmount. Manual internal
--- tracking only, same as the IRDAI clocks above â€” no real insurer/TPA API submission (no sandbox
+-- tracking only, same as the IRDAI clocks above — no real insurer/TPA API submission (no sandbox
 -- access).
 
 IF COL_LENGTH('dbo.AdmissionCoverage','EnhancementRequestedAt') IS NULL
@@ -8004,10 +9282,10 @@ GO
 -- Billing phase (revenue engine).
 -- Captures the payer's entitled room category at admission, so the TPA split can compute the
 -- room-rent "proportionate deduction" the IRDAI split requires: if the patient occupies a room
--- above their entitlement, only the entitled-tier rate stays payable by the insurer â€” the
+-- above their entitlement, only the entitled-tier rate stays payable by the insurer — the
 -- differential becomes the patient's own non-payable liability. Free-text matching
 -- BedMaster.WardType's own convention (soft-validated via IpdConstants.WardType, no CHECK
--- constraint â€” same posture as WardType itself).
+-- constraint — same posture as WardType itself).
 
 IF COL_LENGTH('dbo.AdmissionCoverage','EntitledRoomCategory') IS NULL
   ALTER TABLE dbo.AdmissionCoverage ADD EntitledRoomCategory NVARCHAR(20) NULL;
@@ -8023,10 +9301,10 @@ GO
 -- Discharge phase.
 -- IRDAI discharge-process clock milestones not already captured elsewhere: final bill/discharge
 -- summary submitted to the insurer, and the insurer's response received. The other two milestones
--- (discharge decision, physical discharge) are already computed from AdmissionStatusHistory â€” no
+-- (discharge decision, physical discharge) are already computed from AdmissionStatusHistory — no
 -- schema change needed for those. Kept as separate timestamp pairs, not folded into
 -- AdmissionCoverage.StatusCode, since that column already carries the pre-auth sanction workflow
--- (PENDING/APPROVED/QUERIED/REJECTED/ENHANCED) â€” a different process from final-claim submission.
+-- (PENDING/APPROVED/QUERIED/REJECTED/ENHANCED) — a different process from final-claim submission.
 
 IF COL_LENGTH('dbo.AdmissionCoverage','ClaimSubmittedAt') IS NULL
   ALTER TABLE dbo.AdmissionCoverage ADD ClaimSubmittedAt DATETIME2(3) NULL;
@@ -8053,7 +9331,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Day-wise billing was reworked from admission-anchored to VISIT-anchored (no admission required).
 -- AdmissionDayBill.AdmissionId is now optional. This makes the column nullable on already-deployed
--- databases (the CREATE TABLE script only helps fresh deploys). Idempotent â€” only alters when the
+-- databases (the CREATE TABLE script only helps fresh deploys). Idempotent — only alters when the
 -- column currently exists and is NOT NULL.
 IF EXISTS (
     SELECT 1 FROM sys.columns
@@ -8135,7 +9413,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- =============================================================================
 -- Migration: Appointment booked-by-mobile
--- Description: Adds Appointments.BookedByMobile â€” the OTP-verified patient-session
+-- Description: Adds Appointments.BookedByMobile — the OTP-verified patient-session
 --              mobile number active at the moment a NexEagle public booking was made,
 --              NULL when the visitor was a guest (no verified session at booking time).
 --              Distinct from the appointment's own contact mobile (PatientRegistration.Mobile),
@@ -8160,7 +9438,7 @@ GO
 -- =============================================================================
 -- Migration: Public booking source metadata
 -- Description: Adds Appointments.BookingIpAddress / BookingReferrerUrl / BookingUtmCampaign
---              â€” captured only for public (Nexeagle) bookings, for later abuse-tracking and
+--              — captured only for public (Nexeagle) bookings, for later abuse-tracking and
 --              marketing-attribution analysis (which page/campaign drove the booking).
 --              Guarded ALTER on the already-deployed Appointments table.
 -- =============================================================================
@@ -8208,7 +9486,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- =============================================================================
 -- Migration: Appointment cancellation audit trail
--- Description: CancelAppointmentHandler had no reason/actor tracking â€” just a
+-- Description: CancelAppointmentHandler had no reason/actor tracking — just a
 --              generic status flip. Adds a free-text reason plus who/when
 --              cancelled, matching the same audit shape used elsewhere.
 -- =============================================================================
@@ -8223,6 +9501,34 @@ BEGIN
 
     IF COL_LENGTH('dbo.Appointments', 'CancelledBy') IS NULL
         ALTER TABLE dbo.Appointments ADD CancelledBy NVARCHAR(500) NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_appointments_hospital_seen.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Appointment "seen by hospital"
+-- Description: Adds Appointments.HospitalSeenAt (UTC) and HospitalSeenByUserId —
+--              the first moment hospital staff saw or acted on an appointment request
+--              (acknowledged the online-booking alert, opened the request, confirmed,
+--              changed status, rescheduled or cancelled), and who, when known.
+--              Set once by the API, never cleared. The Doctor Dekho app shows it as the
+--              "Hospital has seen it" step. NULL = nobody at the hospital has opened it yet.
+--              Guarded ALTER on the already-deployed Appointments table.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.Appointments', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Appointments', 'HospitalSeenAt') IS NULL
+        ALTER TABLE dbo.Appointments ADD HospitalSeenAt DATETIME2(3) NULL;
+
+    IF COL_LENGTH('dbo.Appointments', 'HospitalSeenByUserId') IS NULL
+        ALTER TABLE dbo.Appointments ADD HospitalSeenByUserId UNIQUEIDENTIFIER NULL;
 END
 GO
 
@@ -8316,7 +9622,7 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Links each bed to the Room master row it belongs to. Nullable â€” beds created the old way
+-- Links each bed to the Room master row it belongs to. Nullable — beds created the old way
 -- (free-text RoomCode only, no Room master row) keep working unchanged.
 
 IF COL_LENGTH('dbo.BedMaster','RoomId') IS NULL
@@ -8346,7 +9652,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Billing phase.
 -- Best-effort treating-doctor attribution for consultant incentive accrual. Populated by the
--- caller (CPOE: ClinicalOrder.OrderedByDoctorId; OT: SurgeryCase.SurgeonDoctorId) when known â€”
+-- caller (CPOE: ClinicalOrder.OrderedByDoctorId; OT: SurgeryCase.SurgeonDoctorId) when known —
 -- left NULL otherwise, same soft-link convention as ClinicalOrder.OrderedByDoctorId (no FK).
 
 IF COL_LENGTH('dbo.BillingChargeEvent','AttributedDoctorId') IS NULL
@@ -8364,7 +9670,7 @@ GO
 -- BillingChargeEvent never stored a link back to ChargeMaster (AddChargeEventHandler already
 -- receives ChargeDetail.ChargeId per line but silently drops it before persisting). Needed so the
 -- TPA payable/non-payable split can join an admission's full charge history to
--- ChargeMaster.IsIRDAIPayable. Nullable â€” pre-existing rows have no reliable backfill path and
+-- ChargeMaster.IsIRDAIPayable. Nullable — pre-existing rows have no reliable backfill path and
 -- surface as "Unclassified" in the split query rather than being guessed at.
 
 IF COL_LENGTH('dbo.BillingChargeEvent','ChargeId') IS NULL
@@ -8396,7 +9702,7 @@ GO
 -- The offline sync engine's outbox replay already sends an Idempotency-Key header on every
 -- retried write (syncEngine.ts), but AddChargeEventHandler never read or stored it, so a
 -- retried "add-event" call (e.g. after a dropped response on a flaky connection) silently
--- posted the same charges twice. Nullable â€” only calls made through the offline outbox carry
+-- posted the same charges twice. Nullable — only calls made through the offline outbox carry
 -- a key; direct/online calls stay null and are never treated as duplicates of each other.
 
 IF COL_LENGTH('dbo.BillingChargeEvent','IdempotencyKey') IS NULL
@@ -8408,6 +9714,38 @@ BEGIN
   CREATE UNIQUE INDEX UQ_BCE_Hospital_IdempotencyKey
   ON dbo.BillingChargeEvent(HospitalId, IdempotencyKey)
   WHERE IdempotencyKey IS NOT NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_billingpolicy_add_pharmacy_max_discount.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: BillingPolicy.PharmacyMaxDiscountPercent
+-- Description: The pharmacy POS used to post whatever rate and discount % the browser sent.
+--              Pricing is now server-side (batch MRP, else the Charge Master default rate) and
+--              the discount a cashier may give is capped: ChargeMaster.MaxDiscountPercent when the
+--              charge has one, otherwise this hospital-wide pharmacy default (20 %).
+--              Scoped to the pharmacy counter on purpose -- the hospital-wide billing discount cap
+--              (MaxAutoDiscountPercent) stays removed.
+-- Idempotent: guarded by COL_LENGTH. Deploy this BEFORE the API build that maps the column.
+-- =============================================================================
+IF COL_LENGTH('dbo.BillingPolicy', 'PharmacyMaxDiscountPercent') IS NULL
+BEGIN
+    ALTER TABLE dbo.BillingPolicy
+        ADD PharmacyMaxDiscountPercent DECIMAL(5,2) NOT NULL
+            CONSTRAINT DF_BillingPolicy_PharmacyMaxDiscountPercent DEFAULT (20);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_BillingPolicy_PharmacyMaxDiscountPercent' AND parent_object_id = OBJECT_ID('dbo.BillingPolicy'))
+BEGIN
+    ALTER TABLE dbo.BillingPolicy
+        ADD CONSTRAINT CK_BillingPolicy_PharmacyMaxDiscountPercent CHECK (PharmacyMaxDiscountPercent >= 0 AND PharmacyMaxDiscountPercent <= 100);
 END
 GO
 
@@ -8426,7 +9764,7 @@ GO
 -- Idempotent: guarded by COL_LENGTH. Each column's DEFAULT constraint is found by
 -- dynamic lookup (names can differ per database) and dropped before the column.
 
--- â”€â”€â”€ RequirePostBeforeInvoice â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ─── RequirePostBeforeInvoice ────────────────────────────────────────────────
 IF COL_LENGTH('dbo.BillingPolicy', 'RequirePostBeforeInvoice') IS NOT NULL
 BEGIN
     DECLARE @df_post sysname;
@@ -8439,7 +9777,7 @@ BEGIN
 END
 GO
 
--- â”€â”€â”€ MaxAutoDiscountPercent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ─── MaxAutoDiscountPercent ──────────────────────────────────────────────────
 IF COL_LENGTH('dbo.BillingPolicy', 'MaxAutoDiscountPercent') IS NOT NULL
 BEGIN
     DECLARE @df_disc sysname;
@@ -8460,7 +9798,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Inventory Management (INV-10): unify Blood Bank under the Store model. Adds a nullable StoreId
--- FK ALONGSIDE (not replacing) the existing free-text StorageLocation â€” crossmatch/reservation/
+-- FK ALONGSIDE (not replacing) the existing free-text StorageLocation — crossmatch/reservation/
 -- transfusion business logic is untouched; this only gives BloodBag a real location reference so
 -- it can participate in the unified stock-visibility view.
 
@@ -8482,7 +9820,7 @@ END
 GO
 
 -- Backfill: one Store (StoreType='BLOOD_BANK') per hospital per distinct legacy StorageLocation
--- string, then point matching bags at it by name. Idempotent â€” guarded by StoreCode uniqueness and
+-- string, then point matching bags at it by name. Idempotent — guarded by StoreCode uniqueness and
 -- only touches bags that don't already have a StoreId.
 INSERT INTO dbo.Store (StoreId, HospitalId, StoreCode, StoreName, StoreType, IsActive, CreatedAt, UpdatedAt)
 SELECT NEWID(), loc.HospitalId, N'BB-' + CONVERT(NVARCHAR(20), ROW_NUMBER() OVER (PARTITION BY loc.HospitalId ORDER BY loc.StorageLocation)),
@@ -8513,7 +9851,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Discharge phase.
 -- Per-item IRDAI payable/non-payable classification (real TPA claim forms carry a "Non-Payable
--- Items" annexure â€” IRDAI List I/II/III/IV concept). Hospital-configurable, default payable.
+-- Items" annexure — IRDAI List I/II/III/IV concept). Hospital-configurable, default payable.
 IF COL_LENGTH('dbo.ChargeMaster','IsIRDAIPayable') IS NULL
   ALTER TABLE dbo.ChargeMaster ADD IsIRDAIPayable BIT NOT NULL
     CONSTRAINT DF_CM_IRDAIPayable DEFAULT (1);
@@ -8526,7 +9864,7 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Phase 4 Â· MAR closed loop
+-- Phase 4 · MAR closed loop
 -- High-alert medication flag (insulin, heparin, opioids, KCl, chemo, ...), settable at order
 -- time by the ordering/verifying clinician. Drives the mandatory second-nurse witness at
 -- administration. A boolean flag rather than drug-name matching, since matching against the
@@ -8581,7 +9919,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Deleting a billing charge or payment now routes through the same admin-approval gate as
--- advances/refunds/discounts, with a required reason â€” instead of removing the line immediately.
+-- advances/refunds/discounts, with a required reason — instead of removing the line immediately.
 -- TargetEventId carries which ChargeEventId/PaymentId the approval is actually about (CreditApproval
 -- otherwise only ever referenced a whole encounter, never one specific line within it).
 
@@ -8609,7 +9947,7 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Widen CreditApproval.PaymentType to also allow 'DISCOUNT' â€” a retroactive discount that would
+-- Widen CreditApproval.PaymentType to also allow 'DISCOUNT' — a retroactive discount that would
 -- reduce an invoice below amount already collected now routes through the same admin-approval
 -- gate as an over-crediting ADVANCE/REFUND, instead of applying silently.
 IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_CA_PaymentType')
@@ -8632,9 +9970,9 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- =============================================================================
--- Migration: DischargeSummary â€” add Final Diagnosis ICD-10 code capture
+-- Migration: DischargeSummary — add Final Diagnosis ICD-10 code capture
 -- Description: A separate, optional code+description pair alongside the existing
---              free-text FinalDiagnosis â€” the coded value used for billing/TPA/
+--              free-text FinalDiagnosis — the coded value used for billing/TPA/
 --              PM-JAY claims and reporting, distinct from the clinician's free-text
 --              wording. Sourced from the new ICD10 LookupMaster list (WHO ICD-10),
 --              picked via a dedicated search UI, not inferred from the free text.
@@ -8662,12 +10000,12 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- =============================================================================
--- Migration: DischargeSummary â€” public "view anytime on mobile" support
+-- Migration: DischargeSummary — public "view anytime on mobile" support
 -- Description: PdfBlobKey is the STABLE object-key prefix used to re-sign a fresh
---              presigned URL on every view (S3 presigned URLs cap at 7 days â€” see
+--              presigned URL on every view (S3 presigned URLs cap at 7 days — see
 --              IBlobStorageService.RefreshUrlAsync), never a raw URL, which would go
 --              stale. AccessToken is a long random opaque string (not the AdmissionId)
---              â€” the QR code / "view on mobile" link encodes this token, letting
+--              — the QR code / "view on mobile" link encodes this token, letting
 --              anyone with the link view the PDF without logging in, while remaining
 --              unguessable/unenumerable.
 -- =============================================================================
@@ -8709,7 +10047,7 @@ GO
 -- Discharge phase.
 -- DischargeSummary was scaffolded (2026-05-26) with EncounterId NOT NULL, same batch/bug as
 -- VitalReading/FluidEntry/GlucoseReading/NursingAssessment/RoundNote/ConsentRecord (fixed in the
--- Nursing Documentation phase). Admission.EncounterId is nullable when EnableIpdBilling=false â€”
+-- Nursing Documentation phase). Admission.EncounterId is nullable when EnableIpdBilling=false —
 -- a billing-disabled admission must still be dischargeable. Relax to nullable, guarded.
 
 IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.DischargeSummary') AND name = 'EncounterId' AND is_nullable = 0)
@@ -8755,11 +10093,11 @@ GO
 -- Migration: Doctor Dekho CMS marketing controls
 -- Description: Adds Doctors.DiscountPercent/DiscountStartAt/DiscountEndAt (a scheduled
 --              consultation-fee discount, active only when DiscountPercent > 0 and the
---              current time falls within the start/end window â€” computed at read time,
+--              current time falls within the start/end window — computed at read time,
 --              never stored as a separate bool so it can't drift out of sync with the
 --              dates), Doctors.IsFeatured (top-of-listing placement on Doctor Dekho), and
 --              Doctors.IsDelistedByAdmin (a platform-level override, deliberately SEPARATE
---              from the existing hospital-owned Doctors.IsPubliclyListed flag â€” CMS delisting
+--              from the existing hospital-owned Doctors.IsPubliclyListed flag — CMS delisting
 --              a doctor must not be silently undone by the hospital's own admin toggling
 --              IsPubliclyListed back on, and vice versa). All CMS-controlled via CMSAPI's
 --              direct connection to this database. Guarded ALTER on the already-deployed
@@ -8805,7 +10143,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- =============================================================================
 -- Migration: Manual "online now" presence toggle for doctors
--- Description: Adds Doctors.IsOnlineNow â€” off by default. A simple, self-reported flag a
+-- Description: Adds Doctors.IsOnlineNow — off by default. A simple, self-reported flag a
 --              doctor (or staff on their behalf) flips manually, separate from the
 --              schedule-derived "available today" status (see DoctorAvailabilityResolver).
 --              Guarded ALTER on the already-deployed Doctors table.
@@ -8827,7 +10165,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- =============================================================================
 -- Migration: Per-doctor public directory opt-in
--- Description: Adds Doctors.IsPubliclyListed â€” off by default. A doctor only appears
+-- Description: Adds Doctors.IsPubliclyListed — off by default. A doctor only appears
 --              in the platform-wide public directory when BOTH their hospital has
 --              opted in (Hospitals.IsPubliclyListed) AND the hospital admin has
 --              explicitly listed this specific doctor. Lets a hospital that's opted
@@ -8853,7 +10191,7 @@ GO
 -- Migration: Doctor public-profile fields (languages, public contact)
 -- Description: Adds Doctors.LanguagesJson (JSON array of spoken languages, following
 --              the same ISJSON()-checked pattern as Appointments.StatusHistoryJson) and
---              Doctors.PublicContactEmail/PublicContactPhone â€” deliberately separate
+--              Doctors.PublicContactEmail/PublicContactPhone — deliberately separate
 --              from Users.Email/Users.MobileNumber, which are login/OTP credentials,
 --              not meant for public display on the doctor directory. All nullable,
 --              admin-optional. Guarded ALTER on the already-deployed Doctors table.
@@ -8883,11 +10221,11 @@ GO
 -- =============================================================================
 -- Migration: Doctor Dekho registration verification
 -- Description: Adds Doctors.IsRegistrationVerified/RegistrationVerifiedAt/
---              RegistrationVerifiedByUserId â€” a CMS-only-controlled flag an admin sets after
+--              RegistrationVerifiedByUserId — a CMS-only-controlled flag an admin sets after
 --              manually confirming a doctor's LicenseNumber/MedicalCouncil/RegistrationYear
 --              against the NMC's Indian Medical Register (no automated verification API exists
---              in India â€” see CMS's "Verify on NMC Register" button, DoctorDetailModal.tsx).
---              RegistrationVerifiedByUserId is the acting CMS admin's own account id â€” a plain
+--              in India — see CMS's "Verify on NMC Register" button, DoctorDetailModal.tsx).
+--              RegistrationVerifiedByUserId is the acting CMS admin's own account id — a plain
 --              audit-trail GUID with no FK, same convention as other CreatedByUserId-style
 --              columns, since CMS staff accounts aren't rows in this database's dbo.Users.
 --              Timestamp/verifier are set only when IsRegistrationVerified transitions to true,
@@ -8926,34 +10264,6 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/alter_hospital_subscriptions_add_payment.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- Migration: Alter HospitalSubscriptions Table (Add Payment Fields)
--- Description: Adds PaymentAmount, PaymentReference, and PaymentDate for payment tracking
-
-IF NOT EXISTS (
-    SELECT * FROM sys.columns 
-    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptions]') AND name = 'PaymentAmount'
-)
-BEGIN
-    ALTER TABLE [dbo].[HospitalSubscriptions]
-    ADD PaymentAmount DECIMAL(18,2) NULL,
-        PaymentReference NVARCHAR(100) NULL,
-        PaymentDate DATETIME2(3) NULL;
-    
-    PRINT 'Added payment fields to HospitalSubscriptions table';
-END
-ELSE
-BEGIN
-    PRINT 'Payment fields already exist in HospitalSubscriptions table';
-END
-GO
-
-GO
-
--- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/alter_hospital_subscriptions_add_payment_mode.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -8976,6 +10286,34 @@ END
 ELSE
 BEGIN
     PRINT 'PaymentMode field already exists in HospitalSubscriptions table';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hospital_subscriptions_add_payment.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter HospitalSubscriptions Table (Add Payment Fields)
+-- Description: Adds PaymentAmount, PaymentReference, and PaymentDate for payment tracking
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns 
+    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptions]') AND name = 'PaymentAmount'
+)
+BEGIN
+    ALTER TABLE [dbo].[HospitalSubscriptions]
+    ADD PaymentAmount DECIMAL(18,2) NULL,
+        PaymentReference NVARCHAR(100) NULL,
+        PaymentDate DATETIME2(3) NULL;
+    
+    PRINT 'Added payment fields to HospitalSubscriptions table';
+END
+ELSE
+BEGIN
+    PRINT 'Payment fields already exist in HospitalSubscriptions table';
 END
 GO
 
@@ -9147,7 +10485,7 @@ GO
 -- Migration: Hospital GPS coordinates
 -- Description: Adds Hospitals.Latitude/Longitude (nullable) so the public doctor
 --              directory can offer a "get directions" link for every doctor publicly
---              listed at that hospital. Lives on the hospital, not the doctor â€” a
+--              listed at that hospital. Lives on the hospital, not the doctor — a
 --              doctor doesn't have their own address, they practice at a hospital
 --              that already carries City/State/Pincode. Guarded ALTER on the
 --              already-deployed Hospitals table.
@@ -9209,7 +10547,7 @@ GO
 -- Migration: Hospital archiving (soft-delete)
 -- Description: Adds Hospitals.IsArchived/ArchivedAt/ArchivedByUserId. Distinct from the
 --              existing IsActive column, which CMS's admin hospital list already uses to mean
---              "still pending onboarding" (Status = IsActive ? "Active" : "Pending") â€” reusing
+--              "still pending onboarding" (Status = IsActive ? "Active" : "Pending") — reusing
 --              it for archiving would collide with that. ArchivedByUserId is intentionally not
 --              an FK: the archiving actor is a CMS platform-admin user, who lives in CMSDatabase
 --              (CmsUsers), a separate physical database from this one.
@@ -9236,7 +10574,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- =============================================================================
 -- Migration: Hospital public directory opt-in
--- Description: Adds Hospitals.IsPubliclyListed â€” off by default. A hospital only
+-- Description: Adds Hospitals.IsPubliclyListed — off by default. A hospital only
 --              appears in the platform-wide public doctor directory (Nexeagle's
 --              "find a doctor" page, spanning every opted-in hospital) once this
 --              is explicitly turned on in hospital settings. Replaces the old
@@ -9249,6 +10587,77 @@ BEGIN
     IF COL_LENGTH('dbo.Hospitals', 'IsPubliclyListed') IS NULL
         ALTER TABLE dbo.Hospitals ADD IsPubliclyListed BIT NOT NULL CONSTRAINT DF_Hospitals_IsPubliclyListed DEFAULT (0);
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_hr_tds_regime_and_workings.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Section 192 TDS - regime, declared deductions, payslip workings
+-- Description: TDS used to be a fixed slab on annual CTC / 12. It is now projected from actual earnings, so:
+--                * HrSalaryStructures.TaxRegime ('NEW' default / 'OLD') and AnnualDeclaredDeductions (old regime only)
+--                * HrPayslips.TdsWorkingsJson - how the figure was worked out, for the accountant to check
+--              Guarded and idempotent. Deploy BEFORE the API that maps these columns.
+-- =============================================================================
+-- HrSalaryStructures had no CREATE script anywhere in this repo although payroll reads it (a fresh database could not run Track A
+-- payroll at all). Created here only when missing, matching the entity; an existing table is left alone and just gets the new columns.
+IF OBJECT_ID('dbo.HrSalaryStructures', 'U') IS NULL AND OBJECT_ID('dbo.HrEmployees', 'U') IS NOT NULL
+BEGIN
+    CREATE TABLE dbo.HrSalaryStructures (
+        HrSalaryStructureId     UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HrSalaryStructures_Id DEFAULT NEWID(),
+        HrEmployeeId            UNIQUEIDENTIFIER NOT NULL,
+        EffectiveFrom           DATE             NOT NULL,
+        MonthlyGrossCtc         DECIMAL(12,2)    NOT NULL,
+        BasicSalary             DECIMAL(12,2)    NOT NULL,
+        Hra                     DECIMAL(12,2)    NOT NULL CONSTRAINT DF_HrSalaryStructures_Hra DEFAULT (0),
+        DearnessAllowance       DECIMAL(12,2)    NOT NULL CONSTRAINT DF_HrSalaryStructures_Da DEFAULT (0),
+        SpecialAllowance        DECIMAL(12,2)    NOT NULL CONSTRAINT DF_HrSalaryStructures_Special DEFAULT (0),
+        MedicalAllowance        DECIMAL(12,2)    NOT NULL CONSTRAINT DF_HrSalaryStructures_Medical DEFAULT (0),
+        UniformAllowance        DECIMAL(12,2)    NOT NULL CONSTRAINT DF_HrSalaryStructures_Uniform DEFAULT (0),
+        NightShiftAllowanceRate DECIMAL(10,2)    NOT NULL CONSTRAINT DF_HrSalaryStructures_Night DEFAULT (0),
+        IsPfEligible            BIT              NOT NULL CONSTRAINT DF_HrSalaryStructures_Pf DEFAULT (1),
+        IsEsiEligible           BIT              NOT NULL CONSTRAINT DF_HrSalaryStructures_Esi DEFAULT (1),
+        ProfessionalTax         DECIMAL(10,2)    NOT NULL CONSTRAINT DF_HrSalaryStructures_Pt DEFAULT (200),
+        IsActive                BIT              NOT NULL CONSTRAINT DF_HrSalaryStructures_Active DEFAULT (1),
+        CreatedAt               DATETIME2        NOT NULL CONSTRAINT DF_HrSalaryStructures_Created DEFAULT SYSUTCDATETIME(),
+        UpdatedAt               DATETIME2        NOT NULL CONSTRAINT DF_HrSalaryStructures_Updated DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HrSalaryStructures PRIMARY KEY CLUSTERED (HrSalaryStructureId),
+        CONSTRAINT FK_HrSalaryStructures_Employee FOREIGN KEY (HrEmployeeId) REFERENCES dbo.HrEmployees (HrEmployeeId)
+    );
+    CREATE INDEX IX_HrSalaryStructures_Employee ON dbo.HrSalaryStructures (HrEmployeeId, IsActive, EffectiveFrom DESC);
+END
+GO
+
+IF OBJECT_ID('dbo.HrSalaryStructures', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.HrSalaryStructures', 'TaxRegime') IS NULL
+        ALTER TABLE dbo.HrSalaryStructures ADD TaxRegime NVARCHAR(10) NOT NULL CONSTRAINT DF_HrSalaryStructures_TaxRegime DEFAULT ('NEW');
+END
+GO
+
+IF OBJECT_ID('dbo.HrSalaryStructures', 'U') IS NOT NULL AND COL_LENGTH('dbo.HrSalaryStructures', 'TaxRegime') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HrSalaryStructures_TaxRegime')
+    EXEC('ALTER TABLE dbo.HrSalaryStructures ADD CONSTRAINT CK_HrSalaryStructures_TaxRegime CHECK (TaxRegime IN (''NEW'', ''OLD''))');
+GO
+
+IF OBJECT_ID('dbo.HrSalaryStructures', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.HrSalaryStructures', 'AnnualDeclaredDeductions') IS NULL
+        ALTER TABLE dbo.HrSalaryStructures ADD AnnualDeclaredDeductions DECIMAL(12,2) NOT NULL CONSTRAINT DF_HrSalaryStructures_Declared DEFAULT (0);
+END
+GO
+
+IF OBJECT_ID('dbo.HrSalaryStructures', 'U') IS NOT NULL AND COL_LENGTH('dbo.HrSalaryStructures', 'AnnualDeclaredDeductions') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HrSalaryStructures_Declared')
+    EXEC('ALTER TABLE dbo.HrSalaryStructures ADD CONSTRAINT CK_HrSalaryStructures_Declared CHECK (AnnualDeclaredDeductions >= 0)');
+GO
+
+IF OBJECT_ID('dbo.HrPayslips', 'U') IS NOT NULL AND COL_LENGTH('dbo.HrPayslips', 'TdsWorkingsJson') IS NULL
+    ALTER TABLE dbo.HrPayslips ADD TdsWorkingsJson NVARCHAR(MAX) NULL;
 GO
 
 GO
@@ -9311,7 +10720,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Inventory Management (INV-10): unify CSSD under the Store model. Adds a nullable StoreId FK
--- ALONGSIDE (not replacing) the existing free-text CurrentLocation â€” the status-machine/
+-- ALONGSIDE (not replacing) the existing free-text CurrentLocation — the status-machine/
 -- sterilization-cycle business logic is untouched; this only gives InstrumentSet a real location
 -- reference so it can participate in the unified stock-visibility view.
 
@@ -9362,7 +10771,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Inventory Management (INV-3): drug/regulatory metadata + reorder fields on InventoryItem. All
--- additive/nullable-or-defaulted â€” existing rows (and the OT/CSSD callers that only ever set
+-- additive/nullable-or-defaulted — existing rows (and the OT/CSSD callers that only ever set
 -- Category/Unit/CurrentStock) are unaffected.
 
 IF COL_LENGTH('dbo.InventoryItem','ScheduleClass') IS NULL
@@ -9414,7 +10823,7 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Inventory Management (INV-2): link movements to a real Batch + Store pair (all nullable â€” legacy
+-- Inventory Management (INV-2): link movements to a real Batch + Store pair (all nullable — legacy
 -- callers like IntraOpCommandHandlers.RecordIntraOpItemUsage keep working unchanged, passing neither).
 -- Also widens MovementType to allow TRANSFER (store-to-store moves that aren't a receive/issue).
 
@@ -9468,7 +10877,7 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Pharmacy Phase 3c: links an InventoryItem to its normalized SaltComposition â€” items sharing a
+-- Pharmacy Phase 3c: links an InventoryItem to its normalized SaltComposition — items sharing a
 -- SaltCompositionId (with live stock) are generic substitutes for each other.
 IF COL_LENGTH('dbo.InventoryItem', 'SaltCompositionId') IS NULL
 BEGIN
@@ -9718,10 +11127,10 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Phase 4 Â· MAR closed loop
+-- Phase 4 · MAR closed loop
 -- Repoints the (never-wired) MedicationAdministration table from the dead MedicationOrder
 -- header onto the real CPOE ClinicalOrderLine. MedicationOrderId becomes legacy/nullable;
--- OrderLineId is the column every new row populates. Idempotent â€” safe whether or not
+-- OrderLineId is the column every new row populates. Idempotent — safe whether or not
 -- MedicationAdministration already exists from a prior guarded CREATE.
 
 IF COL_LENGTH('dbo.MedicationAdministration','OrderLineId') IS NULL
@@ -9734,7 +11143,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_MA_OrderLine')
       REFERENCES dbo.ClinicalOrderLine(OrderLineId);
 GO
 
--- MedicationOrderId now points at the dead MedicationOrder table â€” legacy only from here on.
+-- MedicationOrderId now points at the dead MedicationOrder table — legacy only from here on.
 -- Relax to nullable so new rows (which populate OrderLineId instead) can be inserted.
 IF EXISTS (
   SELECT 1 FROM sys.columns
@@ -9753,7 +11162,7 @@ IF EXISTS (
 GO
 
 -- Exactly one of the legacy header (MedicationOrderId) / current header (OrderLineId) may be
--- set. Safe to add now â€” confirmed zero rows have ever been written to this table.
+-- set. Safe to add now — confirmed zero rows have ever been written to this table.
 IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_MA_ExactlyOneOrderRef')
   ALTER TABLE dbo.MedicationAdministration
     ADD CONSTRAINT CK_MA_ExactlyOneOrderRef CHECK (
@@ -9770,7 +11179,7 @@ GO
 
 -- Drives the MAR grid query (one admission's administrations for a line, in a day window).
 -- The original IX_MA_AdmissionTimeline/IX_MA_OrderSlot (keyed on the legacy MedicationOrderId)
--- are left untouched â€” dead weight, no functional need to alter them.
+-- are left untouched — dead weight, no functional need to alter them.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MA_OrderLineSlot' AND object_id=OBJECT_ID('dbo.MedicationAdministration'))
 BEGIN
   CREATE INDEX IX_MA_OrderLineSlot
@@ -9786,7 +11195,7 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Phase 3 Â· pharmacy dispensing producer
+-- Phase 3 · pharmacy dispensing producer
 -- Adds optional inventory link + per-dose qty to MedicationOrder so administered doses
 -- can auto-deduct stock and produce a BillingChargeEvent.
 -- Idempotent.
@@ -9826,7 +11235,7 @@ GO
 -- Migration: MedicineMaster bulk-import support fields
 -- Description: Adds fields carried by the Tata 1mg medicine dataset import
 --              (pack size, prescription-required flag, ready-to-print Rx
---              shorthand e.g. "Tab Dintor 20mg") plus SourceKey â€” a stable
+--              shorthand e.g. "Tab Dintor 20mg") plus SourceKey — a stable
 --              hash of (MedicineName, Manufacturer) used to upsert the bulk
 --              import idempotently so re-imports update existing rows
 --              instead of duplicating them. Guarded ALTER on the
@@ -9944,9 +11353,9 @@ GO
 -- Nursing Documentation & SBAR Handover phase.
 -- VitalReading/FluidEntry/GlucoseReading/NursingAssessment/RoundNote were all originally scaffolded
 -- with EncounterId NOT NULL, but Admission.EncounterId is nullable (null when a given admission has
--- IPD billing disabled â€” see EnableIpdBilling). Nursing/clinical charting has nothing to do with
+-- IPD billing disabled — see EnableIpdBilling). Nursing/clinical charting has nothing to do with
 -- billing, so it must not be gated on an encounter existing. Relax to nullable, guarded (these
--- tables may already be deployed empty from the original 2026-05-26 scaffolding â€” never edit the
+-- tables may already be deployed empty from the original 2026-05-26 scaffolding — never edit the
 -- CREATE TABLE body in place).
 
 IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.VitalReading') AND name = 'EncounterId' AND is_nullable = 0)
@@ -10174,8 +11583,8 @@ GO
 -- Description: The existing IX_PReg_HospitalID_Mobile index leads with HospitalID, so it can't be
 --              seeked by a bare "WHERE Mobile = @mobile" query. Doctor Dekho's WhatsApp-OTP login
 --              (GetPublicAppointmentsByMobileHandler, GetPublicPatientProfileHandler) deliberately
---              queries by mobile ALONE across every hospital a patient's visited â€” that's the
---              whole point of it â€” and does so on effectively every page load (it doubles as the
+--              queries by mobile ALONE across every hospital a patient's visited — that's the
+--              whole point of it — and does so on effectively every page load (it doubles as the
 --              "am I logged in" check), so a full table scan there is a real, growing hot path,
 --              not a one-off query.
 
@@ -10205,7 +11614,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- =============================================================================
--- Migration: PatientRegistrations â€” indexed Soundex for fast phonetic name search
+-- Migration: PatientRegistrations — indexed Soundex for fast phonetic name search
 -- Description: SearchPatientHandler matches AppDbContext.Soundex(FullName) against
 --              the search term for phonetic variants (e.g. "Steven" vs "Stephen").
 --              Calling SOUNDEX(FullName) inline in a WHERE clause is a scalar
@@ -10361,7 +11770,7 @@ BEGIN
     PRINT 'Column GuardianName added to PatientRegistrations.';
 END
 ELSE
-    PRINT 'Column GuardianName already exists â€” skipped.';
+    PRINT 'Column GuardianName already exists — skipped.';
 GO
 
 IF NOT EXISTS (
@@ -10375,7 +11784,7 @@ BEGIN
     PRINT 'Column GuardianRelation added to PatientRegistrations.';
 END
 ELSE
-    PRINT 'Column GuardianRelation already exists â€” skipped.';
+    PRINT 'Column GuardianRelation already exists — skipped.';
 GO
 
 GO
@@ -10390,7 +11799,7 @@ GO
 -- Description: Adds PatientRegistrations.MarketingConsent (+ MarketingConsentAt) so an
 --              opt-in given at public (Nexeagle) booking time can be tracked and reused
 --              later for follow-up SMS/email/marketing. Once true it is only ever
---              upgraded, never silently cleared by a later booking that doesn't ask â€”
+--              upgraded, never silently cleared by a later booking that doesn't ask —
 --              see AppointmentBookingHelpers.FindOrCreatePatientAsync. Guarded ALTER on
 --              the already-deployed PatientRegistrations table.
 -- =============================================================================
@@ -10455,7 +11864,7 @@ GO
 -- Migration: Public patient auth login tracking
 -- Description: Adds PublicPatientAuth.LastLoginAt / LoginCount for the CMS "Patient
 --              Logins" report. Set ONLY on a successful OTP verify (see
---              PatientOtpVerifyHandler) â€” UpdatedAt is touched on both success and
+--              PatientOtpVerifyHandler) — UpdatedAt is touched on both success and
 --              failure, so it can't be trusted as "last successful login".
 --              Guarded ALTER on the already-deployed PublicPatientAuth table.
 -- =============================================================================
@@ -10478,7 +11887,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Room/Bed Master unification: floor is now a structural part of a room's identity, not just a
--- label â€” Bed Master's new hierarchy is Floor -> Room -> Bed, and room numbers are only unique
+-- label — Bed Master's new hierarchy is Floor -> Room -> Bed, and room numbers are only unique
 -- WITHIN a floor (two different floors may both legitimately have a "Room 101"). Backfill any
 -- existing NULL FloorNo before making it required, so the ALTER never fails on live data.
 
@@ -10565,11 +11974,11 @@ GO
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
--- Phase 3 Â· GST tax engine
+-- Phase 3 · GST tax engine
 -- Adds HSN/SAC + GST fields to ChargeMaster, BillingPolicy, BillingChargeEvent, BillingInvoice.
 -- Idempotent: each ALTER is guarded by a sys.columns lookup so this script can be re-run safely.
 
--- â”€â”€â”€ ChargeMaster â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ─── ChargeMaster ───────────────────────────────────────────────────────────
 IF COL_LENGTH('dbo.ChargeMaster', 'HsnSacCode') IS NULL
   ALTER TABLE dbo.ChargeMaster ADD HsnSacCode NVARCHAR(10) NULL;
 GO
@@ -10588,7 +11997,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_CM_GstSlab')
     ADD CONSTRAINT CK_CM_GstSlab CHECK (GstSlabPercent IS NULL OR (GstSlabPercent >= 0 AND GstSlabPercent <= 100));
 GO
 
--- â”€â”€â”€ BillingPolicy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ─── BillingPolicy ──────────────────────────────────────────────────────────
 IF COL_LENGTH('dbo.BillingPolicy', 'SupplierGstin') IS NULL
   ALTER TABLE dbo.BillingPolicy ADD SupplierGstin NVARCHAR(15) NULL;
 GO
@@ -10606,7 +12015,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_BP_TaxRoundi
     ADD CONSTRAINT CK_BP_TaxRoundingMode CHECK (TaxRoundingMode IN ('ROUND','FLOOR','CEIL'));
 GO
 
--- â”€â”€â”€ BillingChargeEvent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ─── BillingChargeEvent ─────────────────────────────────────────────────────
 -- Per-event tax snapshot. NULL on legacy rows; new posts must populate.
 IF COL_LENGTH('dbo.BillingChargeEvent', 'HsnSacCode') IS NULL
   ALTER TABLE dbo.BillingChargeEvent ADD HsnSacCode NVARCHAR(10) NULL;
@@ -10636,7 +12045,7 @@ IF COL_LENGTH('dbo.BillingChargeEvent', 'IsInterState') IS NULL
   ALTER TABLE dbo.BillingChargeEvent ADD IsInterState BIT NOT NULL CONSTRAINT DF_BCE_InterState DEFAULT (0);
 GO
 
--- â”€â”€â”€ BillingInvoice â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ─── BillingInvoice ─────────────────────────────────────────────────────────
 IF COL_LENGTH('dbo.BillingInvoice', 'TaxableAmount') IS NULL
   ALTER TABLE dbo.BillingInvoice ADD TaxableAmount DECIMAL(18,2) NULL;
 GO
@@ -10669,11 +12078,77 @@ GO
 -- OT phase (Blood Bank module).
 -- TransfusionEvent was scaffolded (2026-05-26) with EncounterId NOT NULL, same bug pattern as
 -- VitalReading/FluidEntry/GlucoseReading/NursingAssessment/RoundNote/ConsentRecord/DischargeSummary
--- (fixed in prior phases). Admission.EncounterId is nullable when EnableIpdBilling=false â€” a
+-- (fixed in prior phases). Admission.EncounterId is nullable when EnableIpdBilling=false — a
 -- billing-disabled admission must still be able to record a transfusion. Relax to nullable, guarded.
 
 IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.TransfusionEvent') AND name = 'EncounterId' AND is_nullable = 0)
   ALTER TABLE dbo.TransfusionEvent ALTER COLUMN EncounterId UNIQUEIDENTIFIER NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/audit_log_2026_10.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- 2026-10: the API now writes dbo.AuditLog (refunds, deleted payments/charges/bills, discounts,
+-- charge edits, team and hospital changes; easyHMSAPI AuditTrail). The table was defined in
+-- db/schema/tables/create_tables_audit.sql but may never have been created on older databases.
+-- Same script, safe to run more than once. Run BEFORE deploying the API: without the table those
+-- actions fail with an error instead of saving.
+IF OBJECT_ID('dbo.AuditLog','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AuditLog
+  (
+    AuditLogId    UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_AuditLog_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId    UNIQUEIDENTIFIER NULL,
+
+    Action        NVARCHAR(10)     NOT NULL,
+    EntityName    NVARCHAR(100)    NOT NULL,
+    EntityId      NVARCHAR(200)    NOT NULL,
+
+    AdmissionId   UNIQUEIDENTIFIER NULL,
+    PatientId     NVARCHAR(50)     NULL,
+
+    Changes       NVARCHAR(MAX)    NULL,
+
+    UserId        UNIQUEIDENTIFIER NULL,
+    UserName      NVARCHAR(200)    NULL,
+    ClientIp      NVARCHAR(64)     NULL,
+    UserAgent     NVARCHAR(400)    NULL,
+
+    CreatedAt     DATETIME2(3)     NOT NULL CONSTRAINT DF_AuditLog_CreatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_AuditLog PRIMARY KEY CLUSTERED (AuditLogId),
+    CONSTRAINT CK_AuditLog_Action CHECK (Action IN ('INSERT','UPDATE','DELETE'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AL_HospitalTime' AND object_id=OBJECT_ID('dbo.AuditLog'))
+BEGIN
+  CREATE INDEX IX_AL_HospitalTime
+  ON dbo.AuditLog(HospitalId, CreatedAt DESC)
+  INCLUDE (Action, EntityName, EntityId, AdmissionId, UserName);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AL_Entity' AND object_id=OBJECT_ID('dbo.AuditLog'))
+BEGIN
+  CREATE INDEX IX_AL_Entity
+  ON dbo.AuditLog(EntityName, EntityId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AL_Admission' AND object_id=OBJECT_ID('dbo.AuditLog'))
+BEGIN
+  CREATE INDEX IX_AL_Admission
+  ON dbo.AuditLog(HospitalId, AdmissionId, CreatedAt DESC)
+  WHERE AdmissionId IS NOT NULL;
+END
 GO
 
 GO
@@ -10705,6 +12180,49 @@ WHERE NOT EXISTS (
     SELECT 1 FROM dbo.HospitalDepartmentMappings hdm
     WHERE hdm.HospitalID = src.HospitalID AND hdm.DepartmentID = src.DepartmentID
 );
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_abha_consent_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: AbhaConsent
+-- Description: Server-side evidence of consent before an ABHA (Aadhaar) enrolment OTP is requested. Previously consent was only a UI
+--              checkbox plus a hard-coded field in the ABDM payload, so nothing proved who recorded it, when, or for which wording.
+--              One row per recorded consent: hospital, staff user, wording code/version/SHA-256/snapshot, patient or guardian, and how many
+--              OTPs it has been used for (the API allows 3 per consent: first OTP + 2 resends). Guarded and idempotent.
+-- =============================================================================
+IF OBJECT_ID('dbo.AbhaConsent', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AbhaConsent (
+        AbhaConsentId        UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_AbhaConsent_Id DEFAULT NEWID(),
+        HospitalId           UNIQUEIDENTIFIER NOT NULL,
+        GrantedByUserId      UNIQUEIDENTIFIER NOT NULL,
+        GrantedByName        NVARCHAR(200)    NULL,
+        PurposeCode          NVARCHAR(30)     NOT NULL CONSTRAINT DF_AbhaConsent_Purpose DEFAULT ('ABHA_ENROLMENT'),
+        ConsentCode          NVARCHAR(50)     NOT NULL,
+        ConsentVersion       NVARCHAR(20)     NOT NULL,
+        ConsentTextSha256    NVARCHAR(64)     NOT NULL,
+        ConsentTextSnapshot  NVARCHAR(MAX)    NOT NULL,
+        GivenBy              NVARCHAR(10)     NOT NULL,
+        SubjectName          NVARCHAR(200)    NULL,
+        CreatedAt            DATETIME2        NOT NULL CONSTRAINT DF_AbhaConsent_CreatedAt DEFAULT SYSUTCDATETIME(),
+        OtpRequestCount      INT              NOT NULL CONSTRAINT DF_AbhaConsent_Otp DEFAULT (0),
+        LastOtpRequestedAt   DATETIME2        NULL,
+        TxnId                NVARCHAR(100)    NULL,
+        CONSTRAINT PK_AbhaConsent PRIMARY KEY CLUSTERED (AbhaConsentId),
+        CONSTRAINT CK_AbhaConsent_GivenBy CHECK (GivenBy IN ('PATIENT', 'GUARDIAN')),
+        CONSTRAINT CK_AbhaConsent_OtpCount CHECK (OtpRequestCount >= 0)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_AbhaConsent_Hospital' AND object_id = OBJECT_ID('dbo.AbhaConsent'))
+    CREATE INDEX IX_AbhaConsent_Hospital ON dbo.AbhaConsent (HospitalId, CreatedAt DESC);
 GO
 
 GO
@@ -11096,6 +12614,83 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_discharge_config_tables__add_hospital.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Scope DoctorDischargeFieldConfigs per (Doctor, Hospital)
+-- Description: The discharge-summary field-layout customization ("Customize"
+--              editor) was global per doctor across every hospital they work
+--              at. Now scoped per hospital, same as DischargeSettings
+--              (letterhead) already is. HospitalId is added NULLABLE and
+--              existing rows are left as HospitalId = NULL -- they become each
+--              doctor's carried-over legacy default (read as a fallback when no
+--              hospital-specific row exists yet) rather than being silently
+--              discarded. New saves always write a hospital-specific row.
+-- Named to sort after create_discharge_config_tables.sql (migrations apply in filename
+-- order) instead of alter_..., which sorted before it and broke on a fresh database.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DoctorDischargeFieldConfigs', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.DoctorDischargeFieldConfigs', 'HospitalId') IS NULL
+        ALTER TABLE dbo.DoctorDischargeFieldConfigs ADD HospitalId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
+    DROP INDEX UX_DoctorDischargeFieldConfigs_DoctorId ON dbo.DoctorDischargeFieldConfigs;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
+    CREATE UNIQUE INDEX UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId
+    ON dbo.DoctorDischargeFieldConfigs(DoctorId, HospitalId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_discharge_config_tables__add_system_default_letterhead.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: System-generated default letterhead as an explicit, selectable choice
+-- Description: Adds UseSystemDefaultLetterhead to PrescriptionSettings and
+--              DischargeSettings. Previously the system-generated default
+--              letterhead only ever appeared as a silent runtime fallback when
+--              no template happened to be uploaded -- there was no way for an
+--              admin to deliberately choose it. Kept as its own flag rather
+--              than inferred from URI being NULL so switching to the default
+--              doesn't destroy an already-uploaded template: flipping the flag
+--              back off restores it without re-uploading. Defaults to 0 --
+--              every existing row keeps today's exact behavior.
+-- Named to sort after create_discharge_config_tables.sql (migrations apply in
+-- filename order) since it adds a column to a table that file creates.
+-- PrescriptionSettings itself lives in db/schema/tables (applied before every
+-- migration), so no ordering concern there.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.PrescriptionSettings', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.PrescriptionSettings', 'UseSystemDefaultLetterhead') IS NULL
+        ALTER TABLE dbo.PrescriptionSettings ADD UseSystemDefaultLetterhead BIT NOT NULL
+            CONSTRAINT DF_PrescriptionSettings_UseSystemDefault DEFAULT (0);
+END
+GO
+
+IF OBJECT_ID('dbo.DischargeSettings', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.DischargeSettings', 'UseSystemDefaultLetterhead') IS NULL
+        ALTER TABLE dbo.DischargeSettings ADD UseSystemDefaultLetterhead BIT NOT NULL
+            CONSTRAINT DF_DischargeSettings_UseSystemDefault DEFAULT (0);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_discharge_config_tables.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -11177,97 +12772,20 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/create_discharge_config_tables__add_hospital.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- =============================================================================
--- Migration: Scope DoctorDischargeFieldConfigs per (Doctor, Hospital)
--- Description: The discharge-summary field-layout customization ("Customize"
---              editor) was global per doctor across every hospital they work
---              at. Now scoped per hospital, same as DischargeSettings
---              (letterhead) already is. HospitalId is added NULLABLE and
---              existing rows are left as HospitalId = NULL -- they become each
---              doctor's carried-over legacy default (read as a fallback when no
---              hospital-specific row exists yet) rather than being silently
---              discarded. New saves always write a hospital-specific row.
--- Named to sort after create_discharge_config_tables.sql (migrations apply in filename
--- order) instead of alter_..., which sorted before it and broke on a fresh database.
--- =============================================================================
-
-IF OBJECT_ID('dbo.DoctorDischargeFieldConfigs', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.DoctorDischargeFieldConfigs', 'HospitalId') IS NULL
-        ALTER TABLE dbo.DoctorDischargeFieldConfigs ADD HospitalId UNIQUEIDENTIFIER NULL;
-END
-GO
-
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
-    DROP INDEX UX_DoctorDischargeFieldConfigs_DoctorId ON dbo.DoctorDischargeFieldConfigs;
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId' AND object_id = OBJECT_ID('dbo.DoctorDischargeFieldConfigs'))
-    CREATE UNIQUE INDEX UX_DoctorDischargeFieldConfigs_DoctorId_HospitalId
-    ON dbo.DoctorDischargeFieldConfigs(DoctorId, HospitalId);
-GO
-
-GO
-
--- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/create_discharge_config_tables__add_system_default_letterhead.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- =============================================================================
--- Migration: System-generated default letterhead as an explicit, selectable choice
--- Description: Adds UseSystemDefaultLetterhead to PrescriptionSettings and
---              DischargeSettings. Previously the system-generated default
---              letterhead only ever appeared as a silent runtime fallback when
---              no template happened to be uploaded -- there was no way for an
---              admin to deliberately choose it. Kept as its own flag rather
---              than inferred from URI being NULL so switching to the default
---              doesn't destroy an already-uploaded template: flipping the flag
---              back off restores it without re-uploading. Defaults to 0 --
---              every existing row keeps today's exact behavior.
--- Named to sort after create_discharge_config_tables.sql (migrations apply in
--- filename order) since it adds a column to a table that file creates.
--- PrescriptionSettings itself lives in db/schema/tables (applied before every
--- migration), so no ordering concern there.
--- =============================================================================
-
-IF OBJECT_ID('dbo.PrescriptionSettings', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.PrescriptionSettings', 'UseSystemDefaultLetterhead') IS NULL
-        ALTER TABLE dbo.PrescriptionSettings ADD UseSystemDefaultLetterhead BIT NOT NULL
-            CONSTRAINT DF_PrescriptionSettings_UseSystemDefault DEFAULT (0);
-END
-GO
-
-IF OBJECT_ID('dbo.DischargeSettings', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.DischargeSettings', 'UseSystemDefaultLetterhead') IS NULL
-        ALTER TABLE dbo.DischargeSettings ADD UseSystemDefaultLetterhead BIT NOT NULL
-            CONSTRAINT DF_DischargeSettings_UseSystemDefault DEFAULT (0);
-END
-GO
-
-GO
-
--- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_discharge_medication_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- =============================================================================
 -- Migration: Create DischargeMedication Table
--- Description: Structured discharge/home-medication list for a DischargeSummary â€”
+-- Description: Structured discharge/home-medication list for a DischargeSummary —
 --              one row per medicine (name, dosage, route, frequency, duration,
 --              instructions), mirroring PrescriptionMedicine's shape. Replaces
 --              hand-typing the whole list into DischargeSummary.DischargeMedications
 --              (that text column is left in place, now a derived/generated mirror
 --              of this table rather than the source of truth).
---              No enforced FK to DischargeSummary â€” same unconstrained convention
---              used elsewhere this session â€” so this migration doesn't need to run
+--              No enforced FK to DischargeSummary — same unconstrained convention
+--              used elsewhere this session — so this migration doesn't need to run
 --              after create_discharge_config_tables.sql (or wherever DischargeSummary
 --              is created). Idempotent.
 -- =============================================================================
@@ -11306,6 +12824,60 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_discharge_summary_audit_and_link_expiry.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Discharge summary audit trail + public link expiry
+-- Description: 1) DischargeSummaryAudit - insert-only record of SIGN / UNSIGN (with reason and the
+--                 previous signer) / LINK_REGENERATED events. Unsigning used to blank the signature
+--                 with no trace of who or why.
+--              2) DischargeSummary.AccessTokenExpiresAt - the anonymous QR/WhatsApp link used to work
+--                 forever. Existing links get 30 days from the day this runs; new ones are stamped by
+--                 the API (config DischargeSummary:PublicLinkValidityDays, default 30).
+--              Guarded and idempotent.
+-- =============================================================================
+IF OBJECT_ID('dbo.DischargeSummaryAudit', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DischargeSummaryAudit (
+        AuditId             UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_DischargeSummaryAudit_Id DEFAULT NEWID(),
+        HospitalId          UNIQUEIDENTIFIER NOT NULL,
+        DischargeSummaryId  UNIQUEIDENTIFIER NOT NULL,
+        AdmissionId         UNIQUEIDENTIFIER NOT NULL,
+        Action              NVARCHAR(30)     NOT NULL,   -- SIGN / UNSIGN / LINK_REGENERATED
+        Reason              NVARCHAR(500)    NULL,
+        PreviousSignedBy    NVARCHAR(200)    NULL,
+        PreviousSignedAt    DATETIME2        NULL,
+        PerformedByUserId   UNIQUEIDENTIFIER NULL,
+        PerformedBy         NVARCHAR(200)    NULL,
+        PerformedAt         DATETIME2        NOT NULL CONSTRAINT DF_DischargeSummaryAudit_At DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_DischargeSummaryAudit PRIMARY KEY CLUSTERED (AuditId),
+        CONSTRAINT CK_DischargeSummaryAudit_Action CHECK (Action IN ('SIGN', 'UNSIGN', 'LINK_REGENERATED'))
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DischargeSummaryAudit_Summary' AND object_id = OBJECT_ID('dbo.DischargeSummaryAudit'))
+    CREATE INDEX IX_DischargeSummaryAudit_Summary ON dbo.DischargeSummaryAudit (HospitalId, DischargeSummaryId, PerformedAt DESC);
+GO
+
+IF COL_LENGTH('dbo.DischargeSummary', 'AccessTokenExpiresAt') IS NULL
+BEGIN
+    ALTER TABLE dbo.DischargeSummary ADD AccessTokenExpiresAt DATETIME2 NULL;
+END
+GO
+
+-- Existing links stop being permanent: 30 days from now (re-minted links get their own expiry from the API).
+IF COL_LENGTH('dbo.DischargeSummary', 'AccessTokenExpiresAt') IS NOT NULL
+    EXEC('UPDATE dbo.DischargeSummary
+          SET AccessTokenExpiresAt = DATEADD(DAY, 30, SYSUTCDATETIME())
+          WHERE AccessToken IS NOT NULL AND AccessTokenExpiresAt IS NULL');
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_doctor_prescription_field_configs.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -11329,64 +12901,6 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_DoctorPrescriptionFieldConfigs_DoctorId' AND object_id = OBJECT_ID('dbo.DoctorPrescriptionFieldConfigs'))
     CREATE UNIQUE INDEX UX_DoctorPrescriptionFieldConfigs_DoctorId ON dbo.DoctorPrescriptionFieldConfigs(DoctorId);
-GO
-
-GO
-
--- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/create_doctor_review_table.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- =============================================================================
--- Migration: Create DoctorReviews table
--- Description: Real backend for the public doctor-directory review/rating UI
---              (previously localStorage-only on NexEagleWebsite -- never actually
---              shared across visitors or seen by hospital staff). One row per
---              submitted review: rating (1-5), comment, optional author name,
---              lightweight IP capture for abuse-tracking (mirrors
---              Appointment.BookingIpAddress). IsHidden lets a hospital admin
---              moderate a review after the fact from Public Directory -- reviews
---              still go live immediately on submission, per product decision.
---              HospitalId is denormalized (resolved once at submission via
---              PublicDirectoryHelpers) so the admin moderation list never needs a
---              join fan-out through DoctorDepartments.
--- =============================================================================
-
-IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.DoctorReviews (
-        ReviewId      UNIQUEIDENTIFIER NOT NULL
-            CONSTRAINT DF_DoctorReviews_Id DEFAULT NEWSEQUENTIALID(),
-
-        HospitalId    UNIQUEIDENTIFIER NOT NULL,
-        DoctorId      UNIQUEIDENTIFIER NOT NULL,
-
-        AuthorName    NVARCHAR(100)    NULL,
-        Rating        TINYINT          NOT NULL,
-        Comment       NVARCHAR(1000)   NOT NULL,
-        HelpfulCount  INT              NOT NULL CONSTRAINT DF_DoctorReviews_Helpful DEFAULT (0),
-        IsHidden      BIT              NOT NULL CONSTRAINT DF_DoctorReviews_Hidden DEFAULT (0),
-        SubmittedIp   NVARCHAR(64)     NULL,
-
-        CreatedAt     DATETIME2(3)     NOT NULL CONSTRAINT DF_DoctorReviews_CreatedAt DEFAULT (SYSUTCDATETIME()),
-
-        CONSTRAINT PK_DoctorReviews PRIMARY KEY CLUSTERED (ReviewId),
-        CONSTRAINT FK_DoctorReviews_Doctor FOREIGN KEY (DoctorId)
-            REFERENCES dbo.Doctors(DoctorID) ON DELETE CASCADE,
-        CONSTRAINT CK_DoctorReviews_Rating CHECK (Rating BETWEEN 1 AND 5)
-    );
-
-    PRINT 'Created table DoctorReviews';
-END
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DoctorReviews_Doctor' AND object_id = OBJECT_ID('dbo.DoctorReviews'))
-    CREATE INDEX IX_DoctorReviews_Doctor ON dbo.DoctorReviews (DoctorId, IsHidden, CreatedAt DESC);
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DoctorReviews_Hospital' AND object_id = OBJECT_ID('dbo.DoctorReviews'))
-    CREATE INDEX IX_DoctorReviews_Hospital ON dbo.DoctorReviews (HospitalId, CreatedAt DESC);
 GO
 
 GO
@@ -11483,6 +12997,64 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_doctor_review_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Create DoctorReviews table
+-- Description: Real backend for the public doctor-directory review/rating UI
+--              (previously localStorage-only on NexEagleWebsite -- never actually
+--              shared across visitors or seen by hospital staff). One row per
+--              submitted review: rating (1-5), comment, optional author name,
+--              lightweight IP capture for abuse-tracking (mirrors
+--              Appointment.BookingIpAddress). IsHidden lets a hospital admin
+--              moderate a review after the fact from Public Directory -- reviews
+--              still go live immediately on submission, per product decision.
+--              HospitalId is denormalized (resolved once at submission via
+--              PublicDirectoryHelpers) so the admin moderation list never needs a
+--              join fan-out through DoctorDepartments.
+-- =============================================================================
+
+IF OBJECT_ID('dbo.DoctorReviews', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DoctorReviews (
+        ReviewId      UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_DoctorReviews_Id DEFAULT NEWSEQUENTIALID(),
+
+        HospitalId    UNIQUEIDENTIFIER NOT NULL,
+        DoctorId      UNIQUEIDENTIFIER NOT NULL,
+
+        AuthorName    NVARCHAR(100)    NULL,
+        Rating        TINYINT          NOT NULL,
+        Comment       NVARCHAR(1000)   NOT NULL,
+        HelpfulCount  INT              NOT NULL CONSTRAINT DF_DoctorReviews_Helpful DEFAULT (0),
+        IsHidden      BIT              NOT NULL CONSTRAINT DF_DoctorReviews_Hidden DEFAULT (0),
+        SubmittedIp   NVARCHAR(64)     NULL,
+
+        CreatedAt     DATETIME2(3)     NOT NULL CONSTRAINT DF_DoctorReviews_CreatedAt DEFAULT (SYSUTCDATETIME()),
+
+        CONSTRAINT PK_DoctorReviews PRIMARY KEY CLUSTERED (ReviewId),
+        CONSTRAINT FK_DoctorReviews_Doctor FOREIGN KEY (DoctorId)
+            REFERENCES dbo.Doctors(DoctorID) ON DELETE CASCADE,
+        CONSTRAINT CK_DoctorReviews_Rating CHECK (Rating BETWEEN 1 AND 5)
+    );
+
+    PRINT 'Created table DoctorReviews';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DoctorReviews_Doctor' AND object_id = OBJECT_ID('dbo.DoctorReviews'))
+    CREATE INDEX IX_DoctorReviews_Doctor ON dbo.DoctorReviews (DoctorId, IsHidden, CreatedAt DESC);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DoctorReviews_Hospital' AND object_id = OBJECT_ID('dbo.DoctorReviews'))
+    CREATE INDEX IX_DoctorReviews_Hospital ON dbo.DoctorReviews (HospitalId, CreatedAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_early_warning_score_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -11559,6 +13131,43 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_hospital_subscription_payments_table__add_proration.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Migration: Alter HospitalSubscriptionPayments Table (Add Proration Fields)
+-- Description: Supports mid-cycle plan switches (upgrade/downgrade) from the EasyHMS
+--              subscription page. When an already-Active hospital switches plans, the unused
+--              days on their current plan are credited (prorated off what they actually paid)
+--              against the new plan's price. These columns record that breakdown on the payment
+--              row so CMS can see/verify it before approving, instead of just a bare Amount.
+-- Naming: prefixed to match create_hospital_subscription_payments_table.sql (not "alter_...")
+--         so migrations, which apply in alphabetical filename order, run after the table that
+--         creates HospitalSubscriptionPayments instead of before it (see deploy-remote.sh /
+--         deploy.ps1's run_migrations — apply-once, sorted by name).
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptionPayments]') AND name = 'PreviousPlanId'
+)
+BEGIN
+    ALTER TABLE [dbo].[HospitalSubscriptionPayments]
+    ADD PreviousPlanId UNIQUEIDENTIFIER NULL,
+        PreviousPlanName NVARCHAR(200) NULL,
+        ProratedCreditAmount DECIMAL(18,2) NULL,
+        IsProratedSwitch BIT NOT NULL CONSTRAINT DF_HospitalSubscriptionPayments_IsProratedSwitch DEFAULT (0);
+
+    PRINT 'Added proration fields to HospitalSubscriptionPayments table';
+END
+ELSE
+BEGIN
+    PRINT 'Proration fields already exist in HospitalSubscriptionPayments table';
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_hospital_subscription_payments_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -11592,43 +13201,6 @@ BEGIN
     CREATE INDEX IX_HospitalSubscriptionPayments_HospitalId ON dbo.HospitalSubscriptionPayments(HospitalId, SubmittedAt DESC);
 
     PRINT 'Created table HospitalSubscriptionPayments';
-END
-GO
-
-GO
-
--- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/create_hospital_subscription_payments_table__add_proration.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- Migration: Alter HospitalSubscriptionPayments Table (Add Proration Fields)
--- Description: Supports mid-cycle plan switches (upgrade/downgrade) from the EasyHMS
---              subscription page. When an already-Active hospital switches plans, the unused
---              days on their current plan are credited (prorated off what they actually paid)
---              against the new plan's price. These columns record that breakdown on the payment
---              row so CMS can see/verify it before approving, instead of just a bare Amount.
--- Naming: prefixed to match create_hospital_subscription_payments_table.sql (not "alter_...")
---         so migrations, which apply in alphabetical filename order, run after the table that
---         creates HospitalSubscriptionPayments instead of before it (see deploy-remote.sh /
---         deploy.ps1's run_migrations â€” apply-once, sorted by name).
-
-IF NOT EXISTS (
-    SELECT * FROM sys.columns
-    WHERE object_id = OBJECT_ID(N'[dbo].[HospitalSubscriptionPayments]') AND name = 'PreviousPlanId'
-)
-BEGIN
-    ALTER TABLE [dbo].[HospitalSubscriptionPayments]
-    ADD PreviousPlanId UNIQUEIDENTIFIER NULL,
-        PreviousPlanName NVARCHAR(200) NULL,
-        ProratedCreditAmount DECIMAL(18,2) NULL,
-        IsProratedSwitch BIT NOT NULL CONSTRAINT DF_HospitalSubscriptionPayments_IsProratedSwitch DEFAULT (0);
-
-    PRINT 'Added proration fields to HospitalSubscriptionPayments table';
-END
-ELSE
-BEGIN
-    PRINT 'Proration fields already exist in HospitalSubscriptionPayments table';
 END
 GO
 
@@ -11816,15 +13388,15 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- =============================================================================
 -- Migration: Create MedicalQualificationTypes / MedicalSpecialities / MedicalSpecialityFeeders
--- Description: NMC (National Medical Commission) qualification-ladder reference data â€”
+-- Description: NMC (National Medical Commission) qualification-ladder reference data —
 --              MD/MS (broad specialities) and DM/MCh (super-specialities), each with the
 --              "common patient-facing name" used for consumer-facing search (e.g. Doctor
 --              Dekho) and a normalized PatientFacingCategory bucket a handful of NMC rows
 --              collapse into (e.g. DM Medical Oncology + MCh Surgical Oncology + MD Radiation
 --              Oncology all -> "Oncologist (Cancer)"). PG Diplomas and PDCC are deliberately
 --              NOT included: NMC is phasing diplomas out (last admission 2026-27) and PDCC is
---              a rare 1-year add-on after DM/MCh â€” neither maps to a patient search category.
---              Global reference data only (no HospitalID) â€” unlike dbo.Departments/
+--              a rare 1-year add-on after DM/MCh — neither maps to a patient search category.
+--              Global reference data only (no HospitalID) — unlike dbo.Departments/
 --              dbo.Specializations, which are the hospital-operational department/sub-focus
 --              tables and are deliberately left untouched by this migration.
 --              MedicalSpecialityFeeders is a many-to-many bridge because a DM/MCh super-
@@ -12099,7 +13671,7 @@ GO
 --              column (added by alter_ot_plan_package_type.sql) as the source of
 --              truth for the OT Plans configuration board; that column is left in
 --              place, unused, rather than dropped (already-deployed column).
---              No enforced FK â€” same unconstrained convention as OTPlan.PackageTypeId,
+--              No enforced FK — same unconstrained convention as OTPlan.PackageTypeId,
 --              so this migration doesn't need to run after create_ot_plans_table.sql
 --              or create_package_types_table.sql. Idempotent.
 -- =============================================================================
@@ -12120,6 +13692,25 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_OTPlanPkgType_PackageType' AND object_id = OBJECT_ID('dbo.OTPlanPackageType'))
     CREATE INDEX IX_OTPlanPkgType_PackageType ON dbo.OTPlanPackageType (PackageTypeId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_ot_plans_table__package_type.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Optional link from an OT Plan to a PackageType — plain nullable column, not an enforced FK
+-- (matches Admission.OtPlanId's precedent), so this migration doesn't need to run after
+-- create_package_types_table.sql. Idempotent. Named to sort after create_ot_plans_table.sql
+-- (migrations apply in filename order) instead of alter_..., which sorted before it and
+-- broke on a fresh database.
+IF OBJECT_ID('dbo.OTPlan', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.OTPlan', 'PackageTypeId') IS NULL
+        ALTER TABLE dbo.OTPlan ADD PackageTypeId UNIQUEIDENTIFIER NULL;
+END
 GO
 
 GO
@@ -12176,25 +13767,6 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/create_ot_plans_table__package_type.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- Optional link from an OT Plan to a PackageType â€” plain nullable column, not an enforced FK
--- (matches Admission.OtPlanId's precedent), so this migration doesn't need to run after
--- create_package_types_table.sql. Idempotent. Named to sort after create_ot_plans_table.sql
--- (migrations apply in filename order) instead of alter_..., which sorted before it and
--- broke on a fresh database.
-IF OBJECT_ID('dbo.OTPlan', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.OTPlan', 'PackageTypeId') IS NULL
-        ALTER TABLE dbo.OTPlan ADD PackageTypeId UNIQUEIDENTIFIER NULL;
-END
-GO
-
-GO
-
--- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_package_types_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -12203,7 +13775,7 @@ GO
 -- Migration: Create PackageType Table
 -- Description: Reusable, hospital-scoped billing package labels (e.g. "Full
 --              Package", "Non Package") optionally attached to an OT Plan or an
---              Advise Admission referral. No per-component pricing â€” just a
+--              Advise Admission referral. No per-component pricing — just a
 --              name, an optional overall price, and an optional free-text list
 --              of what's included (OT Med, Ward Med, Room Rent, Procedure...).
 -- =============================================================================
@@ -12237,6 +13809,46 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PkgType_Hospital' AND object_id = OBJECT_ID('dbo.PackageType'))
     CREATE INDEX IX_PkgType_Hospital ON dbo.PackageType (HospitalId, IsActive);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_pathology_result_history_table.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: PathologyResultHistory
+-- Description: Lab results were overwritten in place (even after a report had been generated and
+--              handed to the patient) and the report was regenerated under the same number, leaving no
+--              record of what was reported before. Every overwrite of a result now keeps the PREVIOUS
+--              values here, with who changed it, when, and (mandatory once a report exists) why.
+--              Insert-only. Guarded and idempotent.
+-- =============================================================================
+IF OBJECT_ID('dbo.PathologyResultHistory', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PathologyResultHistory (
+        HistoryId        UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PathologyResultHistory_Id DEFAULT NEWID(),
+        HospitalId       UNIQUEIDENTIFIER NOT NULL,
+        ResultId         UNIQUEIDENTIFIER NOT NULL,
+        OrderLineId      UNIQUEIDENTIFIER NOT NULL,
+        ReportId         UNIQUEIDENTIFIER NULL,          -- the report that was out when the change was made, if any
+        PreviousValuesJson NVARCHAR(MAX)  NOT NULL,
+        PreviousInterpretation NVARCHAR(MAX) NULL,
+        PreviousHasCriticalFlag BIT       NOT NULL CONSTRAINT DF_PathologyResultHistory_Crit DEFAULT (0),
+        PreviousUpdatedAt DATETIME2       NULL,           -- when the previous version was entered
+        PreviousUpdatedBy NVARCHAR(100)   NULL,
+        ChangeReason     NVARCHAR(500)    NULL,           -- required when the result had already been reported
+        ChangedAt        DATETIME2        NOT NULL CONSTRAINT DF_PathologyResultHistory_ChangedAt DEFAULT SYSUTCDATETIME(),
+        ChangedBy        NVARCHAR(100)    NULL,
+        CONSTRAINT PK_PathologyResultHistory PRIMARY KEY CLUSTERED (HistoryId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PathologyResultHistory_Line' AND object_id = OBJECT_ID('dbo.PathologyResultHistory'))
+    CREATE INDEX IX_PathologyResultHistory_Line ON dbo.PathologyResultHistory (HospitalId, OrderLineId, ChangedAt DESC);
 GO
 
 GO
@@ -12498,6 +14110,32 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_public_api_client_table__hospitalid_nullable.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: PublicApiClient becomes a platform-wide key, not per-hospital
+-- Description: PublicApiClient.HospitalId was NOT NULL under the old model (one API
+--              key = one hospital, scoped by PublicApiKeyFilter). The public API is
+--              now a platform-wide, opt-in multi-hospital directory — HospitalId is
+--              resolved per-request from the doctor being queried/booked (+
+--              Hospital.IsPubliclyListed), never from the key. Relax to nullable;
+--              existing rows keep whatever HospitalId they have, but it is now
+--              purely informational (which hospital's admin, if any, requested the
+--              key) and no longer read for authorization. Guarded ALTER, same
+--              pattern as alter_nursing_docs_encounterid_nullable.sql.
+-- Named to sort after create_public_api_client_table.sql (migrations apply in filename
+-- order) instead of alter_..., which sorted before it and broke on a fresh database.
+-- =============================================================================
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.PublicApiClient') AND name = 'HospitalId' AND is_nullable = 0)
+  ALTER TABLE dbo.PublicApiClient ALTER COLUMN HospitalId UNIQUEIDENTIFIER NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_public_api_client_table.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -12506,11 +14144,11 @@ GO
 -- Migration: Create PublicApiClient Table
 -- Description: Per-hospital API key for external integrations (e.g. the Nexeagle
 --              public booking website). One row per external integration per
---              hospital â€” a leaked key only exposes the one hospital it belongs
+--              hospital — a leaked key only exposes the one hospital it belongs
 --              to, never every tenant. ApiKeyHash stores a SHA-256 hash only;
 --              the raw key is shown once at creation and never persisted.
---              No enforced FK to Hospitals â€” same unconstrained convention used
---              elsewhere this session â€” so this migration doesn't need to run
+--              No enforced FK to Hospitals — same unconstrained convention used
+--              elsewhere this session — so this migration doesn't need to run
 --              after the Hospitals table's creation file. Idempotent.
 -- =============================================================================
 
@@ -12543,32 +14181,6 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PublicApiClient_ApiKeyHash' AND object_id = OBJECT_ID('dbo.PublicApiClient'))
     CREATE UNIQUE INDEX IX_PublicApiClient_ApiKeyHash ON dbo.PublicApiClient (ApiKeyHash);
-GO
-
-GO
-
--- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/create_public_api_client_table__hospitalid_nullable.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- =============================================================================
--- Migration: PublicApiClient becomes a platform-wide key, not per-hospital
--- Description: PublicApiClient.HospitalId was NOT NULL under the old model (one API
---              key = one hospital, scoped by PublicApiKeyFilter). The public API is
---              now a platform-wide, opt-in multi-hospital directory â€” HospitalId is
---              resolved per-request from the doctor being queried/booked (+
---              Hospital.IsPubliclyListed), never from the key. Relax to nullable;
---              existing rows keep whatever HospitalId they have, but it is now
---              purely informational (which hospital's admin, if any, requested the
---              key) and no longer read for authorization. Guarded ALTER, same
---              pattern as alter_nursing_docs_encounterid_nullable.sql.
--- Named to sort after create_public_api_client_table.sql (migrations apply in filename
--- order) instead of alter_..., which sorted before it and broke on a fresh database.
--- =============================================================================
-
-IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.PublicApiClient') AND name = 'HospitalId' AND is_nullable = 0)
-  ALTER TABLE dbo.PublicApiClient ALTER COLUMN HospitalId UNIQUEIDENTIFIER NULL;
 GO
 
 GO
@@ -12686,13 +14298,31 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/create_referred_admission_tables__add_package_type.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Optional link from an Advise-Admission referral to a PackageType — plain nullable column, no
+-- enforced FK, so a doctor can tag a package type even when no OT Plan is configured yet.
+-- Idempotent. Named to sort after create_referred_admission_tables.sql (migrations apply in
+-- filename order) instead of alter_..., which sorted before it and broke on a fresh database.
+IF OBJECT_ID('dbo.AdmissionReferral', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.AdmissionReferral', 'PackageTypeId') IS NULL
+        ALTER TABLE dbo.AdmissionReferral ADD PackageTypeId UNIQUEIDENTIFIER NULL;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/create_referred_admission_tables.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- =============================================================================
 -- Migration: Create AdmissionReferral + AdmissionReferralStatusHistory Tables
--- Description: Doctor-initiated "advise admission" worklist â€” created from the
+-- Description: Doctor-initiated "advise admission" worklist — created from the
 --              prescription board, tracked through PENDING/CONVERTED/NOT_ADMITTED/
 --              FOLLOW_UP on the IPD board's Referred Admissions tab, converted
 --              (linked to a real Admission) when the patient is actually admitted.
@@ -12767,24 +14397,6 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ARSH_Referral' AND object_id = OBJECT_ID('dbo.AdmissionReferralStatusHistory'))
     CREATE INDEX IX_ARSH_Referral ON dbo.AdmissionReferralStatusHistory (ReferralId, ChangedAt DESC);
-GO
-
-GO
-
--- ---------------------------------------------------------------------
--- FILE: db/schema/migrations/create_referred_admission_tables__add_package_type.sql
--- ---------------------------------------------------------------------
-SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
-GO
--- Optional link from an Advise-Admission referral to a PackageType â€” plain nullable column, no
--- enforced FK, so a doctor can tag a package type even when no OT Plan is configured yet.
--- Idempotent. Named to sort after create_referred_admission_tables.sql (migrations apply in
--- filename order) instead of alter_..., which sorted before it and broke on a fresh database.
-IF OBJECT_ID('dbo.AdmissionReferral', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.AdmissionReferral', 'PackageTypeId') IS NULL
-        ALTER TABLE dbo.AdmissionReferral ADD PackageTypeId UNIQUEIDENTIFIER NULL;
-END
 GO
 
 GO
@@ -12926,7 +14538,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Inventory Management (INV-1/INV-2): every hospital gets exactly one MAIN store, so existing
 -- InventoryItem/BloodBag/InstrumentSet rows have somewhere to attach to once their Store-linked
--- columns land in later migrations. Idempotent â€” safe to re-run (skips hospitals that already
+-- columns land in later migrations. Idempotent — safe to re-run (skips hospitals that already
 -- have one).
 --
 -- The opening-balance Batch/StockLevel backfill (INV-2, originally its own
@@ -12946,7 +14558,7 @@ GO
 
 -- Every InventoryItem with existing stock gets one opening-balance Batch (in its hospital's Main
 -- Store) plus a matching StockLevel row, so FEFO/batch queries have something to work with from
--- day one instead of a stock number with no batch behind it. Idempotent â€” guarded per item
+-- day one instead of a stock number with no batch behind it. Idempotent — guarded per item
 -- (OPENING-BAL batch number), safe to re-run.
 
 INSERT INTO dbo.Batch (BatchId, HospitalId, InventoryItemId, StoreId, BatchNumber, ManufactureDate, ExpiryDate, UnitCost, ReceivedQty, RemainingQty, [Status], CreatedAt, UpdatedAt)
@@ -12978,7 +14590,7 @@ SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Data fix, not a schema change. The Configuration page's "IPD Bed Charge: Auto" toggle wrote
 -- IpdBedChargeMode = 'AUTO', but the nightly bed-charge job (easyHMSNightJob) has always checked
--- for 'DAILY_AUTO' (matching this column's documented intent) â€” the two never matched, so any
+-- for 'DAILY_AUTO' (matching this column's documented intent) — the two never matched, so any
 -- hospital that already flipped the toggle before this fix silently got no automatic bed charges.
 -- Idempotent: safe to re-run, only touches rows still carrying the stale 'AUTO' value.
 
@@ -13074,7 +14686,7 @@ WHERE TestCode = N'SER-RA' AND ParameterSchemaJson LIKE N'%"RA Factor","unit":"I
 
 -- ENDO-THYROID -- flat shape -> enriched, no clinical value change.
 UPDATE dbo.PathologyTestMaster
-SET ParameterSchemaJson = N'{"params":[{"name":"T3","unit":"ng/dL","maleMin":80,"maleMax":200,"femaleMin":80,"femaleMax":200},{"name":"T4","unit":"Âµg/dL","maleMin":5.1,"maleMax":14.1,"femaleMin":5.1,"femaleMax":14.1},{"name":"TSH","unit":"ÂµIU/mL","maleMin":0.27,"maleMax":4.20,"femaleMin":0.27,"femaleMax":4.20}]}'
+SET ParameterSchemaJson = N'{"params":[{"name":"T3","unit":"ng/dL","maleMin":80,"maleMax":200,"femaleMin":80,"femaleMax":200},{"name":"T4","unit":"µg/dL","maleMin":5.1,"maleMax":14.1,"femaleMin":5.1,"femaleMax":14.1},{"name":"TSH","unit":"µIU/mL","maleMin":0.27,"maleMax":4.20,"femaleMin":0.27,"femaleMax":4.20}]}'
 WHERE TestCode = N'ENDO-THYROID' AND ParameterSchemaJson LIKE N'%"T3","unit":"ng/dL","min":80,"max":200%';
 
 -- ENDO-PROLACTIN -- flat shape -> enriched WITH a real gender split (non-pregnant female
@@ -13085,8 +14697,8 @@ WHERE TestCode = N'ENDO-PROLACTIN' AND ParameterSchemaJson LIKE N'%"Prolactin","
 
 -- ENDO-CORTISOL -- flat shape -> enriched, no clinical value change.
 UPDATE dbo.PathologyTestMaster
-SET ParameterSchemaJson = N'{"params":[{"name":"Cortisol (AM)","unit":"Âµg/dL","maleMin":6.2,"maleMax":19.4,"femaleMin":6.2,"femaleMax":19.4}]}'
-WHERE TestCode = N'ENDO-CORTISOL' AND ParameterSchemaJson LIKE N'%"Cortisol (AM)","unit":"Âµg/dL","min":6.2,"max":19.4%';
+SET ParameterSchemaJson = N'{"params":[{"name":"Cortisol (AM)","unit":"µg/dL","maleMin":6.2,"maleMax":19.4,"femaleMin":6.2,"femaleMax":19.4}]}'
+WHERE TestCode = N'ENDO-CORTISOL' AND ParameterSchemaJson LIKE N'%"Cortisol (AM)","unit":"µg/dL","min":6.2,"max":19.4%';
 
 -- ENDO-VITD -- flat shape -> enriched, no clinical value change.
 UPDATE dbo.PathologyTestMaster
@@ -13102,6 +14714,689 @@ GO
 GO
 
 -- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/health_wiki_01_contributor_tables.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Health Wiki, part 1 of 3 - contributors, access links, OTP, sessions.
+-- Description: A contributor is anyone who writes or reviews a Health Wiki article. Hospital doctors link to
+--              dbo.Doctors through DoctorId; independent doctors, health workers and writers have no EasyHMS
+--              login, so they live only here and sign in with a WhatsApp OTP (ContributorOtp -> ContributorSession).
+--              HealthArticleAccessLink holds the single-use invitation links the CMS sends over WhatsApp.
+--              Mobile numbers are stored as 10 digits, are never exposed publicly, and codes/tokens are stored hashed.
+--              Guarded and idempotent. Part 2 reworks dbo.HealthArticle, part 3 adds reviews, topics and statistics.
+-- =============================================================================
+IF OBJECT_ID('dbo.HealthWikiContributor', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HealthWikiContributor (
+        ContributorId        UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HWContributor_Id DEFAULT NEWSEQUENTIALID(),
+        [Type]               NVARCHAR(20)     NOT NULL,
+        FullName             NVARCHAR(200)    NOT NULL,
+        Mobile               NVARCHAR(10)     NULL,
+        Email                NVARCHAR(200)    NULL,
+        PhotoUrl             NVARCHAR(500)    NULL,
+        Bio                  NVARCHAR(1000)   NULL,
+        Speciality           NVARCHAR(150)    NULL,
+        Qualification        NVARCHAR(200)    NULL,
+        RegistrationNumber   NVARCHAR(50)     NULL,
+        RegistrationCouncil  NVARCHAR(150)    NULL,
+        RegistrationYear     INT              NULL,
+        RoleTitle            NVARCHAR(150)    NULL,
+        Organisation         NVARCHAR(200)    NULL,
+        FieldOfWork          NVARCHAR(300)    NULL,
+        [Status]             NVARCHAR(10)     NOT NULL CONSTRAINT DF_HWContributor_Status DEFAULT 'PENDING',
+        RejectReason         NVARCHAR(500)    NULL,
+        EnrolmentSource      NVARCHAR(15)     NOT NULL CONSTRAINT DF_HWContributor_Source DEFAULT 'SELF_ENROLLED',
+        DoctorId             UNIQUEIDENTIFIER NULL,
+        ConsentAt            DATETIME2(3)     NULL,
+        ConsentVersion       NVARCHAR(20)     NULL,
+        VerifiedAt           DATETIME2(3)     NULL,
+        VerifiedBy           NVARCHAR(200)    NULL,
+        LinkSentAt           DATETIME2(3)     NULL,
+        CreatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_HWContributor_CreatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_HWContributor_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HWContributor PRIMARY KEY CLUSTERED (ContributorId),
+        CONSTRAINT CK_HWContributor_Type CHECK ([Type] IN ('HOSPITAL_DOCTOR','INDEPENDENT_DOCTOR','HEALTH_WORKER','WRITER','STAFF')),
+        CONSTRAINT CK_HWContributor_Status CHECK ([Status] IN ('INVITED','PENDING','VERIFIED','REJECTED')),
+        CONSTRAINT CK_HWContributor_Source CHECK (EnrolmentSource IN ('INVITED','SELF_ENROLLED')),
+        CONSTRAINT CK_HWContributor_Mobile CHECK (Mobile IS NULL OR (LEN(Mobile) = 10 AND Mobile NOT LIKE '%[^0-9]%')),
+        -- A doctor is never VERIFIED without the registration the public badge prints.
+        CONSTRAINT CK_HWContributor_DoctorReg CHECK (
+            [Type] NOT IN ('HOSPITAL_DOCTOR','INDEPENDENT_DOCTOR') OR [Status] <> 'VERIFIED'
+            OR (RegistrationNumber IS NOT NULL AND RegistrationCouncil IS NOT NULL)),
+        CONSTRAINT CK_HWContributor_HospitalLink CHECK ([Type] <> 'HOSPITAL_DOCTOR' OR DoctorId IS NOT NULL),
+        CONSTRAINT FK_HWContributor_Doctor FOREIGN KEY (DoctorId) REFERENCES dbo.Doctors(DoctorID)
+    );
+END
+GO
+
+-- One person, one number: a mobile can belong to a single contributor.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_HWContributor_Mobile' AND object_id = OBJECT_ID('dbo.HealthWikiContributor'))
+    CREATE UNIQUE INDEX UX_HWContributor_Mobile ON dbo.HealthWikiContributor (Mobile) WHERE Mobile IS NOT NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_HWContributor_Doctor' AND object_id = OBJECT_ID('dbo.HealthWikiContributor'))
+    CREATE UNIQUE INDEX UX_HWContributor_Doctor ON dbo.HealthWikiContributor (DoctorId) WHERE DoctorId IS NOT NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWContributor_Status' AND object_id = OBJECT_ID('dbo.HealthWikiContributor'))
+    CREATE INDEX IX_HWContributor_Status ON dbo.HealthWikiContributor ([Status], [Type], CreatedAt DESC);
+GO
+
+-- Invitation links sent over WhatsApp. Only the SHA-256 of the token is stored.
+-- ArticleId is null for a JOIN link (invite to enrol, no article yet); the FK to dbo.HealthArticle is added in part 2.
+IF OBJECT_ID('dbo.HealthArticleAccessLink', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HealthArticleAccessLink (
+        LinkId           UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HWLink_Id DEFAULT NEWSEQUENTIALID(),
+        TokenHash        CHAR(64)         NOT NULL,
+        [Role]           NVARCHAR(10)     NOT NULL,
+        ArticleId        UNIQUEIDENTIFIER NULL,
+        ContributorId    UNIQUEIDENTIFIER NULL,
+        InviteeName      NVARCHAR(200)    NULL,
+        Mobile           NVARCHAR(10)     NOT NULL,
+        CreatedByName    NVARCHAR(200)    NULL,
+        ExpiresAt        DATETIME2(3)     NOT NULL,
+        UsedAt           DATETIME2(3)     NULL,
+        RevokedAt        DATETIME2(3)     NULL,
+        SendCount        INT              NOT NULL CONSTRAINT DF_HWLink_Sends DEFAULT (0),
+        LastSentAt       DATETIME2(3)     NULL,
+        CreatedAt        DATETIME2(3)     NOT NULL CONSTRAINT DF_HWLink_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HWLink PRIMARY KEY CLUSTERED (LinkId),
+        CONSTRAINT CK_HWLink_Role CHECK ([Role] IN ('REVIEW','WRITE','JOIN')),
+        CONSTRAINT CK_HWLink_Mobile CHECK (LEN(Mobile) = 10 AND Mobile NOT LIKE '%[^0-9]%'),
+        CONSTRAINT CK_HWLink_ArticleRole CHECK ([Role] = 'JOIN' OR ArticleId IS NOT NULL),
+        CONSTRAINT FK_HWLink_Contributor FOREIGN KEY (ContributorId) REFERENCES dbo.HealthWikiContributor(ContributorId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_HWLink_Token' AND object_id = OBJECT_ID('dbo.HealthArticleAccessLink'))
+    CREATE UNIQUE INDEX UX_HWLink_Token ON dbo.HealthArticleAccessLink (TokenHash);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWLink_Article' AND object_id = OBJECT_ID('dbo.HealthArticleAccessLink'))
+    CREATE INDEX IX_HWLink_Article ON dbo.HealthArticleAccessLink (ArticleId, [Role]) WHERE ArticleId IS NOT NULL;
+GO
+
+-- WhatsApp OTPs. Only a hash of the code is stored; Attempts caps guessing, and the index on
+-- (Mobile, CreatedAt) serves the "how many codes did this number ask for lately" rate limit.
+IF OBJECT_ID('dbo.ContributorOtp', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.ContributorOtp (
+        OtpId        UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HWOtp_Id DEFAULT NEWSEQUENTIALID(),
+        Mobile       NVARCHAR(10)     NOT NULL,
+        CodeHash     CHAR(64)         NOT NULL,
+        LinkId       UNIQUEIDENTIFIER NULL,
+        Attempts     INT              NOT NULL CONSTRAINT DF_HWOtp_Attempts DEFAULT (0),
+        ExpiresAt    DATETIME2(3)     NOT NULL,
+        ConsumedAt   DATETIME2(3)     NULL,
+        RequestIp    NVARCHAR(45)     NULL,
+        CreatedAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_HWOtp_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HWOtp PRIMARY KEY CLUSTERED (OtpId),
+        CONSTRAINT CK_HWOtp_Mobile CHECK (LEN(Mobile) = 10 AND Mobile NOT LIKE '%[^0-9]%'),
+        CONSTRAINT FK_HWOtp_Link FOREIGN KEY (LinkId) REFERENCES dbo.HealthArticleAccessLink(LinkId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWOtp_Mobile' AND object_id = OBJECT_ID('dbo.ContributorOtp'))
+    CREATE INDEX IX_HWOtp_Mobile ON dbo.ContributorOtp (Mobile, CreatedAt DESC);
+GO
+
+-- Sign-in sessions after OTP. The browser holds an HttpOnly cookie; only its hash is stored here.
+IF OBJECT_ID('dbo.ContributorSession', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.ContributorSession (
+        SessionId      UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HWSession_Id DEFAULT NEWSEQUENTIALID(),
+        ContributorId  UNIQUEIDENTIFIER NOT NULL,
+        TokenHash      CHAR(64)         NOT NULL,
+        ExpiresAt      DATETIME2(3)     NOT NULL,
+        LastSeenAt     DATETIME2(3)     NULL,
+        RevokedAt      DATETIME2(3)     NULL,
+        CreatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_HWSession_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HWSession PRIMARY KEY CLUSTERED (SessionId),
+        CONSTRAINT FK_HWSession_Contributor FOREIGN KEY (ContributorId) REFERENCES dbo.HealthWikiContributor(ContributorId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_HWSession_Token' AND object_id = OBJECT_ID('dbo.ContributorSession'))
+    CREATE UNIQUE INDEX UX_HWSession_Token ON dbo.ContributorSession (TokenHash);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWSession_Contributor' AND object_id = OBJECT_ID('dbo.ContributorSession'))
+    CREATE INDEX IX_HWSession_Contributor ON dbo.ContributorSession (ContributorId, ExpiresAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/health_wiki_02_article_rework.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Health Wiki, part 2 of 3 - rework dbo.HealthArticle for contributors and article types.
+-- Description: The first version of HealthArticle pointed author and reviewer at dbo.Doctors, which cannot hold
+--              independent doctors, health workers or writers. This adds the contributor columns and FKs, the
+--              article Type (MEDICAL needs a doctor reviewer, SECTOR_UPDATE never has one), cover image, disclosure,
+--              references, the reviewer's comment, and running view/like totals.
+--              Existing author/reviewer doctors are copied into HealthWikiContributor (HOSPITAL_DOCTOR, PENDING until
+--              their registration is verified, so no public badge appears by accident) and the new columns are filled.
+--              The old AuthorDoctorId / ReviewerDoctorId columns are KEPT (nullable, deprecated) so the API running
+--              today keeps working until it is redeployed; a later migration drops them.
+--              Requires part 1. Guarded and idempotent.
+-- =============================================================================
+IF OBJECT_ID('dbo.HealthWikiContributor', 'U') IS NULL
+    THROW 51000, 'health_wiki_01_contributor_tables.sql must run before health_wiki_02_article_rework.sql', 1;
+GO
+
+IF COL_LENGTH('dbo.HealthArticle', 'Type') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD [Type] NVARCHAR(20) NOT NULL CONSTRAINT DF_HealthArticle_Type DEFAULT 'MEDICAL';
+GO
+IF COL_LENGTH('dbo.HealthArticle', 'CoverImageUrl') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD CoverImageUrl NVARCHAR(500) NULL;
+GO
+IF COL_LENGTH('dbo.HealthArticle', 'CoverImageAlt') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD CoverImageAlt NVARCHAR(300) NULL;
+GO
+IF COL_LENGTH('dbo.HealthArticle', 'Disclosure') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD Disclosure NVARCHAR(1000) NULL;
+GO
+IF COL_LENGTH('dbo.HealthArticle', 'References') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD [References] NVARCHAR(MAX) NULL;
+GO
+IF COL_LENGTH('dbo.HealthArticle', 'AuthorContributorId') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD AuthorContributorId UNIQUEIDENTIFIER NULL;
+GO
+IF COL_LENGTH('dbo.HealthArticle', 'ReviewerContributorId') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD ReviewerContributorId UNIQUEIDENTIFIER NULL;
+GO
+-- The reviewer's or editor's note when an article was sent back for changes.
+IF COL_LENGTH('dbo.HealthArticle', 'ReviewerComment') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD ReviewerComment NVARCHAR(1000) NULL;
+GO
+IF COL_LENGTH('dbo.HealthArticle', 'SubmittedAt') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD SubmittedAt DATETIME2(3) NULL;
+GO
+-- Set when the reviewer approved. An approved MEDICAL article stays IN_REVIEW until the reviewer's
+-- registration is verified; then it is published (the "awaiting verification" state in the contributor pages).
+IF COL_LENGTH('dbo.HealthArticle', 'ApprovedAt') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD ApprovedAt DATETIME2(3) NULL;
+GO
+-- Who approved a SECTOR_UPDATE (a CMS editor, not a doctor). Plain text because CMS users live in the CMS database.
+IF COL_LENGTH('dbo.HealthArticle', 'ApprovedByName') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD ApprovedByName NVARCHAR(200) NULL;
+GO
+IF COL_LENGTH('dbo.HealthArticle', 'ViewCount') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD ViewCount BIGINT NOT NULL CONSTRAINT DF_HealthArticle_Views DEFAULT (0);
+GO
+IF COL_LENGTH('dbo.HealthArticle', 'LikeCount') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD LikeCount BIGINT NOT NULL CONSTRAINT DF_HealthArticle_Likes DEFAULT (0);
+GO
+
+-- Copy every doctor used as author or reviewer into the contributor table (hospital doctors, no mobile).
+INSERT INTO dbo.HealthWikiContributor
+    (ContributorId, [Type], FullName, Qualification, RegistrationNumber, RegistrationCouncil, RegistrationYear,
+     [Status], EnrolmentSource, DoctorId)
+SELECT NEWID(), 'HOSPITAL_DOCTOR', COALESCE(NULLIF(up.FullName, N''), N'Doctor'), d.Qualification,
+       d.LicenseNumber, d.MedicalCouncil, d.RegistrationYear, 'PENDING', 'INVITED', d.DoctorID
+FROM dbo.Doctors d
+LEFT JOIN dbo.UserProfiles up ON up.UserID = d.UserID
+WHERE d.DoctorID IN (SELECT AuthorDoctorId FROM dbo.HealthArticle WHERE AuthorDoctorId IS NOT NULL
+                     UNION
+                     SELECT ReviewerDoctorId FROM dbo.HealthArticle WHERE ReviewerDoctorId IS NOT NULL)
+  AND NOT EXISTS (SELECT 1 FROM dbo.HealthWikiContributor c WHERE c.DoctorId = d.DoctorID);
+GO
+
+UPDATE a SET a.AuthorContributorId = c.ContributorId
+FROM dbo.HealthArticle a JOIN dbo.HealthWikiContributor c ON c.DoctorId = a.AuthorDoctorId
+WHERE a.AuthorContributorId IS NULL AND a.AuthorDoctorId IS NOT NULL;
+GO
+
+UPDATE a SET a.ReviewerContributorId = c.ContributorId
+FROM dbo.HealthArticle a JOIN dbo.HealthWikiContributor c ON c.DoctorId = a.ReviewerDoctorId
+WHERE a.ReviewerContributorId IS NULL AND a.ReviewerDoctorId IS NOT NULL;
+GO
+
+-- A MEDICAL article may not be public without a doctor reviewer. Anything live that breaks this rule goes
+-- back to review instead of the constraint failing the deploy.
+UPDATE dbo.HealthArticle
+SET [Status] = 'IN_REVIEW', PublishedAt = NULL, UpdatedAt = SYSUTCDATETIME()
+WHERE [Status] = 'PUBLISHED' AND [Type] = 'MEDICAL' AND ReviewerContributorId IS NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HealthArticle_AuthorContributor')
+    ALTER TABLE dbo.HealthArticle ADD CONSTRAINT FK_HealthArticle_AuthorContributor
+        FOREIGN KEY (AuthorContributorId) REFERENCES dbo.HealthWikiContributor(ContributorId);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HealthArticle_ReviewerContributor')
+    ALTER TABLE dbo.HealthArticle ADD CONSTRAINT FK_HealthArticle_ReviewerContributor
+        FOREIGN KEY (ReviewerContributorId) REFERENCES dbo.HealthWikiContributor(ContributorId);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HealthArticle_Type')
+    ALTER TABLE dbo.HealthArticle ADD CONSTRAINT CK_HealthArticle_Type CHECK ([Type] IN ('MEDICAL','SECTOR_UPDATE'));
+GO
+-- A sector update is never doctor-reviewed, so it never carries a reviewer (and so never the badge).
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HealthArticle_SectorNoReviewer')
+    ALTER TABLE dbo.HealthArticle ADD CONSTRAINT CK_HealthArticle_SectorNoReviewer
+        CHECK ([Type] <> 'SECTOR_UPDATE' OR ReviewerContributorId IS NULL);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HealthArticle_MedicalPublishedNeedsReviewer')
+    ALTER TABLE dbo.HealthArticle ADD CONSTRAINT CK_HealthArticle_MedicalPublishedNeedsReviewer
+        CHECK ([Status] <> 'PUBLISHED' OR [Type] <> 'MEDICAL' OR ReviewerContributorId IS NOT NULL);
+GO
+-- A cover image needs alt text (accessibility; the CMS and contributor forms enforce it too).
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HealthArticle_CoverAlt')
+    ALTER TABLE dbo.HealthArticle ADD CONSTRAINT CK_HealthArticle_CoverAlt
+        CHECK (CoverImageUrl IS NULL OR LEN(LTRIM(RTRIM(COALESCE(CoverImageAlt, N'')))) > 0);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HealthArticle_Author' AND object_id = OBJECT_ID('dbo.HealthArticle'))
+    CREATE INDEX IX_HealthArticle_Author ON dbo.HealthArticle (AuthorContributorId, [Status]) WHERE AuthorContributorId IS NOT NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HealthArticle_Reviewer' AND object_id = OBJECT_ID('dbo.HealthArticle'))
+    CREATE INDEX IX_HealthArticle_Reviewer ON dbo.HealthArticle (ReviewerContributorId, [Status]) WHERE ReviewerContributorId IS NOT NULL;
+GO
+
+-- The access-link table (part 1) can now point at articles.
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_HWLink_Article')
+    ALTER TABLE dbo.HealthArticleAccessLink ADD CONSTRAINT FK_HWLink_Article
+        FOREIGN KEY (ArticleId) REFERENCES dbo.HealthArticle(ArticleId);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/health_wiki_03_reviews_topics_stats.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Health Wiki, part 3 of 3 - reviews, topic requests, images, statistics, audit trail.
+-- Description: HealthArticleReview keeps every decision a reviewer made (with a snapshot of the name and registration
+--              shown on the badge at that moment). HealthWikiTopicRequest holds topics contributors suggest.
+--              HealthArticleImage records uploaded images (the files live in the object store). HealthArticleLike
+--              de-duplicates the Helpful button per visitor (only a hash of the visitor key is kept) and
+--              HealthArticleStatDaily holds per-day view/like counts for the 14-day chart. HealthWikiAudit is the
+--              history shown in the CMS. Requires parts 1 and 2. Guarded and idempotent.
+-- =============================================================================
+IF OBJECT_ID('dbo.HealthArticle', 'U') IS NULL OR OBJECT_ID('dbo.HealthWikiContributor', 'U') IS NULL
+    THROW 51000, 'health_wiki_01 and health_wiki_02 must run before health_wiki_03_reviews_topics_stats.sql', 1;
+GO
+
+IF OBJECT_ID('dbo.HealthArticleReview', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HealthArticleReview (
+        ReviewId              UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HWReview_Id DEFAULT NEWSEQUENTIALID(),
+        ArticleId             UNIQUEIDENTIFIER NOT NULL,
+        ReviewerContributorId UNIQUEIDENTIFIER NOT NULL,
+        Decision              NVARCHAR(20)     NOT NULL,
+        Comment               NVARCHAR(1000)   NULL,
+        AccuracyConfirmed     BIT              NOT NULL CONSTRAINT DF_HWReview_Accuracy DEFAULT (0),
+        ReviewerNameSnapshot  NVARCHAR(200)    NOT NULL,
+        RegistrationSnapshot  NVARCHAR(250)    NULL,
+        DecidedAt             DATETIME2(3)     NOT NULL CONSTRAINT DF_HWReview_DecidedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HWReview PRIMARY KEY CLUSTERED (ReviewId),
+        CONSTRAINT CK_HWReview_Decision CHECK (Decision IN ('APPROVE','REQUEST_CHANGES')),
+        -- Asking for changes needs a real comment; approving needs the accuracy tick.
+        CONSTRAINT CK_HWReview_Comment CHECK (Decision <> 'REQUEST_CHANGES' OR LEN(LTRIM(RTRIM(COALESCE(Comment, N'')))) >= 10),
+        CONSTRAINT CK_HWReview_Accuracy CHECK (Decision <> 'APPROVE' OR AccuracyConfirmed = 1),
+        CONSTRAINT FK_HWReview_Article FOREIGN KEY (ArticleId) REFERENCES dbo.HealthArticle(ArticleId),
+        CONSTRAINT FK_HWReview_Reviewer FOREIGN KEY (ReviewerContributorId) REFERENCES dbo.HealthWikiContributor(ContributorId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWReview_Article' AND object_id = OBJECT_ID('dbo.HealthArticleReview'))
+    CREATE INDEX IX_HWReview_Article ON dbo.HealthArticleReview (ArticleId, DecidedAt DESC);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWReview_Reviewer' AND object_id = OBJECT_ID('dbo.HealthArticleReview'))
+    CREATE INDEX IX_HWReview_Reviewer ON dbo.HealthArticleReview (ReviewerContributorId, DecidedAt DESC);
+GO
+
+IF OBJECT_ID('dbo.HealthWikiTopicRequest', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HealthWikiTopicRequest (
+        TopicId        UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HWTopic_Id DEFAULT NEWSEQUENTIALID(),
+        ContributorId  UNIQUEIDENTIFIER NOT NULL,
+        Title          NVARCHAR(200)    NOT NULL,
+        [Type]         NVARCHAR(20)     NOT NULL CONSTRAINT DF_HWTopic_Type DEFAULT 'MEDICAL',
+        Outline        NVARCHAR(2000)   NOT NULL,
+        WhyItMatters   NVARCHAR(1000)   NULL,
+        ConditionSlug  NVARCHAR(200)    NULL,
+        [References]   NVARCHAR(2000)   NULL,
+        [Status]       NVARCHAR(20)     NOT NULL CONSTRAINT DF_HWTopic_Status DEFAULT 'SUBMITTED',
+        DecisionNote   NVARCHAR(1000)   NULL,
+        DecidedByName  NVARCHAR(200)    NULL,
+        ArticleId      UNIQUEIDENTIFIER NULL,
+        CreatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_HWTopic_CreatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_HWTopic_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HWTopic PRIMARY KEY CLUSTERED (TopicId),
+        CONSTRAINT CK_HWTopic_Type CHECK ([Type] IN ('MEDICAL','SECTOR_UPDATE')),
+        CONSTRAINT CK_HWTopic_Status CHECK ([Status] IN ('SUBMITTED','NEEDS_DETAIL','ACCEPTED','DECLINED','ARTICLE_STARTED')),
+        -- A decline or a request for detail always carries the reason the contributor will read.
+        CONSTRAINT CK_HWTopic_Note CHECK ([Status] NOT IN ('DECLINED','NEEDS_DETAIL') OR LEN(LTRIM(RTRIM(COALESCE(DecisionNote, N'')))) > 0),
+        CONSTRAINT FK_HWTopic_Contributor FOREIGN KEY (ContributorId) REFERENCES dbo.HealthWikiContributor(ContributorId),
+        CONSTRAINT FK_HWTopic_Article FOREIGN KEY (ArticleId) REFERENCES dbo.HealthArticle(ArticleId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWTopic_Contributor' AND object_id = OBJECT_ID('dbo.HealthWikiTopicRequest'))
+    CREATE INDEX IX_HWTopic_Contributor ON dbo.HealthWikiTopicRequest (ContributorId, [Status], CreatedAt DESC);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWTopic_Status' AND object_id = OBJECT_ID('dbo.HealthWikiTopicRequest'))
+    CREATE INDEX IX_HWTopic_Status ON dbo.HealthWikiTopicRequest ([Status], CreatedAt DESC);
+GO
+
+IF OBJECT_ID('dbo.HealthArticleImage', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HealthArticleImage (
+        ImageId        UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HWImage_Id DEFAULT NEWSEQUENTIALID(),
+        ArticleId      UNIQUEIDENTIFIER NULL,
+        ContributorId  UNIQUEIDENTIFIER NULL,
+        UploadedByName NVARCHAR(200)    NULL,
+        Url            NVARCHAR(500)    NOT NULL,
+        ContentType    NVARCHAR(50)     NOT NULL,
+        SizeBytes      INT              NOT NULL,
+        AltText        NVARCHAR(300)    NULL,
+        CreatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_HWImage_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HWImage PRIMARY KEY CLUSTERED (ImageId),
+        CONSTRAINT CK_HWImage_Type CHECK (ContentType IN ('image/jpeg','image/png','image/webp')),
+        CONSTRAINT CK_HWImage_Size CHECK (SizeBytes > 0 AND SizeBytes <= 2097152),
+        CONSTRAINT CK_HWImage_Https CHECK (Url LIKE 'https://%'),
+        CONSTRAINT FK_HWImage_Article FOREIGN KEY (ArticleId) REFERENCES dbo.HealthArticle(ArticleId),
+        CONSTRAINT FK_HWImage_Contributor FOREIGN KEY (ContributorId) REFERENCES dbo.HealthWikiContributor(ContributorId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWImage_Article' AND object_id = OBJECT_ID('dbo.HealthArticleImage'))
+    CREATE INDEX IX_HWImage_Article ON dbo.HealthArticleImage (ArticleId) WHERE ArticleId IS NOT NULL;
+GO
+
+-- Helpful button: one like per visitor per article. VisitorKeyHash is a salted hash, never an IP or a cookie value.
+IF OBJECT_ID('dbo.HealthArticleLike', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HealthArticleLike (
+        ArticleId       UNIQUEIDENTIFIER NOT NULL,
+        VisitorKeyHash  CHAR(64)         NOT NULL,
+        CreatedAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_HWLike_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HWLike PRIMARY KEY CLUSTERED (ArticleId, VisitorKeyHash),
+        CONSTRAINT FK_HWLike_Article FOREIGN KEY (ArticleId) REFERENCES dbo.HealthArticle(ArticleId)
+    );
+END
+GO
+
+-- Per-day counts for the 14-day views chart; ViewCount/LikeCount on HealthArticle hold the running totals.
+IF OBJECT_ID('dbo.HealthArticleStatDaily', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HealthArticleStatDaily (
+        ArticleId  UNIQUEIDENTIFIER NOT NULL,
+        StatDate   DATE             NOT NULL,
+        Views      INT              NOT NULL CONSTRAINT DF_HWStat_Views DEFAULT (0),
+        Likes      INT              NOT NULL CONSTRAINT DF_HWStat_Likes DEFAULT (0),
+        CONSTRAINT PK_HWStat PRIMARY KEY CLUSTERED (ArticleId, StatDate),
+        CONSTRAINT CK_HWStat_NonNegative CHECK (Views >= 0 AND Likes >= 0),
+        CONSTRAINT FK_HWStat_Article FOREIGN KEY (ArticleId) REFERENCES dbo.HealthArticle(ArticleId)
+    );
+END
+GO
+
+-- History shown in the CMS (who did what, when). EntityId points at an article, contributor or topic.
+IF OBJECT_ID('dbo.HealthWikiAudit', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HealthWikiAudit (
+        AuditId     BIGINT IDENTITY(1,1) NOT NULL,
+        EntityType  NVARCHAR(15)     NOT NULL,
+        EntityId    UNIQUEIDENTIFIER NOT NULL,
+        [Action]    NVARCHAR(50)     NOT NULL,
+        ActorType   NVARCHAR(15)     NOT NULL,
+        ActorName   NVARCHAR(200)    NULL,
+        Detail      NVARCHAR(1000)   NULL,
+        CreatedAt   DATETIME2(3)     NOT NULL CONSTRAINT DF_HWAudit_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HWAudit PRIMARY KEY CLUSTERED (AuditId),
+        CONSTRAINT CK_HWAudit_Entity CHECK (EntityType IN ('ARTICLE','CONTRIBUTOR','TOPIC')),
+        CONSTRAINT CK_HWAudit_Actor CHECK (ActorType IN ('CMS_USER','CONTRIBUTOR','DOCTOR_STAFF','SYSTEM'))
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWAudit_Entity' AND object_id = OBJECT_ID('dbo.HealthWikiAudit'))
+    CREATE INDEX IX_HWAudit_Entity ON dbo.HealthWikiAudit (EntityType, EntityId, CreatedAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/health_wiki_04_article_revision.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Health Wiki, part 4 - pending revisions of a published article.
+-- Description: Editing a PUBLISHED article must not change what readers see until the edit is approved
+--              (a doctor for MEDICAL, a CMS editor for SECTOR_UPDATE). The edit is held here as a working copy.
+--              At most one open revision (DRAFT or IN_REVIEW) per article; when approved its fields are copied onto
+--              dbo.HealthArticle and it is marked APPLIED, otherwise DISCARDED. Requires parts 1 to 3. Guarded and idempotent.
+-- =============================================================================
+IF OBJECT_ID('dbo.HealthArticle', 'U') IS NULL OR OBJECT_ID('dbo.HealthWikiContributor', 'U') IS NULL
+    THROW 51000, 'health_wiki_01 to _03 must run before health_wiki_04_article_revision.sql', 1;
+GO
+
+IF OBJECT_ID('dbo.HealthArticleRevision', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HealthArticleRevision (
+        RevisionId           UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HWRevision_Id DEFAULT NEWSEQUENTIALID(),
+        ArticleId            UNIQUEIDENTIFIER NOT NULL,
+        Title                NVARCHAR(300)    NOT NULL,
+        [Description]        NVARCHAR(1000)   NULL,
+        Content              NVARCHAR(MAX)    NOT NULL,
+        RelatedConditionSlug NVARCHAR(200)    NULL,
+        CoverImageUrl        NVARCHAR(500)    NULL,
+        CoverImageAlt        NVARCHAR(300)    NULL,
+        Disclosure           NVARCHAR(1000)   NULL,
+        [References]         NVARCHAR(MAX)    NULL,
+        EditedByContributorId UNIQUEIDENTIFIER NULL,
+        EditedByName         NVARCHAR(200)    NULL,
+        [Status]             NVARCHAR(10)     NOT NULL CONSTRAINT DF_HWRevision_Status DEFAULT 'DRAFT',
+        ReviewerComment      NVARCHAR(1000)   NULL,
+        CreatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_HWRevision_CreatedAt DEFAULT SYSUTCDATETIME(),
+        UpdatedAt            DATETIME2(3)     NOT NULL CONSTRAINT DF_HWRevision_UpdatedAt DEFAULT SYSUTCDATETIME(),
+        ResolvedAt           DATETIME2(3)     NULL,
+        CONSTRAINT PK_HWRevision PRIMARY KEY CLUSTERED (RevisionId),
+        CONSTRAINT CK_HWRevision_Status CHECK ([Status] IN ('DRAFT','IN_REVIEW','APPLIED','DISCARDED')),
+        CONSTRAINT CK_HWRevision_CoverAlt CHECK (CoverImageUrl IS NULL OR LEN(LTRIM(RTRIM(COALESCE(CoverImageAlt, N'')))) > 0),
+        CONSTRAINT FK_HWRevision_Article FOREIGN KEY (ArticleId) REFERENCES dbo.HealthArticle(ArticleId),
+        CONSTRAINT FK_HWRevision_Editor FOREIGN KEY (EditedByContributorId) REFERENCES dbo.HealthWikiContributor(ContributorId)
+    );
+END
+GO
+
+-- One open working copy per article.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_HWRevision_OpenPerArticle' AND object_id = OBJECT_ID('dbo.HealthArticleRevision'))
+    CREATE UNIQUE INDEX UX_HWRevision_OpenPerArticle ON dbo.HealthArticleRevision (ArticleId) WHERE [Status] IN ('DRAFT','IN_REVIEW');
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWRevision_Status' AND object_id = OBJECT_ID('dbo.HealthArticleRevision'))
+    CREATE INDEX IX_HWRevision_Status ON dbo.HealthArticleRevision ([Status], UpdatedAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/health_wiki_05_fk_indexes.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Health Wiki, part 5 - indexes on foreign key columns that had none.
+-- Description: SQL Server does not index foreign key columns by itself. Without these, deleting or updating a
+--              contributor, link, article or topic scans the child table, and joins on these columns are slower.
+--              Filtered to non-null values because most rows leave these optional columns empty.
+--              Guarded and idempotent.
+-- =============================================================================
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWLink_Contributor' AND object_id = OBJECT_ID('dbo.HealthArticleAccessLink'))
+    CREATE INDEX IX_HWLink_Contributor ON dbo.HealthArticleAccessLink (ContributorId) WHERE ContributorId IS NOT NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWOtp_Link' AND object_id = OBJECT_ID('dbo.ContributorOtp'))
+    CREATE INDEX IX_HWOtp_Link ON dbo.ContributorOtp (LinkId) WHERE LinkId IS NOT NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWTopic_Article' AND object_id = OBJECT_ID('dbo.HealthWikiTopicRequest'))
+    CREATE INDEX IX_HWTopic_Article ON dbo.HealthWikiTopicRequest (ArticleId) WHERE ArticleId IS NOT NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWImage_Contributor' AND object_id = OBJECT_ID('dbo.HealthArticleImage'))
+    CREATE INDEX IX_HWImage_Contributor ON dbo.HealthArticleImage (ContributorId) WHERE ContributorId IS NOT NULL;
+GO
+IF OBJECT_ID('dbo.HealthArticleRevision', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWRevision_Editor' AND object_id = OBJECT_ID('dbo.HealthArticleRevision'))
+    CREATE INDEX IX_HWRevision_Editor ON dbo.HealthArticleRevision (EditedByContributorId) WHERE EditedByContributorId IS NOT NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/health_wiki_06_notifications.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Health Wiki, part 6 - record of every WhatsApp message the Health Wiki sends.
+-- Description: One row per message: which of the product's messages it was (N1 to N15), which approved template, who it went to (a
+--              contributor, with only a masked number kept), what it was about (an article, contributor or topic request), and whether
+--              WhatsApp accepted it (SENT), refused or timed out (FAILED), or there was nobody or nothing to send to (SKIPPED).
+--              It stops the same message going twice, lets the daily reminder know when a doctor was last told, and lets the CMS show
+--              "not delivered". Guarded and idempotent. Requires parts 1 to 5.
+-- =============================================================================
+IF OBJECT_ID('dbo.HealthWikiContributor', 'U') IS NULL
+    THROW 51000, 'health_wiki_01 to _05 must run before health_wiki_06_notifications.sql', 1;
+GO
+
+IF OBJECT_ID('dbo.HealthWikiNotification', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HealthWikiNotification (
+        NotificationId         UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HWNotification_Id DEFAULT NEWSEQUENTIALID(),
+        Code                   NVARCHAR(4)      NOT NULL,
+        TemplateName           NVARCHAR(80)     NOT NULL,
+        RecipientContributorId UNIQUEIDENTIFIER NULL,
+        RecipientMobileMasked  NVARCHAR(20)     NULL,
+        EntityType             NVARCHAR(15)     NOT NULL,
+        EntityId               UNIQUEIDENTIFIER NOT NULL,
+        [Status]               NVARCHAR(10)     NOT NULL,
+        Detail                 NVARCHAR(300)    NULL,
+        CreatedAt              DATETIME2(3)     NOT NULL CONSTRAINT DF_HWNotification_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HWNotification PRIMARY KEY CLUSTERED (NotificationId),
+        CONSTRAINT CK_HWNotification_Code CHECK (Code LIKE 'N[0-9]' OR Code LIKE 'N[0-9][0-9]'),
+        CONSTRAINT CK_HWNotification_Status CHECK ([Status] IN ('SENT','FAILED','SKIPPED')),
+        CONSTRAINT CK_HWNotification_Entity CHECK (EntityType IN ('ARTICLE','CONTRIBUTOR','TOPIC')),
+        CONSTRAINT FK_HWNotification_Recipient FOREIGN KEY (RecipientContributorId) REFERENCES dbo.HealthWikiContributor(ContributorId)
+    );
+END
+GO
+
+-- "Was this message already sent for this thing to this person, and when?" (duplicates, reminders, the CMS history)
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWNotification_Entity' AND object_id = OBJECT_ID('dbo.HealthWikiNotification'))
+    CREATE INDEX IX_HWNotification_Entity ON dbo.HealthWikiNotification (EntityType, EntityId, Code, CreatedAt DESC);
+GO
+-- The recipient's foreign key column, so removing or changing a contributor does not scan the table.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWNotification_Recipient' AND object_id = OBJECT_ID('dbo.HealthWikiNotification'))
+    CREATE INDEX IX_HWNotification_Recipient ON dbo.HealthWikiNotification (RecipientContributorId, CreatedAt DESC) WHERE RecipientContributorId IS NOT NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/health_wiki_07_notification_delivery.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Health Wiki, part 7 - what happened to each WhatsApp message after WhatsApp accepted it.
+-- Description: WhatsApp can accept a message (SENT in part 6) and still not deliver it, for example when a template is
+--              reclassified as Marketing or the number is not reachable. WhatsApp reports that later, in a status callback that
+--              carries the message id it returned. ProviderMessageId stores that id; DeliveryStatus (DELIVERED, READ, FAILED),
+--              DeliveryDetail (WhatsApp's own reason on a failure) and DeliveryAt record the callback so the CMS can show
+--              "not delivered". Guarded and idempotent. Requires part 6.
+-- =============================================================================
+IF OBJECT_ID('dbo.HealthWikiNotification', 'U') IS NULL
+    THROW 51000, 'health_wiki_06_notifications.sql must run before health_wiki_07_notification_delivery.sql', 1;
+GO
+
+IF COL_LENGTH('dbo.HealthWikiNotification', 'ProviderMessageId') IS NULL
+    ALTER TABLE dbo.HealthWikiNotification ADD ProviderMessageId NVARCHAR(150) NULL;
+GO
+IF COL_LENGTH('dbo.HealthWikiNotification', 'DeliveryStatus') IS NULL
+    ALTER TABLE dbo.HealthWikiNotification ADD DeliveryStatus NVARCHAR(10) NULL;
+GO
+IF COL_LENGTH('dbo.HealthWikiNotification', 'DeliveryDetail') IS NULL
+    ALTER TABLE dbo.HealthWikiNotification ADD DeliveryDetail NVARCHAR(300) NULL;
+GO
+IF COL_LENGTH('dbo.HealthWikiNotification', 'DeliveryAt') IS NULL
+    ALTER TABLE dbo.HealthWikiNotification ADD DeliveryAt DATETIME2(3) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HWNotification_Delivery')
+    ALTER TABLE dbo.HealthWikiNotification ADD CONSTRAINT CK_HWNotification_Delivery
+        CHECK (DeliveryStatus IS NULL OR DeliveryStatus IN ('DELIVERED','READ','FAILED'));
+GO
+
+-- WhatsApp's callback finds the row by the message id it returned.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWNotification_ProviderMessage' AND object_id = OBJECT_ID('dbo.HealthWikiNotification'))
+    CREATE INDEX IX_HWNotification_ProviderMessage ON dbo.HealthWikiNotification (ProviderMessageId) WHERE ProviderMessageId IS NOT NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/health_wiki_08_writer_requests_and_handoff.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Health Wiki, part 8 - doctors asking for a writer, and the hand-off from EasyHMS to Doctor Dekho.
+-- Description: 1. HealthWikiTopicRequest.RequestWriter: a doctor who suggests a topic can ask the team to have someone else write it. When the
+--                 team accepts it, they choose the writer (or the NexEagle content team) and the doctor becomes the reviewer.
+--              2. ContributorHandoff: a hospital doctor who chooses "Write an article" in EasyHMS is passed to Doctor Dekho already signed in.
+--                 The EasyHMS API makes a short-lived, single-use code (only its SHA-256 is stored); Doctor Dekho swaps it for a session.
+--              Requires part 1 and 3. Guarded and idempotent.
+-- =============================================================================
+IF OBJECT_ID('dbo.HealthWikiTopicRequest', 'U') IS NULL OR OBJECT_ID('dbo.HealthWikiContributor', 'U') IS NULL
+    THROW 51000, 'health_wiki_01 to _07 must run before health_wiki_08_writer_requests_and_handoff.sql', 1;
+GO
+
+IF COL_LENGTH('dbo.HealthWikiTopicRequest', 'RequestWriter') IS NULL
+    ALTER TABLE dbo.HealthWikiTopicRequest ADD RequestWriter BIT NOT NULL CONSTRAINT DF_HWTopic_RequestWriter DEFAULT (0);
+GO
+
+IF OBJECT_ID('dbo.ContributorHandoff', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.ContributorHandoff (
+        HandoffId      UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_HWHandoff_Id DEFAULT NEWSEQUENTIALID(),
+        ContributorId  UNIQUEIDENTIFIER NOT NULL,
+        TokenHash      CHAR(64)         NOT NULL,
+        ExpiresAt      DATETIME2(3)     NOT NULL,
+        UsedAt         DATETIME2(3)     NULL,
+        CreatedAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_HWHandoff_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_HWHandoff PRIMARY KEY CLUSTERED (HandoffId),
+        CONSTRAINT FK_HWHandoff_Contributor FOREIGN KEY (ContributorId) REFERENCES dbo.HealthWikiContributor(ContributorId)
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_HWHandoff_Token' AND object_id = OBJECT_ID('dbo.ContributorHandoff'))
+    CREATE UNIQUE INDEX UX_HWHandoff_Token ON dbo.ContributorHandoff (TokenHash);
+GO
+-- The contributor's foreign key column, so removing a contributor does not scan the table; also serves the daily cleanup by date.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWHandoff_Contributor' AND object_id = OBJECT_ID('dbo.ContributorHandoff'))
+    CREATE INDEX IX_HWHandoff_Contributor ON dbo.ContributorHandoff (ContributorId, CreatedAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
 -- FILE: db/schema/migrations/link_doctors_to_medical_specialities.sql
 -- ---------------------------------------------------------------------
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
@@ -13109,7 +15404,7 @@ GO
 -- =============================================================================
 -- Migration: Add Doctors.PrimaryMedicalSpecialityId
 -- Description: Optional link from a doctor to their super/broad-speciality row in
---              dbo.MedicalSpecialities (the NMC qualification-ladder catalog â€” see
+--              dbo.MedicalSpecialities (the NMC qualification-ladder catalog — see
 --              create_medical_specialities_tables.sql). Deliberately additive and
 --              nullable: sits alongside the existing free-text Doctor.Qualification
 --              and the separate Department/Specialization system, replacing neither.
@@ -13149,9 +15444,9 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 -- Some hospitals' NumberSeries rows were saved with junk values (e.g. prefix 'string',
--- a multi-char separator, an unrecognised year format, or an oversized pad length) â€” producing
+-- a multi-char separator, an unrecognised year format, or an oversized pad length) — producing
 -- invoice numbers like "stringstrinstrin0000000011". This normalises any such row back to clean
--- defaults (INV / RCPT / ADM / IB Â· YYYY Â· '-' Â· pad 6) while PRESERVING CurrentValue so the
+-- defaults (INV / RCPT / ADM / IB · YYYY · '-' · pad 6) while PRESERVING CurrentValue so the
 -- running sequence is not disturbed. Idempotent: only rewrites fields that are actually invalid.
 UPDATE dbo.NumberSeries
 SET
@@ -13179,6 +15474,563 @@ GO
 
 GO
 
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/nursing_shift_codes_allow_custom.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Allow hospital-defined nursing shift codes
+-- Description: Hospitals now define their own shifts (dbo.NursingShift: code, name,
+--              times; codes up to 30 chars such as 'DAY' or '12H-DAY'). The roster,
+--              patient-assignment and SBAR handover tables were still locked to the
+--              three built-ins by CHECK constraints and an NVARCHAR(10) column, so
+--              every custom shift was rejected at the database even once the API
+--              accepted it. This drops the three CHECKs (validation now lives in the
+--              API against the hospital's own shift list) and widens ShiftCode to
+--              NVARCHAR(30) to match dbo.NursingShift.ShiftCode.
+--
+--              Guarded and idempotent. Applies after create_nurse_shift_assignment_table
+--              and create_patient_nurse_assignment_table (alphabetical order).
+-- =============================================================================
+
+-- 1) Drop the built-in-only CHECK constraints
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_NSA_Shift' AND parent_object_id = OBJECT_ID('dbo.NurseShiftAssignment'))
+    ALTER TABLE dbo.NurseShiftAssignment DROP CONSTRAINT CK_NSA_Shift;
+
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_PNA_Shift' AND parent_object_id = OBJECT_ID('dbo.PatientNurseAssignment'))
+    ALTER TABLE dbo.PatientNurseAssignment DROP CONSTRAINT CK_PNA_Shift;
+
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_SHN_Shift' AND parent_object_id = OBJECT_ID('dbo.ShiftHandoverNote'))
+    ALTER TABLE dbo.ShiftHandoverNote DROP CONSTRAINT CK_SHN_Shift;
+GO
+
+-- 2) Widen ShiftCode NVARCHAR(10) -> NVARCHAR(30) (max_length is in bytes: 20 = 10 chars)
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.NurseShiftAssignment') AND name = 'ShiftCode' AND max_length < 60)
+    ALTER TABLE dbo.NurseShiftAssignment ALTER COLUMN ShiftCode NVARCHAR(30) NOT NULL;
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.PatientNurseAssignment') AND name = 'ShiftCode' AND max_length < 60)
+    ALTER TABLE dbo.PatientNurseAssignment ALTER COLUMN ShiftCode NVARCHAR(30) NOT NULL;
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.ShiftHandoverNote') AND name = 'ShiftCode' AND max_length < 60)
+    ALTER TABLE dbo.ShiftHandoverNote ALTER COLUMN ShiftCode NVARCHAR(30) NOT NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/pathology_sample_rejection_2026_10.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- 2026-10: sample rejection and recollection in the lab (easyHMSAPI reject-sample / sample-rejections).
+-- Same definition as db/schema/tables/create_tables_pathology_sample_rejection.sql. Safe to run more than once.
+-- Run BEFORE deploying the API: the order screens read this table, so without it opening a lab order fails.
+IF OBJECT_ID('dbo.PathologySampleRejection','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PathologySampleRejection
+  (
+    SampleRejectionId  UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PSR_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
+    OrderId            UNIQUEIDENTIFIER NOT NULL,
+    OrderLineId        UNIQUEIDENTIFIER NOT NULL,
+    TestId             UNIQUEIDENTIFIER NOT NULL,
+    PatientId          NVARCHAR(50)     NOT NULL,
+
+    ReasonCode         NVARCHAR(40)     NOT NULL,
+    Notes              NVARCHAR(500)    NULL,
+
+    PreviousStatus     NVARCHAR(40)     NOT NULL,
+    PreviousBarcode    NVARCHAR(100)    NULL,
+    SampleCollectedAt  DATETIME2(3)     NULL,
+
+    RejectedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PSR_RejectedAt DEFAULT SYSUTCDATETIME(),
+    RejectedByUserId   UNIQUEIDENTIFIER NULL,
+    RejectedByName     NVARCHAR(200)    NULL,
+
+    CONSTRAINT PK_PathologySampleRejection PRIMARY KEY CLUSTERED (SampleRejectionId),
+    CONSTRAINT CK_PSR_Reason CHECK (ReasonCode IN ('HAEMOLYSED','CLOTTED','INSUFFICIENT','WRONG_CONTAINER','MISLABELLED','LIPAEMIC','LEAKED_OR_DAMAGED','DELAYED','OTHER')),
+    CONSTRAINT CK_PSR_PreviousStatus CHECK (PreviousStatus IN ('SAMPLE_COLLECTED','SENT_TO_EXTERNAL_LAB'))
+  );
+END
+GO
+
+-- Rejection register / rejection rate by date.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PSR_HospitalRejectedAt' AND object_id=OBJECT_ID('dbo.PathologySampleRejection'))
+BEGIN
+  CREATE INDEX IX_PSR_HospitalRejectedAt
+  ON dbo.PathologySampleRejection(HospitalId, RejectedAt)
+  INCLUDE (OrderId, OrderLineId, TestId, PatientId, ReasonCode, SampleCollectedAt);
+END
+GO
+
+-- "Was this test rejected before?" (order view, no second charge on recollection).
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PSR_OrderLine' AND object_id=OBJECT_ID('dbo.PathologySampleRejection'))
+BEGIN
+  CREATE INDEX IX_PSR_OrderLine
+  ON dbo.PathologySampleRejection(HospitalId, OrderLineId)
+  INCLUDE (OrderId, ReasonCode, RejectedAt);
+END
+GO
+
+-- Order list counts tests awaiting recollection per order.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PSR_Order' AND object_id=OBJECT_ID('dbo.PathologySampleRejection'))
+BEGIN
+  CREATE INDEX IX_PSR_Order
+  ON dbo.PathologySampleRejection(HospitalId, OrderId)
+  INCLUDE (OrderLineId);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/patient_allergy_2026_10.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- 2026-10: the API now writes dbo.PatientAllergy (allergy panel on the patient profile and IPD workspace;
+-- easyHMSAPI PatientAllergyController). The table is defined in db/schema/tables/create_tables_medication_safety.sql
+-- but may never have been created on older databases. Same definition, plus any missing columns added.
+-- Safe to run more than once. Run BEFORE deploying the API.
+IF OBJECT_ID('dbo.PatientAllergy','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PatientAllergy
+  (
+    PatientAllergyId  UNIQUEIDENTIFIER NOT NULL
+      CONSTRAINT DF_PA_Id DEFAULT NEWSEQUENTIALID(),
+
+    HospitalId        UNIQUEIDENTIFIER NOT NULL,
+    PatientId         NVARCHAR(50)     NOT NULL,
+
+    AllergyType       NVARCHAR(20)     NOT NULL CONSTRAINT DF_PA_Type DEFAULT 'DRUG',
+    Allergen          NVARCHAR(200)    NOT NULL,
+    Severity          NVARCHAR(20)     NOT NULL CONSTRAINT DF_PA_Severity DEFAULT 'MODERATE',
+    Reaction          NVARCHAR(500)    NULL,
+    Notes             NVARCHAR(1000)   NULL,
+
+    OnsetDate         DATETIME2(3)     NULL,
+    IsActive          BIT              NOT NULL CONSTRAINT DF_PA_IsActive DEFAULT (1),
+
+    CreatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PA_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy         NVARCHAR(100)    NULL,
+    UpdatedAt         DATETIME2(3)     NOT NULL CONSTRAINT DF_PA_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedBy         NVARCHAR(100)    NULL,
+
+    RowVersion        ROWVERSION       NOT NULL,
+
+    CONSTRAINT PK_PatientAllergy PRIMARY KEY CLUSTERED (PatientAllergyId),
+    CONSTRAINT CK_PA_Type     CHECK (AllergyType IN ('DRUG','FOOD','ENVIRONMENT','OTHER')),
+    CONSTRAINT CK_PA_Severity CHECK (Severity IN ('MILD','MODERATE','SEVERE','ANAPHYLAXIS'))
+  );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_PA_PatientActive' AND object_id=OBJECT_ID('dbo.PatientAllergy'))
+BEGIN
+  CREATE INDEX IX_PA_PatientActive
+  ON dbo.PatientAllergy(HospitalId, PatientId, IsActive)
+  INCLUDE (Allergen, Severity, AllergyType);
+END
+GO
+
+IF COL_LENGTH('dbo.PatientAllergy','Notes') IS NULL
+  ALTER TABLE dbo.PatientAllergy ADD Notes NVARCHAR(1000) NULL;
+GO
+
+IF COL_LENGTH('dbo.PatientAllergy','OnsetDate') IS NULL
+  ALTER TABLE dbo.PatientAllergy ADD OnsetDate DATETIME2(3) NULL;
+GO
+
+IF COL_LENGTH('dbo.PatientAllergy','CreatedAt') IS NULL
+  ALTER TABLE dbo.PatientAllergy ADD CreatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_PA_CreatedAt DEFAULT SYSUTCDATETIME();
+GO
+
+IF COL_LENGTH('dbo.PatientAllergy','CreatedBy') IS NULL
+  ALTER TABLE dbo.PatientAllergy ADD CreatedBy NVARCHAR(100) NULL;
+GO
+
+IF COL_LENGTH('dbo.PatientAllergy','UpdatedAt') IS NULL
+  ALTER TABLE dbo.PatientAllergy ADD UpdatedAt DATETIME2(3) NOT NULL CONSTRAINT DF_PA_UpdatedAt DEFAULT SYSUTCDATETIME();
+GO
+
+IF COL_LENGTH('dbo.PatientAllergy','UpdatedBy') IS NULL
+  ALTER TABLE dbo.PatientAllergy ADD UpdatedBy NVARCHAR(100) NULL;
+GO
+
+IF COL_LENGTH('dbo.PatientAllergy','RowVersion') IS NULL
+  ALTER TABLE dbo.PatientAllergy ADD RowVersion ROWVERSION NOT NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/patient_app_2026_10.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Doctor Dekho mobile app (Android / iOS, Expo) — 2026-10-21.
+-- Read and written by 1HMSAPI PublicController (patients/me/app-profile, patients/me/devices) with the
+-- same WhatsApp-OTP patient token the website uses. Run BEFORE deploying the matching 1HMSAPI. Idempotent.
+--
+-- The patient's short profile (name, age, sex, blood group, email, guardian) is NOT here: it stays in
+-- dbo.PatientAccountProfiles so the website and the app share one profile. These tables hold only what the
+-- app adds on top of it, all keyed by the OTP-verified mobile like PatientAccountProfiles.
+--
+--   PatientAppProfiles   one row per mobile: the app's quick-booking preferences (language, home city and
+--                        its coordinates, who the patient usually books for, preferred time window, the last
+--                        doctor booked) and whether they agreed to WhatsApp / push reminders.
+--   PatientAppDevices    one row per app install per mobile: platform, app version and the Expo push token,
+--                        so reminders can reach the phone. Deactivated on logout.
+
+IF OBJECT_ID('dbo.PatientAppProfiles','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PatientAppProfiles
+  (
+    Mobile                 NVARCHAR(20)     NOT NULL,
+    PreferredLanguage      NVARCHAR(5)      NULL,             -- en | hi | bn | hg
+    HomeCity               NVARCHAR(100)    NULL,
+    HomeState              NVARCHAR(100)    NULL,
+    HomeLatitude           DECIMAL(9,6)     NULL,
+    HomeLongitude          DECIMAL(9,6)     NULL,
+    DefaultMemberId        UNIQUEIDENTIFIER NULL,             -- NULL = the account holder; else a PatientFamilyMembers row
+    PreferredTimeWindow    NVARCHAR(10)     NULL,             -- MORNING | AFTERNOON | EVENING | NIGHT
+    LastDoctorId           UNIQUEIDENTIFIER NULL,
+    LastBookedAt           DATETIME2(3)     NULL,
+    RemindersOptIn         BIT              NOT NULL CONSTRAINT DF_PAPP_RemindersOptIn DEFAULT 0,
+    RemindersOptInAt       DATETIME2(3)     NULL,
+    OnboardingCompletedAt  DATETIME2(3)     NULL,
+    CreatedAt              DATETIME2(3)     NOT NULL CONSTRAINT DF_PAPP_CreatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedAt              DATETIME2(3)     NOT NULL CONSTRAINT DF_PAPP_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_PatientAppProfiles PRIMARY KEY CLUSTERED (Mobile),
+    CONSTRAINT CK_PAPP_Language   CHECK (PreferredLanguage IS NULL OR PreferredLanguage IN ('en','hi','bn','hg')),
+    CONSTRAINT CK_PAPP_TimeWindow CHECK (PreferredTimeWindow IS NULL OR PreferredTimeWindow IN ('MORNING','AFTERNOON','EVENING','NIGHT')),
+    CONSTRAINT CK_PAPP_Latitude   CHECK (HomeLatitude IS NULL OR (HomeLatitude BETWEEN -90 AND 90)),
+    CONSTRAINT CK_PAPP_Longitude  CHECK (HomeLongitude IS NULL OR (HomeLongitude BETWEEN -180 AND 180))
+  );
+END
+GO
+
+IF OBJECT_ID('dbo.PatientAppDevices','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PatientAppDevices
+  (
+    DeviceId         UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PADV_Id DEFAULT NEWSEQUENTIALID(),
+    Mobile           NVARCHAR(20)     NOT NULL,
+    InstallationId   NVARCHAR(64)     NOT NULL,              -- random id the app creates once per install
+    Platform         NVARCHAR(10)     NOT NULL,              -- android | ios
+    AppVersion       NVARCHAR(20)     NULL,
+    OsVersion        NVARCHAR(40)     NULL,
+    DeviceModel      NVARCHAR(100)    NULL,
+    PushToken        NVARCHAR(256)    NULL,                  -- ExponentPushToken[...]
+    IsActive         BIT              NOT NULL CONSTRAINT DF_PADV_IsActive DEFAULT 1,
+    FirstSeenAt      DATETIME2(3)     NOT NULL CONSTRAINT DF_PADV_FirstSeenAt DEFAULT SYSUTCDATETIME(),
+    LastSeenAt       DATETIME2(3)     NOT NULL CONSTRAINT DF_PADV_LastSeenAt DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_PatientAppDevices PRIMARY KEY CLUSTERED (DeviceId),
+    CONSTRAINT UQ_PADV_Mobile_Installation UNIQUE (Mobile, InstallationId),
+    CONSTRAINT CK_PADV_Platform CHECK (Platform IN ('android','ios'))
+  );
+  CREATE INDEX IX_PADV_Mobile_Active ON dbo.PatientAppDevices (Mobile) INCLUDE (PushToken) WHERE IsActive = 1;
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/patient_family_and_profile_details.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Doctor Dekho patient account - first/last name and blood group on the profile, and family members' health records.
+-- Description: 1. PatientAccountProfiles: FirstName, LastName, BloodGroup (existing rows keep FullName; first/last are filled from it).
+--              2. PatientHealthLockerDocuments.MemberId: a document may belong to one of the account's family members (NULL = the account holder).
+--              Requires create_tables_patient_account_profile.sql, create_tables_patient_health_locker_documents.sql and
+--              create_tables_patient_family_members.sql (tables run before migrations). Guarded and idempotent.
+-- =============================================================================
+IF OBJECT_ID('dbo.PatientAccountProfiles','U') IS NULL OR OBJECT_ID('dbo.PatientFamilyMembers','U') IS NULL OR OBJECT_ID('dbo.PatientHealthLockerDocuments','U') IS NULL
+    THROW 51000, 'The patient account, family member and health locker tables must exist before patient_family_and_profile_details.sql', 1;
+GO
+
+IF COL_LENGTH('dbo.PatientAccountProfiles','FirstName') IS NULL
+    ALTER TABLE dbo.PatientAccountProfiles ADD FirstName NVARCHAR(100) NULL, LastName NVARCHAR(100) NULL, BloodGroup NVARCHAR(5) NULL;
+GO
+
+-- Existing rows only had a full name: first word is the first name, the rest the last name.
+UPDATE dbo.PatientAccountProfiles
+SET FirstName = CASE WHEN CHARINDEX(' ', LTRIM(FullName)) > 0 THEN LEFT(LTRIM(FullName), CHARINDEX(' ', LTRIM(FullName)) - 1) ELSE LTRIM(FullName) END,
+    LastName  = CASE WHEN CHARINDEX(' ', LTRIM(FullName)) > 0 THEN NULLIF(LTRIM(SUBSTRING(LTRIM(FullName), CHARINDEX(' ', LTRIM(FullName)) + 1, 200)), '') END
+WHERE FirstName IS NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_PAP_Blood')
+    ALTER TABLE dbo.PatientAccountProfiles ADD CONSTRAINT CK_PAP_Blood CHECK (BloodGroup IS NULL OR BloodGroup IN ('A+','A-','B+','B-','AB+','AB-','O+','O-'));
+GO
+
+IF COL_LENGTH('dbo.PatientHealthLockerDocuments','MemberId') IS NULL
+    ALTER TABLE dbo.PatientHealthLockerDocuments ADD MemberId UNIQUEIDENTIFIER NULL;
+GO
+
+-- Removing a member removes their records' link only through the API (which also deletes the files), so no cascade here.
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_PHLD_Member')
+    ALTER TABLE dbo.PatientHealthLockerDocuments ADD CONSTRAINT FK_PHLD_Member FOREIGN KEY (MemberId) REFERENCES dbo.PatientFamilyMembers(MemberId);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PHLD_Member' AND object_id = OBJECT_ID('dbo.PatientHealthLockerDocuments'))
+    CREATE INDEX IX_PHLD_Member ON dbo.PatientHealthLockerDocuments (MemberId) WHERE MemberId IS NOT NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/patient_health_locker_visit_details.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Doctor Dekho Health Locker - which doctor visit a record is from, including a doctor who is not in our system.
+-- Description: PatientHealthLockerDocuments gets VisitDate and ExternalDoctorName / ExternalClinicName / ExternalLocation. A record is tied
+--              either to an appointment already in the system (ApptId, which already exists) or to a doctor the patient typed in; the API
+--              refuses both at once. Requires create_tables_patient_health_locker_documents.sql. Guarded and idempotent.
+-- =============================================================================
+IF OBJECT_ID('dbo.PatientHealthLockerDocuments','U') IS NULL
+    THROW 51000, 'create_tables_patient_health_locker_documents.sql must run before patient_health_locker_visit_details.sql', 1;
+GO
+
+IF COL_LENGTH('dbo.PatientHealthLockerDocuments','VisitDate') IS NULL
+    ALTER TABLE dbo.PatientHealthLockerDocuments ADD
+        VisitDate          DATE           NULL,
+        ExternalDoctorName NVARCHAR(200)  NULL,
+        ExternalClinicName NVARCHAR(200)  NULL,
+        ExternalLocation   NVARCHAR(300)  NULL;
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/reconcile_bed_status_with_assignments.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: reconcile BedMaster.StatusCode with BedAssignment
+-- Description: Bed assignment never set the bed OCCUPIED (and release never freed it), so the bed board
+--              and the "can't deactivate an occupied bed" guards ran on a status that drifted from
+--              reality. The API now maintains the status (assign -> OCCUPIED, release -> CLEANING).
+--              This one-off aligns existing rows with the real assignments:
+--                * a bed with an ACTIVE assignment            -> OCCUPIED
+--                * a bed marked OCCUPIED with NO active one   -> AVAILABLE
+--              Beds that are CLEANING / RESERVED / BLOCKED / MAINTENANCE-style are left alone.
+--              Idempotent. Run BEFORE deploying the API that enforces bed status on assignment.
+-- =============================================================================
+IF OBJECT_ID('dbo.BedAssignment', 'U') IS NOT NULL AND OBJECT_ID('dbo.BedMaster', 'U') IS NOT NULL
+BEGIN
+    UPDATE b
+    SET    b.StatusCode   = 'OCCUPIED',
+           b.LastStatusAt = SYSUTCDATETIME()
+    FROM   dbo.BedMaster b
+    WHERE  EXISTS (SELECT 1 FROM dbo.BedAssignment a WHERE a.BedId = b.BedId AND a.StatusCode = 'ACTIVE')
+      AND  ISNULL(b.StatusCode, '') <> 'OCCUPIED';
+
+    UPDATE b
+    SET    b.StatusCode   = 'AVAILABLE',
+           b.LastStatusAt = SYSUTCDATETIME()
+    FROM   dbo.BedMaster b
+    WHERE  b.StatusCode = 'OCCUPIED'
+      AND  NOT EXISTS (SELECT 1 FROM dbo.BedAssignment a WHERE a.BedId = b.BedId AND a.StatusCode = 'ACTIVE');
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/tracking_privacy_2026_10.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Website-tracking privacy changes (decided 2026-10-19). Run BEFORE deploying the matching EasyHMS API
+-- (TrackEventHandler writes AnalyticsEvents.MobileHash) and NexeagleCMSAPI.
+--
+--   1. AnalyticsEvents.MobileHash: keyed hash of the mobile (HMAC-SHA256, key = Tracking:MobileHashKey).
+--   2. Indexes so the retention job's date-range deletes do not scan whole tables.
+--   3. JobSettings row 'TrackingDataRetention' (CMS Night Jobs panel toggle for the daily delete job).
+--   4. One-off backfill, IRREVERSIBLE: mask full mobile numbers already stored in AnalyticsEvents and
+--      truncate stored IPs (IPv4 to /24; IPv6 and anything unparseable set to NULL). HospitalLeads keep
+--      their mobile numbers: hospitals use them to call leads back.
+-- Idempotent: safe to run more than once.
+
+IF COL_LENGTH('dbo.AnalyticsEvents', 'MobileHash') IS NULL
+    ALTER TABLE dbo.AnalyticsEvents ADD MobileHash NVARCHAR(64) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_AnalyticsEvents_MobileHash' AND object_id = OBJECT_ID('dbo.AnalyticsEvents'))
+    CREATE INDEX IX_AnalyticsEvents_MobileHash ON dbo.AnalyticsEvents (MobileHash) WHERE MobileHash IS NOT NULL;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_AnalyticsEvents_OccurredAt' AND object_id = OBJECT_ID('dbo.AnalyticsEvents'))
+    CREATE INDEX IX_AnalyticsEvents_OccurredAt ON dbo.AnalyticsEvents (OccurredAt);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HospitalLeads_OccurredAt' AND object_id = OBJECT_ID('dbo.HospitalLeads'))
+    CREATE INDEX IX_HospitalLeads_OccurredAt ON dbo.HospitalLeads (OccurredAt);
+GO
+
+-- Seeded switched ON with no last-run date; switch off from the CMS Night Jobs panel if needed.
+IF NOT EXISTS (SELECT 1 FROM dbo.JobSettings WHERE JobName = N'TrackingDataRetention')
+    INSERT INTO dbo.JobSettings (JobName, LastExecutionDateUTC, IsActive) VALUES (N'TrackingDataRetention', NULL, 1);
+GO
+
+-- ── Backfill (irreversible) ──────────────────────────────────────────────────────────────────────
+-- Mask: keep first 2 and last 2 characters (same rule as the API). Rows already masked are skipped.
+UPDATE dbo.AnalyticsEvents
+SET Mobile = LEFT(Mobile, 2) + REPLICATE('X', LEN(Mobile) - 4) + RIGHT(Mobile, 2)
+WHERE Mobile IS NOT NULL AND LEN(Mobile) > 4 AND Mobile NOT LIKE '%X%';
+
+UPDATE dbo.AnalyticsEvents SET Mobile = REPLICATE('X', LEN(Mobile))
+WHERE Mobile IS NOT NULL AND LEN(Mobile) BETWEEN 1 AND 4 AND Mobile NOT LIKE '%X%';
+GO
+
+-- IPv4 a.b.c.d -> a.b.c.0 ; everything else (IPv6, junk) -> NULL. Already-truncated rows are unchanged.
+UPDATE dbo.WebsiteVisits SET IpAddress =
+    CASE WHEN IpAddress LIKE '%_.%_.%_.%_' AND IpAddress NOT LIKE '%[^0-9.]%'
+         THEN LEFT(IpAddress, LEN(IpAddress) - CHARINDEX('.', REVERSE(IpAddress))) + '.0' END
+WHERE IpAddress IS NOT NULL AND IpAddress NOT LIKE '%.0';
+
+UPDATE dbo.AnalyticsEvents SET IpAddress =
+    CASE WHEN IpAddress LIKE '%_.%_.%_.%_' AND IpAddress NOT LIKE '%[^0-9.]%'
+         THEN LEFT(IpAddress, LEN(IpAddress) - CHARINDEX('.', REVERSE(IpAddress))) + '.0' END
+WHERE IpAddress IS NOT NULL AND IpAddress NOT LIKE '%.0';
+
+UPDATE dbo.HospitalLeads SET IpAddress =
+    CASE WHEN IpAddress LIKE '%_.%_.%_.%_' AND IpAddress NOT LIKE '%[^0-9.]%'
+         THEN LEFT(IpAddress, LEN(IpAddress) - CHARINDEX('.', REVERSE(IpAddress))) + '.0' END
+WHERE IpAddress IS NOT NULL AND IpAddress NOT LIKE '%.0';
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/tracking_traffic_quality_2026_10.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Website-tracking data quality (2026-10-19). Run BEFORE deploying the matching EasyHMS API and
+-- NexeagleCMSAPI (both map the new columns).
+--
+-- Why: the CMS "Site Visits" report was dominated by Mountain View / Council Bluffs / Pryor (Google),
+-- Cupertino (Apple), Altoona (Meta), Los Angeles / Allentown (data centres). Those are crawlers and
+-- link-preview renderers that execute the page's JavaScript and so fire the same beacons as people.
+--
+--   1. IsAutomated on WebsiteVisits / AnalyticsEvents / HospitalLeads. Set at write time by EasyHMS
+--      (bot user agent, or an IP the geo lookup reports as a hosting/data-centre address); reports
+--      exclude these rows and show how many were excluded.
+--   2. WebsiteVisits.Site: which website sent the page view ('doctordekho' | 'nexeagle'). Both sites
+--      write the same table; until now the CMS could not tell them apart.
+--   3. One-off backfill of both columns for existing rows (re-runnable; only ever sets IsAutomated
+--      to 1 and only fills Site where it is NULL).
+-- Idempotent: safe to run more than once.
+
+IF COL_LENGTH('dbo.WebsiteVisits', 'IsAutomated') IS NULL
+    ALTER TABLE dbo.WebsiteVisits ADD IsAutomated BIT NOT NULL CONSTRAINT DF_WV_IsAutomated DEFAULT 0;
+IF COL_LENGTH('dbo.WebsiteVisits', 'Site') IS NULL
+    ALTER TABLE dbo.WebsiteVisits ADD Site NVARCHAR(20) NULL;
+IF COL_LENGTH('dbo.AnalyticsEvents', 'IsAutomated') IS NULL
+    ALTER TABLE dbo.AnalyticsEvents ADD IsAutomated BIT NOT NULL CONSTRAINT DF_AE_IsAutomated DEFAULT 0;
+IF COL_LENGTH('dbo.HospitalLeads', 'IsAutomated') IS NULL
+    ALTER TABLE dbo.HospitalLeads ADD IsAutomated BIT NOT NULL CONSTRAINT DF_HL_IsAutomated DEFAULT 0;
+GO
+
+-- Reports always filter on IsAutomated = 0 within a date range.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_WebsiteVisits_IsAutomated_VisitedAt' AND object_id = OBJECT_ID('dbo.WebsiteVisits'))
+    CREATE INDEX IX_WebsiteVisits_IsAutomated_VisitedAt ON dbo.WebsiteVisits (IsAutomated, VisitedAt)
+        INCLUDE (SessionId, Site, Country, Region, City, PagePath);
+GO
+
+-- ── Backfill 1: automated page views ─────────────────────────────────────────────────────────────
+-- Same rules as EasyHMSAPI.Application.Common.TrafficClassifier (keep the two lists in step).
+-- Default collation is case-insensitive, so the patterns match any casing.
+DECLARE @BotUa TABLE (Pattern NVARCHAR(100) NOT NULL);
+INSERT INTO @BotUa (Pattern) VALUES
+ (N'%googlebot%'), (N'%google-inspectiontool%'), (N'%googleother%'), (N'%google-read-aloud%'), (N'%adsbot%'),
+ (N'%mediapartners%'), (N'%apis-google%'), (N'%feedfetcher%'), (N'%google page renderer%'), (N'%storebot%'),
+ (N'%bingbot%'), (N'%bingpreview%'), (N'%msnbot%'), (N'%adidxbot%'), (N'%applebot%'),
+ (N'%facebookexternalhit%'), (N'%facebookcatalog%'), (N'%meta-externalagent%'), (N'%meta-externalfetcher%'),
+ (N'%yandex%'), (N'%baiduspider%'), (N'%duckduckbot%'), (N'%petalbot%'), (N'%bytespider%'), (N'%sogou%'),
+ (N'%ahrefs%'), (N'%semrush%'), (N'%mj12bot%'), (N'%dotbot%'), (N'%dataforseo%'), (N'%seznambot%'),
+ (N'%gptbot%'), (N'%chatgpt-user%'), (N'%oai-searchbot%'), (N'%claudebot%'), (N'%claude-user%'),
+ (N'%perplexity%'), (N'%ccbot%'), (N'%amazonbot%'), (N'%headlesschrome%'), (N'%lighthouse%'),
+ (N'%pagespeed%'), (N'%gtmetrix%'), (N'%pingdom%'), (N'%uptimerobot%'), (N'%statuscake%'),
+ (N'%phantomjs%'), (N'%puppeteer%'), (N'%playwright%'), (N'%selenium%'), (N'%whatsapp%'),
+ (N'%telegrambot%'), (N'%twitterbot%'), (N'%linkedinbot%'), (N'%slackbot%'), (N'%discordbot%'),
+ (N'%skypeuripreview%'), (N'%pinterestbot%'), (N'%redditbot%'), (N'%embedly%'), (N'%vercel-screenshot%'),
+ (N'%python-requests%'), (N'%python-urllib%'), (N'%aiohttp%'), (N'curl/%'), (N'wget/%'), (N'%okhttp%'),
+ (N'%go-http-client%'), (N'%node-fetch%'), (N'axios/%'), (N'%java/%'), (N'%crawler%'), (N'%spider%'),
+ (N'%bot/%'), (N'%bot;%'), (N'%bot)%'), (N'%(bot%'), (N'%+http%');
+
+UPDATE v SET IsAutomated = 1
+FROM dbo.WebsiteVisits v
+WHERE v.IsAutomated = 0
+  AND (v.UserAgent IS NULL OR LTRIM(RTRIM(v.UserAgent)) = N''
+       OR EXISTS (SELECT 1 FROM @BotUa p WHERE v.UserAgent LIKE p.Pattern));
+GO
+
+-- Published crawler ranges (IPs are stored truncated to /24, the first three octets survive):
+-- Googlebot 66.249.64.0/19, Applebot 17.0.0.0/8, Meta crawler 31.13/16, 66.220.144/20, 69.63.176/20,
+-- 69.171.224/19, 173.252.64/18, 57.141/16, Bingbot 40.77/16, 157.55/16, 207.46/16.
+UPDATE dbo.WebsiteVisits SET IsAutomated = 1
+WHERE IsAutomated = 0 AND IpAddress IS NOT NULL AND (
+       IpAddress LIKE '17.%'
+    OR IpAddress LIKE '31.13.%' OR IpAddress LIKE '57.141.%'
+    OR IpAddress LIKE '40.77.%' OR IpAddress LIKE '157.55.%' OR IpAddress LIKE '207.46.%'
+    OR (IpAddress LIKE '66.249.%' AND TRY_CAST(PARSENAME(IpAddress, 2) AS INT) BETWEEN 64 AND 95)
+    OR (IpAddress LIKE '66.220.%' AND TRY_CAST(PARSENAME(IpAddress, 2) AS INT) BETWEEN 144 AND 159)
+    OR (IpAddress LIKE '69.63.%'  AND TRY_CAST(PARSENAME(IpAddress, 2) AS INT) BETWEEN 176 AND 191)
+    OR (IpAddress LIKE '69.171.%' AND TRY_CAST(PARSENAME(IpAddress, 2) AS INT) BETWEEN 224 AND 255)
+    OR (IpAddress LIKE '173.252.%' AND TRY_CAST(PARSENAME(IpAddress, 2) AS INT) BETWEEN 64 AND 127));
+GO
+
+-- A session is automated if any of its page views was: carry the flag to the session's other page
+-- views and to its funnel events and leads (those tables have no user agent of their own).
+UPDATE v SET IsAutomated = 1
+FROM dbo.WebsiteVisits v
+WHERE v.IsAutomated = 0 AND v.SessionId IS NOT NULL
+  AND EXISTS (SELECT 1 FROM dbo.WebsiteVisits b WHERE b.SessionId = v.SessionId AND b.IsAutomated = 1);
+
+UPDATE e SET IsAutomated = 1
+FROM dbo.AnalyticsEvents e
+WHERE e.IsAutomated = 0 AND e.SessionId IS NOT NULL
+  AND EXISTS (SELECT 1 FROM dbo.WebsiteVisits b WHERE b.SessionId = e.SessionId AND b.IsAutomated = 1);
+
+UPDATE l SET IsAutomated = 1
+FROM dbo.HospitalLeads l
+WHERE l.IsAutomated = 0 AND l.SessionId IS NOT NULL
+  AND EXISTS (SELECT 1 FROM dbo.WebsiteVisits b WHERE b.SessionId = l.SessionId AND b.IsAutomated = 1);
+GO
+
+-- ── Backfill 2: which site ───────────────────────────────────────────────────────────────────────
+-- Paths that exist on only one of the two sites decide it for the whole session; sessions that only
+-- ever saw '/' (both sites have a home page) stay NULL and show as "Not recorded" in the CMS.
+UPDATE dbo.WebsiteVisits SET Site = N'doctordekho'
+WHERE Site IS NULL AND (
+       PagePath LIKE '/doctors%' OR PagePath LIKE '/hospitals%' OR PagePath LIKE '/specialties%'
+    OR PagePath LIKE '/conditions%' OR PagePath LIKE '/health%' OR PagePath LIKE '/labs%'
+    OR PagePath LIKE '/appointments%' OR PagePath LIKE '/login%' OR PagePath LIKE '/profile%'
+    OR PagePath LIKE '/contribute%' OR PagePath LIKE '/about%');
+
+UPDATE dbo.WebsiteVisits SET Site = N'nexeagle'
+WHERE Site IS NULL AND (
+       PagePath LIKE '/ai%' OR PagePath LIKE '/careers%' OR PagePath LIKE '/contact%' OR PagePath LIKE '/faqs%'
+    OR PagePath LIKE '/how-it-works%' OR PagePath LIKE '/products%' OR PagePath LIKE '/security%'
+    OR PagePath LIKE '/services%' OR PagePath LIKE '/solutions%' OR PagePath LIKE '/team%'
+    OR PagePath LIKE '/terms%' OR PagePath LIKE '/why%' OR PagePath LIKE '/privacy%');
+
+UPDATE v SET Site = s.Site
+FROM dbo.WebsiteVisits v
+CROSS APPLY (SELECT MIN(b.Site) AS Site, COUNT(DISTINCT b.Site) AS Sites
+             FROM dbo.WebsiteVisits b WHERE b.SessionId = v.SessionId AND b.Site IS NOT NULL) s
+WHERE v.Site IS NULL AND v.SessionId IS NOT NULL AND s.Sites = 1;
+GO
+
+GO
+
 -- #####################################################################
 -- ##  SECTION: INDEXES
 -- #####################################################################
@@ -13189,7 +16041,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 /* =========================================================
-   easyHMS â€“ Recommended Indexes (Dev/QA)
+   easyHMS – Recommended Indexes (Dev/QA)
    Safe to re-run; creates indexes only if missing.
    ========================================================= */
 SET NOCOUNT ON;
@@ -13273,7 +16125,7 @@ BEGIN
         ON dbo.Hospitals(CreatedByUserID);
     END;
 
-    -- Business key â€“ fast lookup by registration no.
+    -- Business key – fast lookup by registration no.
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Hospitals_RegistrationNumber'
                    AND object_id = OBJECT_ID(N'dbo.Hospitals'))
     BEGIN
@@ -13309,7 +16161,7 @@ BEGIN
 END
 GO
 
--- HospitalProfileStatus: PK(HospitalID) already covers FK â†’ Hospitals
+-- HospitalProfileStatus: PK(HospitalID) already covers FK → Hospitals
 
 IF OBJECT_ID('dbo.HospitalUsers','U') IS NOT NULL
 BEGIN
@@ -13741,7 +16593,7 @@ DECLARE @HospitalId UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000'; -
 DECLARE @Now DATETIME2(3) = SYSUTCDATETIME();
 DECLARE @SeededBy NVARCHAR(100) = 'SEED';
 
--- â”€â”€â”€â”€â”€ General admission consent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ───── General admission consent ─────────────────────────────────────────────
 IF NOT EXISTS (
   SELECT 1 FROM dbo.ConsentTemplate
   WHERE HospitalId = @HospitalId AND TypeCode = N'GENERAL_ADMISSION' AND [Language] = N'EN' AND IsActive = 1
@@ -13764,7 +16616,7 @@ N'<h3>General Consent for In-Patient Admission</h3>
 END
 GO
 
--- â”€â”€â”€â”€â”€ IV contrast consent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ───── IV contrast consent ──────────────────────────────────────────────────
 DECLARE @HospitalId2 UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
 DECLARE @Now2 DATETIME2(3) = SYSUTCDATETIME();
 
@@ -13797,7 +16649,7 @@ N'<h3>Informed Consent for Intravenous Contrast</h3>
 END
 GO
 
--- â”€â”€â”€â”€â”€ Blood transfusion consent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ───── Blood transfusion consent ────────────────────────────────────────────
 DECLARE @HospitalId3 UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
 DECLARE @Now3 DATETIME2(3) = SYSUTCDATETIME();
 
@@ -13816,10 +16668,10 @@ N'<h3>Informed Consent for Blood and Blood Product Transfusion</h3>
 <h4>Risks</h4>
 <ul>
   <li>Allergic and febrile reactions (mild to severe).</li>
-  <li>Transfusion-related acute lung injury (TRALI) â€” rare.</li>
+  <li>Transfusion-related acute lung injury (TRALI) — rare.</li>
   <li>Transfusion-associated circulatory overload (TACO).</li>
   <li>Acute and delayed haemolytic reactions due to blood-group incompatibility.</li>
-  <li>Transmission of infections (HIV, hepatitis B / C, syphilis, malaria, others) â€” extremely low risk due to mandatory donor screening.</li>
+  <li>Transmission of infections (HIV, hepatitis B / C, syphilis, malaria, others) — extremely low risk due to mandatory donor screening.</li>
   <li>Alloimmunization affecting future transfusions or pregnancy.</li>
 </ul>
 <h4>Alternatives</h4>
@@ -13830,7 +16682,7 @@ N'<h3>Informed Consent for Blood and Blood Product Transfusion</h3>
 END
 GO
 
--- â”€â”€â”€â”€â”€ Discharge advice & consent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ───── Discharge advice & consent ───────────────────────────────────────────
 DECLARE @HospitalId4 UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
 DECLARE @Now4 DATETIME2(3) = SYSUTCDATETIME();
 
@@ -13856,7 +16708,7 @@ N'<h3>Discharge Advice &amp; Consent</h3>
 END
 GO
 
--- â”€â”€â”€â”€â”€ Leave Against Medical Advice (LAMA) consent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- ───── Leave Against Medical Advice (LAMA) consent ──────────────────────────
 DECLARE @HospitalId5 UNIQUEIDENTIFIER = '00000000-0000-0000-0000-000000000000';
 DECLARE @Now5 DATETIME2(3) = SYSUTCDATETIME();
 
@@ -13905,7 +16757,7 @@ DECLARE @SeededBy NVARCHAR(100) = 'SEED';
     (N'warfarin',     N'clopidogrel',   N'MAJOR',           N'Additive bleeding risk.',                                                                                        N'Avoid combination; if essential, monitor INR and CBC frequently.',                          N'STARTER'),
     (N'warfarin',     N'nsaid',         N'MAJOR',           N'NSAIDs displace warfarin and increase GI-bleed risk.',                                                           N'Avoid NSAIDs; prefer paracetamol; PPI cover if essential.',                                 N'STARTER'),
     (N'warfarin',     N'ibuprofen',     N'MAJOR',           N'NSAIDs displace warfarin and increase GI-bleed risk.',                                                           N'Avoid; prefer paracetamol.',                                                                 N'STARTER'),
-    (N'aspirin',      N'ibuprofen',     N'MODERATE',        N'Ibuprofen blocks the antiplatelet effect of aspirin.',                                                           N'Take aspirin â‰¥ 2 h before ibuprofen, or choose an alternative analgesic.',                  N'STARTER'),
+    (N'aspirin',      N'ibuprofen',     N'MODERATE',        N'Ibuprofen blocks the antiplatelet effect of aspirin.',                                                           N'Take aspirin ≥ 2 h before ibuprofen, or choose an alternative analgesic.',                  N'STARTER'),
 
     -- QT prolongation
     (N'ciprofloxacin',N'ondansetron',   N'MODERATE',        N'Additive QT prolongation risk.',                                                                                 N'Check baseline ECG; avoid in known long-QT.',                                                N'STARTER'),
@@ -13919,7 +16771,7 @@ DECLARE @SeededBy NVARCHAR(100) = 'SEED';
 
     -- Statins
     (N'simvastatin',  N'clarithromycin',N'CONTRAINDICATED', N'Macrolides inhibit CYP3A4 and raise statin levels; rhabdomyolysis risk.',                                        N'Stop simvastatin for the duration of clarithromycin therapy.',                                N'STARTER'),
-    (N'atorvastatin', N'clarithromycin',N'MAJOR',           N'Raised atorvastatin levels; myopathy risk.',                                                                     N'Limit atorvastatin to â‰¤ 20 mg/day or choose azithromycin.',                                   N'STARTER'),
+    (N'atorvastatin', N'clarithromycin',N'MAJOR',           N'Raised atorvastatin levels; myopathy risk.',                                                                     N'Limit atorvastatin to ≤ 20 mg/day or choose azithromycin.',                                   N'STARTER'),
 
     -- Hyperkalaemia
     (N'spironolactone', N'potassium',   N'MAJOR',           N'Risk of severe hyperkalaemia.',                                                                                  N'Avoid potassium supplementation; monitor K+ daily.',                                          N'STARTER'),
@@ -13954,8 +16806,8 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 /* =========================================================
-   easyHMS â€“ Global Seed (Departments, Specializations, Roles, Permissions, Types, Shifts, Status, LookupTypes)
-   Idempotent DML â€“ safe to re-run.
+   easyHMS – Global Seed (Departments, Specializations, Roles, Permissions, Types, Shifts, Status, LookupTypes)
+   Idempotent DML – safe to re-run.
    ========================================================= */
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
@@ -13969,7 +16821,7 @@ SET XACT_ABORT ON;
       (N'Neurology',N'Brain, nerves, and spinal cord'),
       (N'Orthopedics',N'Bones, joints, ligaments, muscles'),
       (N'Pediatrics',N'Healthcare for infants and children'),
-      (N'Gynecology',N'Womenâ€™s reproductive health'),
+      (N'Gynecology',N'Women’s reproductive health'),
       (N'Obstetrics',N'Pregnancy and childbirth care'),
       (N'General Medicine',N'Broad non-surgical medical care'),
       (N'General Surgery',N'Common surgical procedures'),
@@ -14127,7 +16979,7 @@ USING (SELECT r.RoleID, v.PermissionKey
        CROSS JOIN (VALUES (N'admin_panel'),(N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),(N'doc_board'),
                      (N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),(N'inventory'),
                      (N'pathology'),(N'pharmacy'),(N'patients'),(N'doctor_calendar'),(N'abdm'),
-                     (N'leads'),(N'print_preview')) v(PermissionKey)
+                     (N'leads'),(N'print_preview'),(N'health_wiki')) v(PermissionKey)
        WHERE r.RoleName = N'AdminDoctor') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
@@ -14163,7 +17015,7 @@ USING (SELECT r.RoleID, v.PermissionKey
        FROM @Roles r
        CROSS JOIN (VALUES (N'doc_board'),(N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),
                      (N'inventory'),(N'pathology'),(N'pharmacy'),(N'patients'),(N'doctor_calendar'),
-                     (N'billing')) v(PermissionKey)
+                     (N'billing'),(N'health_wiki')) v(PermissionKey)
        WHERE r.RoleName = N'Doctor') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
@@ -14210,6 +17062,18 @@ USING (SELECT r.RoleID, v.PermissionKey
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- HR suite (1HR): the API gates HrController / HrBiometricController on these two keys
+-- (RequiresPermission("hr.manage_employees", "hr.view_dashboard")). They were never seeded, so no
+-- role could reach HR through the normal permission path. Admin + AdminDoctor only.
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'hr.manage_employees'),(N'hr.view_dashboard')) v(PermissionKey)
+       WHERE r.RoleName IN (N'Admin', N'AdminDoctor')) AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET t.IsAllowed = 1;
 
 ------------------------------------------------------------
 -- 5) Hospital Types (global)
@@ -14383,7 +17247,7 @@ BEGIN TRY
   (N'ADV-LIFE-ALCOHOL',        N'Alcohol Moderation', N'Limit/avoid alcohol; abstain in liver disease/pregnancy', N'Alcohol harm reduction'),
 
   (N'ADV-PED-FEVER',           N'Pediatric Fever Care', N'Light clothing; tepid sponging; weight-based antipyretics', N'Child fever advice'),
-  (N'ADV-PED-ORS',             N'Acute Diarrhea ORS/Zinc', N'Small frequent ORS; continue feeds; zinc 10â€“20 mg/day', N'Diarrhea home care child'),
+  (N'ADV-PED-ORS',             N'Acute Diarrhea ORS/Zinc', N'Small frequent ORS; continue feeds; zinc 10–20 mg/day', N'Diarrhea home care child'),
   (N'ADV-PED-ASTHMA',          N'Pediatric Asthma Action Plan', N'Reliever for symptoms; controller daily if prescribed', N'Asthma plan child'),
 
   (N'ADV-OBG-ANC',             N'Antenatal Care Schedule', N'Regular ANC; supplements; warning signs', N'Pregnancy care schedule'),
@@ -14410,7 +17274,7 @@ BEGIN TRY
   (N'ADV-ID-ANTIBIOTIC',       N'Antibiotic Stewardship', N'Avoid unnecessary antibiotics; complete course if prescribed', N'AB stewardship'),
 
   (N'ADV-SURG-WOUND',          N'Wound Care', N'Keep clean/dry; dressing change; infection signs', N'Post-op wound advice'),
-  (N'ADV-ORTH-CAST',           N'Cast/Brace Care', N'Keep cast dry; donâ€™t insert objects; elevate limb', N'Plaster care'),
+  (N'ADV-ORTH-CAST',           N'Cast/Brace Care', N'Keep cast dry; don’t insert objects; elevate limb', N'Plaster care'),
 
   (N'ADV-OPH-POSTCAT',         N'Post Cataract Surgery Care', N'Shield; avoid rubbing/water; drop schedule', N'Postphaco advice'),
   (N'ADV-ENT-NOSEBLEED',       N'Epistaxis First Aid', N'Pinch nose; lean forward; avoid picking', N'Nosebleed control'),
@@ -14445,7 +17309,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 /* =========================================================
-   easyHMS â€“ Seed: LookupMaster (CHIEF_COMPLAINT)
+   easyHMS – Seed: LookupMaster (CHIEF_COMPLAINT)
    Assumes: LookupTypeId = 1 is CHIEF_COMPLAINT (already present)
    Idempotent (MERGE): safe to re-run.
    ========================================================= */
@@ -14694,10 +17558,10 @@ BEGIN TRY
     (N'ENDO-DYSLIP', N'Dyslipidemia', N'Hypercholesterolemia/hypertriglyceridemia', N'hyperlipidemia, high cholesterol', N'Endocrine & Metabolic'),
     (N'ENDO-HYPO-T', N'Hypothyroidism', N'Underactive thyroid', N'low thyroid', N'Endocrine & Metabolic'),
     (N'ENDO-HYPER-T', N'Hyperthyroidism', N'Overactive thyroid', N'thyrotoxicosis', N'Endocrine & Metabolic'),
-    (N'ENDO-OBESITY', N'Obesity', N'BMI â‰¥ 30 kg/mÂ² (adult)', N'overweight, metabolic syndrome', N'Endocrine & Metabolic'),
+    (N'ENDO-OBESITY', N'Obesity', N'BMI ≥ 30 kg/m² (adult)', N'overweight, metabolic syndrome', N'Endocrine & Metabolic'),
     (N'ENDO-METSYN', N'Metabolic syndrome', N'Insulin resistance, central obesity, dyslipidemia', N'syndrome X', N'Endocrine & Metabolic'),
     (N'ENDO-PCOS', N'Polycystic ovary syndrome', N'PCOS diagnosis', N'PCOS, PCOD', N'Endocrine & Metabolic'),
-    (N'ENDO-ADRENAL', N'Adrenal disorder', N'Cushingâ€™s/Addisonâ€™s', N'adrenal insufficiency, hyperadrenalism', N'Endocrine & Metabolic'),
+    (N'ENDO-ADRENAL', N'Adrenal disorder', N'Cushing’s/Addison’s', N'adrenal insufficiency, hyperadrenalism', N'Endocrine & Metabolic'),
     (N'ENDO-PIT', N'Pituitary disorder', N'Acromegaly/prolactinoma/etc.', N'pituitary disease', N'Endocrine & Metabolic'),
     (N'ENDO-GOUT', N'Gout / Hyperuricemia', N'Crystal arthropathy or high uric acid', N'gouty arthritis, hyperuricemia', N'Endocrine & Metabolic'),
     (N'ENDO-VITD', N'Vitamin D deficiency', N'Low vitamin D / osteomalacia', N'hypovitaminosis D', N'Endocrine & Metabolic');
@@ -14734,9 +17598,9 @@ BEGIN TRY
     (N'NEURO-STROKE', N'Stroke', N'Cerebrovascular accident; residual deficits', N'CVA, brain stroke', N'Neurological'),
     (N'NEURO-TIA', N'Transient ischemic attack', N'TIA episodes', N'mini stroke', N'Neurological'),
     (N'NEURO-EPI', N'Epilepsy', N'Seizure disorder', N'seizures, fits', N'Neurological'),
-    (N'NEURO-PD', N'Parkinsonâ€™s disease', N'Neurodegenerative movement disorder', N'parkinsonism', N'Neurological'),
+    (N'NEURO-PD', N'Parkinson’s disease', N'Neurodegenerative movement disorder', N'parkinsonism', N'Neurological'),
     (N'NEURO-MS', N'Multiple sclerosis', N'Demyelinating disease', N'MS', N'Neurological'),
-    (N'NEURO-DEM', N'Dementia', N'Alzheimerâ€™s or other dementias', N'memory disorder', N'Neurological'),
+    (N'NEURO-DEM', N'Dementia', N'Alzheimer’s or other dementias', N'memory disorder', N'Neurological'),
     (N'NEURO-NEUROPATHY', N'Peripheral neuropathy', N'Diabetic/other neuropathy', N'neuropathy', N'Neurological'),
     (N'NEURO-MIGRAINE', N'Chronic migraine', N'Recurrent migraine headaches', N'migraine', N'Neurological'),
     (N'NEURO-NMD', N'Neuromuscular disease', N'MG/ALS/etc.', N'myasthenia gravis, ALS', N'Neurological');
@@ -14750,7 +17614,7 @@ BEGIN TRY
     (N'GI-HEPC', N'Hepatitis C infection', N'Chronic or past HCV', N'HCV', N'Gastrointestinal & Hepatic'),
     (N'GI-NAFLD', N'NAFLD / NASH', N'Fatty liver disease', N'fatty liver, NASH', N'Gastrointestinal & Hepatic'),
     (N'GI-GERD', N'GERD / Acid peptic disease', N'Reflux/ulcer disease', N'acid reflux, peptic ulcer', N'Gastrointestinal & Hepatic'),
-    (N'GI-IBD', N'Inflammatory bowel disease', N'Crohnâ€™s/Ulcerative colitis', N'IBD', N'Gastrointestinal & Hepatic'),
+    (N'GI-IBD', N'Inflammatory bowel disease', N'Crohn’s/Ulcerative colitis', N'IBD', N'Gastrointestinal & Hepatic'),
     (N'GI-IBS', N'Irritable bowel syndrome', N'Functional bowel disorder', N'IBS', N'Gastrointestinal & Hepatic'),
     (N'GI-CP', N'Chronic pancreatitis', N'Recurrent/ongoing pancreatic inflammation', N'pancreatitis', N'Gastrointestinal & Hepatic'),
     (N'GI-CHOL', N'Gallstones', N'Cholelithiasis', N'gall bladder stones', N'Gastrointestinal & Hepatic'),
@@ -14779,7 +17643,7 @@ BEGIN TRY
     (N'ID-STI', N'Syphilis/other STI', N'Past or active STI', N'sexually transmitted infection', N'Infectious Diseases'),
     (N'ID-LONGCOVID', N'Post-COVID-19 / Long COVID', N'Persistent symptoms after COVID', N'long covid', N'Infectious Diseases'),
     (N'ID-MALARIA', N'Malaria (recurrent/chronic)', N'History of malaria', N'plasmodium infection', N'Infectious Diseases'),
-    (N'ID-LEPROSY', N'Leprosy (past/treated)', N'Hansenâ€™s disease', N'hansen disease', N'Infectious Diseases');
+    (N'ID-LEPROSY', N'Leprosy (past/treated)', N'Hansen’s disease', N'hansen disease', N'Infectious Diseases');
 
     /* =========================
        Rheumatologic / Autoimmune
@@ -15228,20 +18092,20 @@ BEGIN TRY
         Severity    NVARCHAR(40)  NOT NULL
     );
 
-    /* ===================== Neurology â€” Headache ===================== */
+    /* ===================== Neurology — Headache ===================== */
     INSERT INTO @Items (Code,Name,ShortDesc,Synonyms,Category,ForSymptom,Severity) VALUES
-    (N'DDX-NEURO-HA-MIG',   N'Migraine',                     N'Unilateral throbbing headache Â± aura',             N'vescular headache', N'Neurology', N'Headache', N'non-emergent'),
-    (N'DDX-NEURO-HA-TTH',   N'Tension-type headache',        N'Bilateral, pressure-like, mildâ€“moderate',          N'TTH',               N'Neurology', N'Headache', N'non-emergent'),
+    (N'DDX-NEURO-HA-MIG',   N'Migraine',                     N'Unilateral throbbing headache ± aura',             N'vescular headache', N'Neurology', N'Headache', N'non-emergent'),
+    (N'DDX-NEURO-HA-TTH',   N'Tension-type headache',        N'Bilateral, pressure-like, mild–moderate',          N'TTH',               N'Neurology', N'Headache', N'non-emergent'),
     (N'DDX-NEURO-HA-CLUST', N'Cluster headache',             N'Severe orbital pain with autonomic features',      N'trigeminal autonomic cephalalgia', N'Neurology', N'Headache', N'urgent'),
     (N'DDX-NEURO-HA-SAH',   N'Subarachnoid hemorrhage',      N'Thunderclap onset, worst headache of life',        N'aneurysmal bleed',  N'Neurology', N'Headache', N'emergency'),
     (N'DDX-NEURO-HA-MEN',   N'Meningitis/Encephalitis',      N'Fever, neck stiffness, altered sensorium',         N'CNS infection',     N'Neurology', N'Headache', N'emergency'),
-    (N'DDX-NEURO-HA-TEMPART',N'Temporal arteritis',          N'Age >50, jaw claudication, ESRâ†‘',                  N'giant cell arteritis', N'Neurology', N'Headache', N'urgent'),
-    (N'DDX-NEURO-HA-TUM',   N'Intracranial mass',            N'Progressive headache Â± focal deficits',            N'brain tumor',       N'Neurology', N'Headache', N'urgent'),
+    (N'DDX-NEURO-HA-TEMPART',N'Temporal arteritis',          N'Age >50, jaw claudication, ESR↑',                  N'giant cell arteritis', N'Neurology', N'Headache', N'urgent'),
+    (N'DDX-NEURO-HA-TUM',   N'Intracranial mass',            N'Progressive headache ± focal deficits',            N'brain tumor',       N'Neurology', N'Headache', N'urgent'),
     (N'DDX-NEURO-HA-HTN',   N'Hypertensive emergency',       N'Headache with BP crisis, end-organ damage',        N'malignant HTN',     N'Neurology', N'Headache', N'emergency'),
     (N'DDX-NEURO-HA-CSF',   N'Low CSF pressure headache',    N'Postural, better supine',                          N'post-dural puncture', N'Neurology', N'Headache', N'non-emergent'),
     (N'DDX-NEURO-HA-SINUS', N'Acute sinusitis',              N'Facial pain, purulent nasal discharge',            N'sinus headache',    N'Neurology', N'Headache', N'non-emergent');
 
-    /* === Neurology â€” Seizure/Transient LOC === */
+    /* === Neurology — Seizure/Transient LOC === */
     INSERT INTO @Items VALUES
     (N'DDX-NEURO-SZ-EPI',  N'Epilepsy',                             N'Unprovoked recurrent seizures',              N'seizure disorder', N'Neurology', N'Seizure/Transient loss of consciousness', N'urgent'),
     (N'DDX-NEURO-SZ-SYN',  N'Syncope (vasovagal)',                  N'Transient LOC with prodrome; quick recovery',N'fainting',         N'Neurology', N'Seizure/Transient loss of consciousness', N'non-emergent'),
@@ -15250,9 +18114,9 @@ BEGIN TRY
     (N'DDX-NEURO-SZ-TIA',  N'TIA/posterior circulation event',      N'Brainstem symptoms, transient deficits',     N'vertebrobasilar insufficiency', N'Neurology', N'Seizure/Transient loss of consciousness', N'urgent'),
     (N'DDX-NEURO-SZ-PSYN', N'Psychogenic non-epileptic seizure',    N'Asynchronous movements, prolonged',          N'PNES',             N'Neurology', N'Seizure/Transient loss of consciousness', N'non-emergent');
 
-    /* ===================== Cardiology â€” Chest Pain ===================== */
+    /* ===================== Cardiology — Chest Pain ===================== */
     INSERT INTO @Items VALUES
-    (N'DDX-CARD-CP-ACS',   N'Acute coronary syndrome', N'Pressure-like substernal pain Â± radiation', N'MI, unstable angina', N'Cardiology', N'Chest pain', N'emergency'),
+    (N'DDX-CARD-CP-ACS',   N'Acute coronary syndrome', N'Pressure-like substernal pain ± radiation', N'MI, unstable angina', N'Cardiology', N'Chest pain', N'emergency'),
     (N'DDX-CARD-CP-STABLE',N'Stable angina',           N'Exertional chest pain relieved by rest',    N'angina pectoris',     N'Cardiology', N'Chest pain', N'urgent'),
     (N'DDX-CARD-CP-ADIS',  N'Aortic dissection',       N'Tearing pain to back, pulse deficit',        N'dissecting aneurysm', N'Cardiology', N'Chest pain', N'emergency'),
     (N'DDX-CARD-CP-PE',    N'Pulmonary embolism',      N'Pleuritic pain, tachycardia, risk factors',  N'PE',                  N'Cardiology', N'Chest pain', N'emergency'),
@@ -15262,7 +18126,7 @@ BEGIN TRY
     (N'DDX-CARD-CP-MSK',   N'Costochondritis',         N'Localized reproducible chest wall tenderness', N'musculoskeletal chest pain', N'Cardiology', N'Chest pain', N'non-emergent'),
     (N'DDX-CARD-CP-PNA',   N'Pneumonia',               N'Fever, cough, pleuritic chest pain',         N'lung infection',      N'Cardiology', N'Chest pain', N'urgent');
 
-    /* ===================== Respiratory â€” Dyspnea ===================== */
+    /* ===================== Respiratory — Dyspnea ===================== */
     INSERT INTO @Items VALUES
     (N'DDX-RESP-DYSP-ASTH', N'Asthma',                 N'Episodic wheeze; reversible obstruction',    N'bronchial asthma', N'Respiratory', N'Dyspnea', N'urgent'),
     (N'DDX-RESP-DYSP-COPD', N'COPD exacerbation',      N'Chronic smoker, hyperinflation',             N'COPD',             N'Respiratory', N'Dyspnea', N'urgent'),
@@ -15273,50 +18137,50 @@ BEGIN TRY
     (N'DDX-RESP-DYSP-ANEM', N'Anemia',                 N'Dyspnea on exertion with low Hb',            N'low hemoglobin',   N'Respiratory', N'Dyspnea', N'non-emergent'),
     (N'DDX-RESP-DYSP-ANX',  N'Anxiety/hyperventilation',N'Tingling, chest tightness, normal sats',    N'panic',            N'Respiratory', N'Dyspnea', N'non-emergent');
 
-    /* ============ Gastroenterology â€” Abdominal Pain (RUQ) ============ */
+    /* ============ Gastroenterology — Abdominal Pain (RUQ) ============ */
     INSERT INTO @Items VALUES
-    (N'DDX-GI-RUQ-CHOL', N'Cholelithiasis/Cholecystitis', N'RUQ colic, Murphy sign',                       N'gallstones',    N'Gastroenterology', N'Abdominal pain â€“ RUQ', N'urgent'),
-    (N'DDX-GI-RUQ-HEP',  N'Hepatitis',                    N'Tender hepatomegaly, AST/ALTâ†‘',                N'acute hepatitis',N'Gastroenterology', N'Abdominal pain â€“ RUQ', N'non-emergent'),
-    (N'DDX-GI-RUQ-ABD',  N'Liver abscess',                N'Fever, RUQ pain, leukocytosis',                N'amoebic abscess',N'Gastroenterology', N'Abdominal pain â€“ RUQ', N'urgent'),
-    (N'DDX-GI-RUQ-PUD',  N'Peptic ulcer disease',         N'Epigastric pain, relation to meals',           N'PUD',           N'Gastroenterology', N'Abdominal pain â€“ RUQ', N'non-emergent'),
-    (N'DDX-GI-RUQ-PNA',  N'Right lower lobe pneumonia',   N'Pleuritic pain, fever, basal crackles',        N'RLL pneumonia',  N'Gastroenterology', N'Abdominal pain â€“ RUQ', N'urgent');
+    (N'DDX-GI-RUQ-CHOL', N'Cholelithiasis/Cholecystitis', N'RUQ colic, Murphy sign',                       N'gallstones',    N'Gastroenterology', N'Abdominal pain – RUQ', N'urgent'),
+    (N'DDX-GI-RUQ-HEP',  N'Hepatitis',                    N'Tender hepatomegaly, AST/ALT↑',                N'acute hepatitis',N'Gastroenterology', N'Abdominal pain – RUQ', N'non-emergent'),
+    (N'DDX-GI-RUQ-ABD',  N'Liver abscess',                N'Fever, RUQ pain, leukocytosis',                N'amoebic abscess',N'Gastroenterology', N'Abdominal pain – RUQ', N'urgent'),
+    (N'DDX-GI-RUQ-PUD',  N'Peptic ulcer disease',         N'Epigastric pain, relation to meals',           N'PUD',           N'Gastroenterology', N'Abdominal pain – RUQ', N'non-emergent'),
+    (N'DDX-GI-RUQ-PNA',  N'Right lower lobe pneumonia',   N'Pleuritic pain, fever, basal crackles',        N'RLL pneumonia',  N'Gastroenterology', N'Abdominal pain – RUQ', N'urgent');
 
-    /* ============ Gastroenterology â€” Abdominal Pain (RLQ) ============ */
+    /* ============ Gastroenterology — Abdominal Pain (RLQ) ============ */
     INSERT INTO @Items VALUES
-    (N'DDX-GI-RLQ-APP',      N'Appendicitis',          N'Periumbilical to RLQ migration; McBurney', N'acute appendicitis', N'Gastroenterology', N'Abdominal pain â€“ RLQ', N'urgent'),
-    (N'DDX-GI-RLQ-CROHN',    N'Crohn''s disease',      N'Chronic diarrhea, weight loss',            N'IBD',               N'Gastroenterology', N'Abdominal pain â€“ RLQ', N'non-emergent'),
-    (N'DDX-GI-RLQ-RENAL',    N'Ureteric stone',        N'Colicky flankâ†’groin pain, hematuria',      N'renal calculus',    N'Gastroenterology', N'Abdominal pain â€“ RLQ', N'urgent'),
-    (N'DDX-GI-RLQ-GYN-TORS', N'Ovarian torsion (female)', N'Acute pelvic pain, adnexal mass',       N'torsion ovary',     N'Gastroenterology', N'Abdominal pain â€“ RLQ', N'emergency'),
-    (N'DDX-GI-RLQ-ECT',      N'Ectopic pregnancy (female)', N'Amenorrhea, shock if ruptured',       N'tubal pregnancy',   N'Gastroenterology', N'Abdominal pain â€“ RLQ', N'emergency'),
-    (N'DDX-GI-RLQ-MESAD',    N'Mesenteric adenitis',   N'Post-viral RLQ tenderness in kids',        N'reactive nodes',    N'Gastroenterology', N'Abdominal pain â€“ RLQ', N'non-emergent');
+    (N'DDX-GI-RLQ-APP',      N'Appendicitis',          N'Periumbilical to RLQ migration; McBurney', N'acute appendicitis', N'Gastroenterology', N'Abdominal pain – RLQ', N'urgent'),
+    (N'DDX-GI-RLQ-CROHN',    N'Crohn''s disease',      N'Chronic diarrhea, weight loss',            N'IBD',               N'Gastroenterology', N'Abdominal pain – RLQ', N'non-emergent'),
+    (N'DDX-GI-RLQ-RENAL',    N'Ureteric stone',        N'Colicky flank→groin pain, hematuria',      N'renal calculus',    N'Gastroenterology', N'Abdominal pain – RLQ', N'urgent'),
+    (N'DDX-GI-RLQ-GYN-TORS', N'Ovarian torsion (female)', N'Acute pelvic pain, adnexal mass',       N'torsion ovary',     N'Gastroenterology', N'Abdominal pain – RLQ', N'emergency'),
+    (N'DDX-GI-RLQ-ECT',      N'Ectopic pregnancy (female)', N'Amenorrhea, shock if ruptured',       N'tubal pregnancy',   N'Gastroenterology', N'Abdominal pain – RLQ', N'emergency'),
+    (N'DDX-GI-RLQ-MESAD',    N'Mesenteric adenitis',   N'Post-viral RLQ tenderness in kids',        N'reactive nodes',    N'Gastroenterology', N'Abdominal pain – RLQ', N'non-emergent');
 
-    /* ===== Gastroenterology â€” Abdominal Pain (Epigastric) ===== */
+    /* ===== Gastroenterology — Abdominal Pain (Epigastric) ===== */
     INSERT INTO @Items VALUES
-    (N'DDX-GI-EPI-PUD',  N'Peptic ulcer disease', N'Burning epigastric pain',            N'gastric ulcer',   N'Gastroenterology', N'Abdominal pain â€“ Epigastric', N'non-emergent'),
-    (N'DDX-GI-EPI-PANC', N'Acute pancreatitis',   N'Severe epigastric pain radiating to back', N'pancreatitis',N'Gastroenterology', N'Abdominal pain â€“ Epigastric', N'emergency'),
-    (N'DDX-GI-EPI-GERD', N'GERD',                 N'Heartburn/regurgitation',            N'acid reflux',     N'Gastroenterology', N'Abdominal pain â€“ Epigastric', N'non-emergent'),
-    (N'DDX-GI-EPI-BILI', N'Biliary colic',        N'Postprandial RUQ/epigastric pain',   N'gallstone colic', N'Gastroenterology', N'Abdominal pain â€“ Epigastric', N'urgent'),
-    (N'DDX-GI-EPI-MI',   N'Inferior wall MI',     N'Epigastric pain + cardiovascular risks', N'atypical MI',  N'Gastroenterology', N'Abdominal pain â€“ Epigastric', N'emergency');
+    (N'DDX-GI-EPI-PUD',  N'Peptic ulcer disease', N'Burning epigastric pain',            N'gastric ulcer',   N'Gastroenterology', N'Abdominal pain – Epigastric', N'non-emergent'),
+    (N'DDX-GI-EPI-PANC', N'Acute pancreatitis',   N'Severe epigastric pain radiating to back', N'pancreatitis',N'Gastroenterology', N'Abdominal pain – Epigastric', N'emergency'),
+    (N'DDX-GI-EPI-GERD', N'GERD',                 N'Heartburn/regurgitation',            N'acid reflux',     N'Gastroenterology', N'Abdominal pain – Epigastric', N'non-emergent'),
+    (N'DDX-GI-EPI-BILI', N'Biliary colic',        N'Postprandial RUQ/epigastric pain',   N'gallstone colic', N'Gastroenterology', N'Abdominal pain – Epigastric', N'urgent'),
+    (N'DDX-GI-EPI-MI',   N'Inferior wall MI',     N'Epigastric pain + cardiovascular risks', N'atypical MI',  N'Gastroenterology', N'Abdominal pain – Epigastric', N'emergency');
 
-    /* ============ Gastroenterology â€” Diarrhea ============ */
+    /* ============ Gastroenterology — Diarrhea ============ */
     INSERT INTO @Items VALUES
-    (N'DDX-GI-DIARR-INF',  N'Infectious gastroenteritis', N'Acute watery stools Â± fever',         N'GE',                   N'Gastroenterology', N'Diarrhea/Loose stools', N'non-emergent'),
+    (N'DDX-GI-DIARR-INF',  N'Infectious gastroenteritis', N'Acute watery stools ± fever',         N'GE',                   N'Gastroenterology', N'Diarrhea/Loose stools', N'non-emergent'),
     (N'DDX-GI-DIARR-IBD',  N'Inflammatory bowel disease', N'Chronic bloody diarrhea',             N'UC/Crohn',             N'Gastroenterology', N'Diarrhea/Loose stools', N'non-emergent'),
     (N'DDX-GI-DIARR-IBS',  N'Irritable bowel syndrome',   N'Altered bowel habits without alarm signs', N'IBS',             N'Gastroenterology', N'Diarrhea/Loose stools', N'non-emergent'),
     (N'DDX-GI-DIARR-MAL',  N'Malabsorption',              N'Steatorrhea, weight loss',            N'celiac, EPI',         N'Gastroenterology', N'Diarrhea/Loose stools', N'non-emergent'),
     (N'DDX-GI-DIARR-CHOL', N'Cholera (severe watery diarrhea)', N'Rice-water stools, dehydration', N'Vibrio cholerae',     N'Gastroenterology', N'Diarrhea/Loose stools', N'emergency');
 
-    /* ============ General / Infectious â€” Undiff. Fever ============ */
+    /* ============ General / Infectious — Undiff. Fever ============ */
     INSERT INTO @Items VALUES
-    (N'DDX-GEN-FEV-VIR',  N'Viral fever',         N'Myalgia, malaise; self-limited',  N'flu-like illness', N'General / Infectious', N'Fever â€“ undifferentiated', N'non-emergent'),
-    (N'DDX-GEN-FEV-DENG', N'Dengue',              N'Tropical, thrombocytopenia, rash',N'breakbone fever',  N'General / Infectious', N'Fever â€“ undifferentiated', N'urgent'),
-    (N'DDX-GEN-FEV-MAL',  N'Malaria',             N'Paroxysmal fever, travel to endemic area', N'plasmodium', N'General / Infectious', N'Fever â€“ undifferentiated', N'urgent'),
-    (N'DDX-GEN-FEV-TYPH', N'Enteric fever (Typhoid)', N'Step-ladder fever, rose spots', N'typhoid',         N'General / Infectious', N'Fever â€“ undifferentiated', N'urgent'),
-    (N'DDX-GEN-FEV-UTI',  N'Acute pyelonephritis',N'Fever, flank pain, dysuria',      N'kidney infection', N'General / Infectious', N'Fever â€“ undifferentiated', N'urgent'),
-    (N'DDX-GEN-FEV-PNA',  N'Pneumonia',           N'Fever, cough, crackles',          N'CAP',              N'General / Infectious', N'Fever â€“ undifferentiated', N'urgent'),
-    (N'DDX-GEN-FEV-SEPS', N'Sepsis of unknown source', N'Hypotension, organ dysfunction', N'septicemia',   N'General / Infectious', N'Fever â€“ undifferentiated', N'emergency');
+    (N'DDX-GEN-FEV-VIR',  N'Viral fever',         N'Myalgia, malaise; self-limited',  N'flu-like illness', N'General / Infectious', N'Fever – undifferentiated', N'non-emergent'),
+    (N'DDX-GEN-FEV-DENG', N'Dengue',              N'Tropical, thrombocytopenia, rash',N'breakbone fever',  N'General / Infectious', N'Fever – undifferentiated', N'urgent'),
+    (N'DDX-GEN-FEV-MAL',  N'Malaria',             N'Paroxysmal fever, travel to endemic area', N'plasmodium', N'General / Infectious', N'Fever – undifferentiated', N'urgent'),
+    (N'DDX-GEN-FEV-TYPH', N'Enteric fever (Typhoid)', N'Step-ladder fever, rose spots', N'typhoid',         N'General / Infectious', N'Fever – undifferentiated', N'urgent'),
+    (N'DDX-GEN-FEV-UTI',  N'Acute pyelonephritis',N'Fever, flank pain, dysuria',      N'kidney infection', N'General / Infectious', N'Fever – undifferentiated', N'urgent'),
+    (N'DDX-GEN-FEV-PNA',  N'Pneumonia',           N'Fever, cough, crackles',          N'CAP',              N'General / Infectious', N'Fever – undifferentiated', N'urgent'),
+    (N'DDX-GEN-FEV-SEPS', N'Sepsis of unknown source', N'Hypotension, organ dysfunction', N'septicemia',   N'General / Infectious', N'Fever – undifferentiated', N'emergency');
 
-    /* ============ General/Cardio-Neuro â€” Syncope ============ */
+    /* ============ General/Cardio-Neuro — Syncope ============ */
     INSERT INTO @Items VALUES
     (N'DDX-SYNC-VASO', N'Vasovagal syncope',      N'Prodrome; triggers like pain/emotion', N'reflex syncope', N'General / Cardio-Neuro', N'Syncope', N'non-emergent'),
     (N'DDX-SYNC-ORT',  N'Orthostatic hypotension',N'On standing; volume depletion',        N'postural drop',  N'General / Cardio-Neuro', N'Syncope', N'non-emergent'),
@@ -15325,7 +18189,7 @@ BEGIN TRY
     (N'DDX-SYNC-PE',   N'Pulmonary embolism',     N'Syncope with pleuritic chest pain',    N'PE',             N'General / Cardio-Neuro', N'Syncope', N'emergency'),
     (N'DDX-SYNC-TSH',  N'Hypoglycemia',           N'Adrenergic signs, low blood glucose',  N'low sugar',      N'General / Cardio-Neuro', N'Syncope', N'emergency');
 
-    /* ============ Pediatrics â€” Cough/Wheeze ============ */
+    /* ============ Pediatrics — Cough/Wheeze ============ */
     INSERT INTO @Items VALUES
     (N'DDX-PED-WHEEZE-ASTH',    N'Asthma',               N'Recurrent wheeze; triggers; atopy', N'childhood asthma', N'Pediatrics', N'Cough/Wheeze', N'urgent'),
     (N'DDX-PED-WHEEZE-BRONC',   N'Bronchiolitis',        N'Infant, RSV season',                N'viral bronchiolitis', N'Pediatrics', N'Cough/Wheeze', N'urgent'),
@@ -15333,7 +18197,7 @@ BEGIN TRY
     (N'DDX-PED-WHEEZE-FOREIGN', N'Foreign body aspiration', N'Sudden cough/wheeze, unilateral', N'FB aspiration',  N'Pediatrics', N'Cough/Wheeze', N'emergency'),
     (N'DDX-PED-WHEEZE-PERT',    N'Pertussis',            N'Paroxysmal cough, whoop',           N'whooping cough', N'Pediatrics', N'Cough/Wheeze', N'non-emergent');
 
-    /* ============ OBG â€” Vaginal discharge ============ */
+    /* ============ OBG — Vaginal discharge ============ */
     INSERT INTO @Items VALUES
     (N'DDX-OBG-DISCH-CAND', N'Vulvovaginal candidiasis', N'Thick curdy discharge, pruritus',    N'candida',                N'OBG', N'Vaginal discharge', N'non-emergent'),
     (N'DDX-OBG-DISCH-BV',   N'Bacterial vaginosis',      N'Thin grey discharge, fishy odor',    N'BV',                     N'OBG', N'Vaginal discharge', N'non-emergent'),
@@ -15341,7 +18205,7 @@ BEGIN TRY
     (N'DDX-OBG-DISCH-CERV', N'Cervicitis (GC/CT)',       N'Purulent discharge, friable cervix', N'gonorrhea, chlamydia',   N'OBG', N'Vaginal discharge', N'urgent'),
     (N'DDX-OBG-DISCH-FB',   N'Foreign body',             N'Retained tampon/condom with odor',   N'retained foreign body',  N'OBG', N'Vaginal discharge', N'non-emergent');
 
-    /* ============ Dermatology â€” Generalized rash ============ */
+    /* ============ Dermatology — Generalized rash ============ */
     INSERT INTO @Items VALUES
     (N'DDX-DERM-RASH-ATOP',  N'Atopic dermatitis', N'Pruritic, flexural distribution',                 N'eczema',          N'Dermatology', N'Generalized rash', N'non-emergent'),
     (N'DDX-DERM-RASH-PSOR',  N'Psoriasis',         N'Well-demarcated plaques with scale',              N'psoriatic plaques', N'Dermatology', N'Generalized rash', N'non-emergent'),
@@ -15349,12 +18213,12 @@ BEGIN TRY
     (N'DDX-DERM-RASH-DRUG',  N'Drug eruption',     N'Morbiliform after new medication',                N'drug rash',       N'Dermatology', N'Generalized rash', N'urgent'),
     (N'DDX-DERM-RASH-TINEA', N'Tinea corporis',    N'Annular scaly plaque with central clearing',      N'ringworm',        N'Dermatology', N'Generalized rash', N'non-emergent'),
     (N'DDX-DERM-RASH-SCAB',  N'Scabies',           N'Nocturnal pruritus, burrows',                     N'sarcoptes',       N'Dermatology', N'Generalized rash', N'non-emergent'),
-    (N'DDX-DERM-RASH-VIRAL', N'Viral exanthem',    N'Diffuse maculopapular rash Â± fever',              N'viral rash',      N'Dermatology', N'Generalized rash', N'non-emergent');
+    (N'DDX-DERM-RASH-VIRAL', N'Viral exanthem',    N'Diffuse maculopapular rash ± fever',              N'viral rash',      N'Dermatology', N'Generalized rash', N'non-emergent');
 
-    /* ============ Ortho/Rheum â€” Acute monoarthritis & Polyarthritis ============ */
+    /* ============ Ortho/Rheum — Acute monoarthritis & Polyarthritis ============ */
     INSERT INTO @Items VALUES
     (N'DDX-ORTHO-MONO-GOUT',   N'Gout',                 N'Podagra, hyperuricemia, crystals',        N'gouty arthritis', N'Orthopedics/Rheumatology', N'Acute monoarthritis', N'non-emergent'),
-    (N'DDX-ORTHO-MONO-SEP',    N'Septic arthritis',     N'Fever, hot swollen joint; aspirate WBCâ†‘',  N'infective arthritis', N'Orthopedics/Rheumatology', N'Acute monoarthritis', N'emergency'),
+    (N'DDX-ORTHO-MONO-SEP',    N'Septic arthritis',     N'Fever, hot swollen joint; aspirate WBC↑',  N'infective arthritis', N'Orthopedics/Rheumatology', N'Acute monoarthritis', N'emergency'),
     (N'DDX-ORTHO-MONO-PSEUDO', N'Pseudogout',           N'CPPD crystals, elderly',                   N'chondrocalcinosis', N'Orthopedics/Rheumatology', N'Acute monoarthritis', N'non-emergent'),
     (N'DDX-ORTHO-MONO-TRAUMA', N'Traumatic hemarthrosis', N'Injury history; blood in joint',         N'hemarthrosis',    N'Orthopedics/Rheumatology', N'Acute monoarthritis', N'urgent'),
     (N'DDX-ORTHO-MONO-REACT',  N'Reactive arthritis',   N'Post-infectious, HLA-B27',                 N'Reiter syndrome', N'Orthopedics/Rheumatology', N'Acute monoarthritis', N'non-emergent'),
@@ -15364,7 +18228,7 @@ BEGIN TRY
     (N'DDX-ORTHO-POLY-OSTEO',  N'Osteoarthritis',       N'Activity-related pain, bony enlargement',  N'OA',              N'Orthopedics/Rheumatology', N'Chronic polyarthritis', N'non-emergent'),
     (N'DDX-ORTHO-POLY-VASC',   N'Vasculitis',           N'Constitutional symptoms, neuropathy',      N'ANCA-associated', N'Orthopedics/Rheumatology', N'Chronic polyarthritis', N'urgent');
 
-    /* ============ Urology â€” Dysuria ============ */
+    /* ============ Urology — Dysuria ============ */
     INSERT INTO @Items VALUES
     (N'DDX-URO-DYS-UTI',   N'Acute cystitis',      N'Dysuria, frequency, suprapubic pain', N'UTI',            N'Urology', N'Dysuria', N'non-emergent'),
     (N'DDX-URO-DYS-PYELO', N'Pyelonephritis',      N'Fever, flank pain, CVA tenderness',   N'kidney infection',N'Urology', N'Dysuria', N'urgent'),
@@ -15372,7 +18236,7 @@ BEGIN TRY
     (N'DDX-URO-DYS-STONE', N'Ureteric stone',      N'Colicky pain, microscopic hematuria', N'renal colic',     N'Urology', N'Dysuria', N'urgent'),
     (N'DDX-URO-DYS-PROST', N'Prostatitis',         N'Perineal pain, tender prostate',      N'acute prostatitis', N'Urology', N'Dysuria', N'non-emergent');
 
-    /* ============ Ophthalmology â€” Red eye ============ */
+    /* ============ Ophthalmology — Red eye ============ */
     INSERT INTO @Items VALUES
     (N'DDX-OPH-RE-CONJ',    N'Conjunctivitis',                N'Itchy, sticky eyes, minimal pain', N'pink eye',       N'Ophthalmology', N'Red eye', N'non-emergent'),
     (N'DDX-OPH-RE-KER',     N'Keratitis/corneal ulcer',       N'Pain, photophobia, decreased vision', N'corneal ulcer',N'Ophthalmology', N'Red eye', N'urgent'),
@@ -15380,16 +18244,16 @@ BEGIN TRY
     (N'DDX-OPH-RE-ACG',     N'Acute angle-closure glaucoma',  N'Severe pain, halos, mid-dilated pupil', N'AACG',      N'Ophthalmology', N'Red eye', N'emergency'),
     (N'DDX-OPH-RE-SUBCONJ', N'Subconjunctival hemorrhage',    N'Painless red patch',                 N'SCH',           N'Ophthalmology', N'Red eye', N'non-emergent');
 
-    /* ============ Psychiatry â€” Low mood ============ */
+    /* ============ Psychiatry — Low mood ============ */
     INSERT INTO @Items VALUES
-    (N'DDX-PSY-DEP-MDD',  N'Major depressive disorder',     N'â‰¥2 weeks depressed mood/anhedonia', N'depression',             N'Psychiatry', N'Low mood', N'non-emergent'),
+    (N'DDX-PSY-DEP-MDD',  N'Major depressive disorder',     N'≥2 weeks depressed mood/anhedonia', N'depression',             N'Psychiatry', N'Low mood', N'non-emergent'),
     (N'DDX-PSY-DEP-BP',   N'Bipolar disorder (depressive phase)', N'Past mania/hypomania',         N'BPAD',                  N'Psychiatry', N'Low mood', N'non-emergent'),
     (N'DDX-PSY-DEP-ADJ',  N'Adjustment disorder',           N'Temporal relation to stressor',     N'reactive depression',    N'Psychiatry', N'Low mood', N'non-emergent'),
-    (N'DDX-PSY-DEP-THY',  N'Hypothyroidism',                N'Fatigue, weight gain, TSHâ†‘',        N'low thyroid',            N'Psychiatry', N'Low mood', N'non-emergent'),
+    (N'DDX-PSY-DEP-THY',  N'Hypothyroidism',                N'Fatigue, weight gain, TSH↑',        N'low thyroid',            N'Psychiatry', N'Low mood', N'non-emergent'),
     (N'DDX-PSY-DEP-SUBS', N'Substance/medication-induced',  N'Alcohol/benzos/steroids etc.',      N'drug-induced depression',N'Psychiatry', N'Low mood', N'non-emergent'),
     (N'DDX-PSY-DEP-GRIEF',N'Bereavement/normal grief',      N'Culturally normative grief reaction',N'grief',                 N'Psychiatry', N'Low mood', N'non-emergent');
 
-    /* ============ ENT â€” Sore throat ============ */
+    /* ============ ENT — Sore throat ============ */
     INSERT INTO @Items VALUES
     (N'DDX-ENT-ST-VIR',  N'Viral pharyngitis',      N'Diffuse erythema, cough, coryza',     N'viral sore throat', N'ENT', N'Sore throat', N'non-emergent'),
     (N'DDX-ENT-ST-STREP',N'Streptococcal pharyngitis', N'Exudate, tender nodes, no cough',   N'strep throat',      N'ENT', N'Sore throat', N'non-emergent'),
@@ -15397,22 +18261,22 @@ BEGIN TRY
     (N'DDX-ENT-ST-EPI',  N'Epiglottitis',           N'Rapid onset, drooling, tripoding',    N'Hib epiglottitis',  N'ENT', N'Sore throat', N'emergency'),
     (N'DDX-ENT-ST-GERD', N'Laryngopharyngeal reflux', N'Globus, throat clearing',           N'LPR',               N'ENT', N'Sore throat', N'non-emergent');
 
-    /* ============ Hematology â€” Anemia workup ============ */
+    /* ============ Hematology — Anemia workup ============ */
     INSERT INTO @Items VALUES
     (N'DDX-HEME-ANEM-IDA',  N'Iron deficiency anemia', N'Microcytic hypochromic anemia',      N'IDA',           N'Hematology', N'Anemia', N'non-emergent'),
     (N'DDX-HEME-ANEM-ACD',  N'Anemia of chronic disease', N'Inflammation-related anemia',      N'ACD',           N'Hematology', N'Anemia', N'non-emergent'),
     (N'DDX-HEME-ANEM-B12',  N'B12/Folate deficiency', N'Macrocytosis, neurologic signs (B12)', N'megaloblastic', N'Hematology', N'Anemia', N'non-emergent'),
-    (N'DDX-HEME-ANEM-HEM',  N'Hemolytic anemia',      N'Reticulocytosis, LDHâ†‘, bilirubinâ†‘',   N'hemolysis',     N'Hematology', N'Anemia', N'urgent'),
+    (N'DDX-HEME-ANEM-HEM',  N'Hemolytic anemia',      N'Reticulocytosis, LDH↑, bilirubin↑',   N'hemolysis',     N'Hematology', N'Anemia', N'urgent'),
     (N'DDX-HEME-ANEM-APLA', N'Aplastic anemia',       N'Pancytopenia, hypocellular marrow',   N'AA',            N'Hematology', N'Anemia', N'urgent');
 
-    /* ============ Endocrinology â€” Polyuria/Polydipsia ============ */
+    /* ============ Endocrinology — Polyuria/Polydipsia ============ */
     INSERT INTO @Items VALUES
     (N'DDX-ENDO-PU-DM',      N'Diabetes mellitus',    N'Hyperglycemia with osmotic symptoms', N'DM',                  N'Endocrinology', N'Polyuria/Polydipsia', N'non-emergent'),
     (N'DDX-ENDO-PU-DI',      N'Diabetes insipidus',   N'Polyuria with low urine osmolality',  N'central/nephrogenic DI', N'Endocrinology', N'Polyuria/Polydipsia', N'non-emergent'),
     (N'DDX-ENDO-PU-PSY',     N'Primary polydipsia',   N'Excess fluid intake',                 N'psychogenic polydipsia',N'Endocrinology', N'Polyuria/Polydipsia', N'non-emergent'),
     (N'DDX-ENDO-PU-HYPERCA', N'Hypercalcemia',        N'Polyuria, stones, bones, groans',     N'high calcium',        N'Endocrinology', N'Polyuria/Polydipsia', N'non-emergent');
 
-    /* ============ Orthopedics â€” Low back pain ============ */
+    /* ============ Orthopedics — Low back pain ============ */
     INSERT INTO @Items VALUES
     (N'DDX-ORTHO-BACK-MECH', N'Mechanical strain',        N'Acute strain; improves with rest',               N'lumbago',        N'Orthopedics', N'Low back pain', N'non-emergent'),
     (N'DDX-ORTHO-BACK-DISC', N'Lumbar disc herniation',   N'Radicular pain; SLR positive',                   N'slipped disc',   N'Orthopedics', N'Low back pain', N'urgent'),
@@ -15591,13 +18455,13 @@ BEGIN TRY
        ========================= */
     INSERT INTO @Items (Code, Name, ShortDesc, Synonyms, Category, Subcategory, ExamType, Flags) VALUES
     (N'CNS-HMF', N'Higher mental functions', N'Orientation, memory, language, praxis', N'cognition', N'CNS', NULL, N'assessment', N'[]'),
-    (N'CNS-CRANIAL', N'Cranial nerves Iâ€“XII', N'Smell, vision, EOM, facial, etc.', N'CN exam', N'CNS', NULL, N'assessment', N'[]'),
+    (N'CNS-CRANIAL', N'Cranial nerves I–XII', N'Smell, vision, EOM, facial, etc.', N'CN exam', N'CNS', NULL, N'assessment', N'[]'),
     (N'CNS-MOTOR', N'Motor system', N'Tone, bulk, power (MRC), reflexes', N'UMN/LMN', N'CNS', NULL, N'assessment', N'[]'),
     (N'CNS-SENSORY', N'Sensory system', N'Touch, pain, temp, vibration, proprioception', N'sensory modalities', N'CNS', NULL, N'assessment', N'[]'),
-    (N'CNS-CEREB', N'Cerebellar tests', N'Fingerâ€“nose, heelâ€“shin, DDK', N'coordination', N'CNS', NULL, N'special_test', N'[]'),
+    (N'CNS-CEREB', N'Cerebellar tests', N'Finger–nose, heel–shin, DDK', N'coordination', N'CNS', NULL, N'special_test', N'[]'),
     (N'CNS-GAIT', N'Gait & stance', N'Romberg, tandem gait', N'balance', N'CNS', NULL, N'special_test', N'[]'),
     (N'CNS-MENINGEAL', N'Meningeal signs', N'Neck stiffness, Kernig, Brudzinski', N'meningism', N'CNS', NULL, N'special_test', N'[]'),
-    (N'CNS-GCS', N'Glasgow Coma Scale', N'EVM score 3â€“15', N'GCS', N'CNS', N'Measurement', N'measurement', N'[]'),
+    (N'CNS-GCS', N'Glasgow Coma Scale', N'EVM score 3–15', N'GCS', N'CNS', N'Measurement', N'measurement', N'[]'),
     (N'CNS-PLANTAR', N'Plantar response', N'Flexor/extensor (Babinski)', N'plantar reflex', N'CNS', NULL, N'special_test', N'[]');
 
     /* =========================
@@ -15715,7 +18579,7 @@ BEGIN TRY
     (N'GERI-FRAIL', N'Frailty screening', N'Frail/robust; gait speed', N'frailty', N'Geriatrics', NULL, N'assessment', N'[]'),
     (N'GERI-FALLS', N'Falls risk', N'History, balance tests', N'fall risk', N'Geriatrics', NULL, N'assessment', N'[]'),
     (N'GERI-NUTR', N'Nutritional screen (MNA)', N'Mini Nutritional Assessment', N'MNA', N'Geriatrics', NULL, N'measurement', N'[]'),
-    (N'GERI-POLY', N'Polypharmacy review', N'â‰¥5 meds; high-risk drugs', N'polypharmacy', N'Geriatrics', NULL, N'assessment', N'[]');
+    (N'GERI-POLY', N'Polypharmacy review', N'≥5 meds; high-risk drugs', N'polypharmacy', N'Geriatrics', NULL, N'assessment', N'[]');
 
     /* =========================
        Pediatrics
@@ -15734,7 +18598,7 @@ BEGIN TRY
     (N'ENDO-THYROID', N'Thyroid exam', N'Inspection, palpation, bruit', N'goiter exam', N'Endocrine', N'Neck', N'palpation', N'[]'),
     (N'ENDO-DFOOT', N'Diabetic foot exam', N'Monofilament, vibration, pulses, skin', N'neuropathy screen', N'Endocrine', N'Foot', N'special_test', N'[]'),
     (N'ENDO-ACANTH', N'Acanthosis nigricans', N'Neck/axillae skin change', N'insulin resistance sign', N'Endocrine', NULL, N'inspection', N'[]'),
-    (N'ENDO-HIRSUT', N'Hirsutism score', N'Ferrimanâ€“Gallwey scoring', N'hirsutism', N'Endocrine', NULL, N'measurement', N'[]');
+    (N'ENDO-HIRSUT', N'Hirsutism score', N'Ferriman–Gallwey scoring', N'hirsutism', N'Endocrine', NULL, N'measurement', N'[]');
 
     -- Upsert with MetaJson normalization and seed stamping
     DECLARE @tags NVARCHAR(MAX) = N'["examination"]';
@@ -15843,7 +18707,7 @@ BEGIN TRY
     (N'HPI-RELIEVE', N'Relieving factors', N'What makes it better', N'alleviating factors', N'Chief Complaint & HPI'),
     (N'HPI-RADIATION', N'Radiation', N'Does pain/symptom spread to other areas', N'spread', N'Chief Complaint & HPI'),
     (N'HPI-TIMING', N'Timing', N'Frequency/pattern (intermittent, constant)', N'pattern, periodicity', N'Chief Complaint & HPI'),
-    (N'HPI-SEVERITY', N'Severity', N'Intensity e.g., 0â€“10 scale', N'intensity, pain score', N'Chief Complaint & HPI'),
+    (N'HPI-SEVERITY', N'Severity', N'Intensity e.g., 0–10 scale', N'intensity, pain score', N'Chief Complaint & HPI'),
     (N'HPI-ASSOC', N'Associated symptoms', N'Other symptoms occurring with main complaint', N'concomitant symptoms', N'Chief Complaint & HPI'),
     (N'HPI-PRIOR', N'Previous episodes', N'Similar events in the past', N'recurrence', N'Chief Complaint & HPI'),
     (N'HPI-TREAT', N'Treatment tried', N'Medications/remedies taken and response', N'self-medication, home remedies', N'Chief Complaint & HPI'),
@@ -15914,7 +18778,7 @@ BEGIN TRY
     (N'SOC-FINANCE', N'Financial/Access concerns', N'Affordability/transport barriers', N'socioeconomic', N'Social & Lifestyle History'),
     (N'SOC-DV', N'Domestic/Intimate partner violence', N'Safety concerns', N'abuse', N'Social & Lifestyle History'),
     (N'SOC-PETS', N'Pets/Animal exposure', N'Cats/dogs/livestock', N'animal contact', N'Social & Lifestyle History'),
-    (N'EXP-TRAVEL', N'Recent travel', N'Domestic/international in last 1â€“3 months', N'travel history', N'Exposure, Travel & Environmental'),
+    (N'EXP-TRAVEL', N'Recent travel', N'Domestic/international in last 1–3 months', N'travel history', N'Exposure, Travel & Environmental'),
     (N'EXP-ENDEMIC', N'Endemic exposure', N'TB/malaria/dengue areas', N'endemic area', N'Exposure, Travel & Environmental'),
     (N'EXP-FOOD', N'Food/water exposure', N'Street food/untreated water', N'unsafe food', N'Exposure, Travel & Environmental'),
     (N'EXP-CONTACT', N'Sick contacts', N'Family/colleague illnesses', N'contact history', N'Exposure, Travel & Environmental'),
@@ -26702,7 +29566,7 @@ BEGIN TRY
 
   /* ===== Add your rows (examples) ===== */
   INSERT INTO @Items (Code,Name,ShortDesc,Synonyms) VALUES
-  (N'IMM-CHILD-BCG',         N'BCG',                     N'Tuberculosis prevention',                                         N'Bacillus Calmette-GuÃ©rin, TB vaccine'),
+  (N'IMM-CHILD-BCG',         N'BCG',                     N'Tuberculosis prevention',                                         N'Bacillus Calmette-Guérin, TB vaccine'),
   (N'IMM-CHILD-OPV',         N'OPV',                     N'Oral polio vaccine',                                              N'Polio (oral), tOPV, bOPV'),
   (N'IMM-CHILD-IPV',         N'IPV',                     N'Inactivated polio vaccine',                                       N'Inactivated polio'),
   (N'IMM-CHILD-DTP',         N'DTP/DTaP',                N'Diphtheria, Tetanus, Pertussis (pediatric)',                      N'DTP, DTaP, DT pediatric'),
@@ -26726,7 +29590,7 @@ BEGIN TRY
   (N'IMM-ADULT-Rabies-Post', N'Rabies (post-exposure)',  N'Rabies PEP per national guidance',                                N'Rabies PEP'),
   (N'IMM-ADULT-YellowFever', N'Yellow Fever',            N'Yellow fever vaccine (17D); travel/endemic',                      N'YF'),
   (N'IMM-GER-PCV',           N'Pneumococcal (PCV, adult)',N'PCV15/PCV20 for adults (policy/risk-based)',                      N'PCV adult'),
-  (N'IMM-GER-PPSV23',        N'Pneumococcal (PPSV23)',   N'Pneumococcal polysaccharide (risk-based/â‰¥65)',                     N'PPSV23'),
+  (N'IMM-GER-PPSV23',        N'Pneumococcal (PPSV23)',   N'Pneumococcal polysaccharide (risk-based/≥65)',                     N'PPSV23'),
   (N'IMM-GER-Zoster',        N'Herpes Zoster (Shingles)',N'Recombinant zoster vaccine (2-dose series)',                      N'RZV, Shingrix');
 
   /* ===== Insert only missing rows ===== */
@@ -26787,14 +29651,14 @@ BEGIN TRY
   INSERT INTO @Items (Code,Name,ShortDesc,Synonyms,Category,SubCategory,Sample,Modality,Panel,IsRoutine) VALUES
   (N'INV-HEM-CBC',      N'Complete blood count (CBC)',       N'Hb, RBC indices, WBC, platelets', N'full blood count', N'Hematology',   N'CBC',            N'Blood', NULL, N'CBC', 1),
   (N'INV-HEM-ESR',      N'Erythrocyte sedimentation rate',   N'Inflammatory marker',             N'ESR',              N'Hematology',   N'Inflammation',   N'Blood', NULL, NULL, 1),
-  (N'INV-BIO-HBA1C',    N'HbA1c',                            N'Average glucose (2â€“3 months)',    N'A1c',              N'Biochemistry', N'Glycated Hb',    N'Blood', NULL, NULL, 1),
+  (N'INV-BIO-HBA1C',    N'HbA1c',                            N'Average glucose (2–3 months)',    N'A1c',              N'Biochemistry', N'Glycated Hb',    N'Blood', NULL, NULL, 1),
   (N'INV-BIO-RFT',      N'Renal function tests',             N'Urea/Creatinine/Electrolytes',    N'kidney panel',     N'Biochemistry', N'RFT',            N'Blood', NULL, N'RFT', 1),
   (N'INV-BIO-LFT',      N'Liver function tests',             N'AST/ALT/ALP/Bilirubin/Albumin',   N'liver panel',      N'Biochemistry', N'LFT',            N'Blood', NULL, N'LFT', 1),
   (N'INV-IMG-CXR-PA',   N'X-ray Chest (PA view)',            N'Chest radiograph PA',              N'CXR',              N'Imaging',      N'X-ray',          NULL,     N'X-ray', NULL, 1),
   (N'INV-IMG-USG-ABDO', N'Ultrasound Abdomen',               N'USG abdomen solid/viscera',        N'USG abdomen',      N'Imaging',      N'Ultrasound',     NULL,     N'Ultrasound', NULL, 1),
   (N'INV-CARD-ECG',     N'Electrocardiogram (ECG)',          N'12-lead ECG',                      N'EKG',              N'Cardio-Pulmonary', N'Cardiac',   NULL, NULL, NULL, 1),
   (N'INV-PULM-PFT',     N'Pulmonary function tests (PFT)',   N'Spirometry and lung volumes',      N'spirometry',       N'Cardio-Pulmonary', N'Pulmonary', NULL, NULL, NULL, 1),
-  (N'INV-OBG-UPT',      N'Urine pregnancy test (Î²-hCG)',     N'Qualitative pregnancy test',       N'UPT',              N'OBG',          N'Pregnancy',      N'Urine', NULL, NULL, 1);
+  (N'INV-OBG-UPT',      N'Urine pregnancy test (β-hCG)',     N'Qualitative pregnancy test',       N'UPT',              N'OBG',          N'Pregnancy',      N'Urine', NULL, NULL, 1);
 
   /* ===== Insert only missing rows ===== */
   INSERT INTO dbo.LookupMaster (LookupTypeId, Code, Name, ShortDesc, Synonyms, MetaJson)
@@ -26857,32 +29721,32 @@ BEGIN TRY
   INSERT INTO @Items VALUES
     (N'NP-GEN-DASH', N'DASH/Mediterranean Diet', N'High fruits/veg, whole grains; low salt and trans fat', N'Heart-healthy diet',
       N'Lifestyle', N'["General Medicine","Cardiology","Nephrology","Endocrinology"]', N'["diet","hypertension","lipids"]',
-      N'["Fill half the plate with vegetables/fruits","Use whole grains","Choose fish/legumes; limit red/processed meat","Use oils like olive/mustard; avoid trans fats","Limit sodium to ~2g (â‰ˆ5g salt)/day"]',
+      N'["Fill half the plate with vegetables/fruits","Use whole grains","Choose fish/legumes; limit red/processed meat","Use oils like olive/mustard; avoid trans fats","Limit sodium to ~2g (≈5g salt)/day"]',
       N'[]', N'', N'Tailor for CKD/heart failure'),
 
     (N'NP-GEN-WEIGHT', N'Weight Management Plan', N'Calorie deficit with diet + activity; habit stacking', N'Weight loss lifestyle',
       N'Lifestyle', N'["General Medicine","Endocrinology"]', N'["calorie deficit","obesity"]',
-      N'["Set realistic goal (5â€“10% in 3â€“6 months)","Track intake and steps","Prefer protein & fiber-rich foods","Sleep 7â€“8h; manage stress","Weekly weigh-in, adjust plan"]',
+      N'["Set realistic goal (5–10% in 3–6 months)","Track intake and steps","Prefer protein & fiber-rich foods","Sleep 7–8h; manage stress","Weekly weigh-in, adjust plan"]',
       N'[]', N'', N''),
 
     (N'NP-GEN-EXERCISE-150', N'Exercise Prescription (General)', N'150 min/week moderate + 2 days strength + balance', N'Physical activity general',
       N'Exercise', N'["General Medicine","Rehab","Cardiology","Pulmonology","Geriatrics"]', N'["aerobic","resistance","balance"]',
-      N'["Start with brisk walking/cycling as tolerated","Add 2 non-consecutive days of resistance training","Include balance exercises esp. â‰¥65 yrs","Warm-up/cool-down 5â€“10 min"]',
+      N'["Start with brisk walking/cycling as tolerated","Add 2 non-consecutive days of resistance training","Include balance exercises esp. ≥65 yrs","Warm-up/cool-down 5–10 min"]',
       N'["unstable angina","acute illness with fever"]', N'Most days of the week', N''),
 
     (N'NP-GEN-SLEEP', N'Sleep Hygiene', N'Regular schedule, screen curfew, cool dark room', N'Insomnia nonpharm',
       N'Sleep', N'["Psychiatry","General Medicine"]', N'["CBT-I","insomnia"]',
-      N'["Fixed sleep/wake time","Avoid caffeine after noon","Screen curfew 60â€“90 min pre-bed","Bedroom cool, dark, quiet","Get out of bed if awake >20 min"]',
+      N'["Fixed sleep/wake time","Avoid caffeine after noon","Screen curfew 60–90 min pre-bed","Bedroom cool, dark, quiet","Get out of bed if awake >20 min"]',
       N'[]', N'', N''),
 
     (N'NP-GEN-STRESS', N'Stress Reduction & Mindfulness', N'Breathing, mindfulness, relaxation response', N'Mind-body techniques',
       N'Mind-Body', N'["Psychiatry","General Medicine"]', N'["mindfulness","breathing","relaxation"]',
-      N'["5â€“10 minutes diaphragmatic breathing twice daily","Body scan/mindfulness app practice","Schedule pleasant activities","Journaling for worry scheduling"]',
+      N'["5–10 minutes diaphragmatic breathing twice daily","Body scan/mindfulness app practice","Schedule pleasant activities","Journaling for worry scheduling"]',
       N'[]', N'', N''),
 
     (N'NP-GEN-SMOKING', N'Tobacco Cessation (Behavioral)', N'Set quit date, identify triggers, coping skills', N'Quit smoking nonpharm',
       N'Lifestyle', N'["Pulmonology","Cardiology","Oncology"]', N'["behavioral","motivation"]',
-      N'["Set a quit date within 2â€“4 weeks","Remove tobacco/ashtrays","Identify triggers and replacements (gum/water/walk)","Use support groups/quitlines","Relapse plan after slips"]',
+      N'["Set a quit date within 2–4 weeks","Remove tobacco/ashtrays","Identify triggers and replacements (gum/water/walk)","Use support groups/quitlines","Relapse plan after slips"]',
       N'[]', N'', N''),
 
     (N'NP-GEN-ALCOHOL', N'Alcohol Brief Intervention', N'Motivational interviewing; low-risk limits', N'AUD brief intervention',
@@ -26893,14 +29757,14 @@ BEGIN TRY
     (N'NP-GEN-HYDRATION', N'Hydration Guidance', N'Adequate fluids adjusted for comorbidities', N'Fluid advice general',
       N'Lifestyle', N'["General Medicine"]', N'["fluids","dehydration"]',
       N'["Distribute water evenly through day","Use ORS homemade for minor dehydration","Adjust for heat/exercise"]',
-      N'["Fluid restriction in HF/CKDâ€”individualize"]', N'', N''),
+      N'["Fluid restriction in HF/CKD—individualize"]', N'', N''),
 
     (N'NP-CARD-SALT', N'Sodium Restriction', N'Limit sodium intake for BP/HF control', N'Salt restriction',
       N'Diet', N'["Cardiology","Nephrology"]', N'["hypertension","heart failure"]',
       N'["Avoid packaged/processed foods","Cook without added salt; add herbs/spices","Read labels (<140 mg/serving target)"]',
       N'[]', N'', N''),
 
-    (N'NP-CARD-CARDIAC-REHAB', N'Cardiac Rehabilitation (Phases Iâ€“III)', N'Supervised aerobic + education + risk factor control', N'Cardiac rehab nonpharm',
+    (N'NP-CARD-CARDIAC-REHAB', N'Cardiac Rehabilitation (Phases I–III)', N'Supervised aerobic + education + risk factor control', N'Cardiac rehab nonpharm',
       N'Program', N'["Cardiology","Rehab"]', N'["post-MI","post-PCI","HF"]',
       N'["Baseline assessment and goal setting","Gradual aerobic/resistance progression","Diet/psychosocial counselling","Home plan after supervised phase"]',
       N'[]', N'', N''),
@@ -26912,12 +29776,12 @@ BEGIN TRY
 
     (N'NP-PULM-BREATH', N'Breathing Techniques (COPD/Asthma)', N'Pursed-lip & diaphragmatic breathing', N'Pulmonary rehab breathing',
       N'Breathing', N'["Pulmonology","Rehab"]', N'["COPD","asthma"]',
-      N'["Inhale through nose 2 counts","Exhale through pursed lips 4 counts","Practice 5â€“10 minutes, 2â€“3 times/day"]',
+      N'["Inhale through nose 2 counts","Exhale through pursed lips 4 counts","Practice 5–10 minutes, 2–3 times/day"]',
       N'[]', N'', N''),
 
     (N'NP-PULM-PEP', N'Airway Clearance (PEP/Active Cycle)', N'PEP device or huff coughing for secretions', N'Airway clearance',
       N'Physio', N'["Pulmonology","Physiotherapy"]', N'[]',
-      N'["Breathing control","Thoracic expansion exercises","Huff coughs","Repeat cycles 10â€“20 min"]',
+      N'["Breathing control","Thoracic expansion exercises","Huff coughs","Repeat cycles 10–20 min"]',
       N'[]', N'', N''),
 
     (N'NP-PULM-TRIGGER', N'Trigger Avoidance Plan', N'Dust/mold/pollens avoidance; mask use; pet dander control', N'Allergen avoidance',
@@ -26932,7 +29796,7 @@ BEGIN TRY
 
     (N'NP-ENDO-DM-EXER', N'Exercise in Diabetes', N'Post-meal walks, resistance twice weekly', N'DM exercise',
       N'Exercise', N'["Endocrinology","Rehab"]', N'[]',
-      N'["10â€“15 min walk after meals","2â€“3 sessions of resistance training/week","Carry quick sugar if at risk of hypoglycemia"]',
+      N'["10–15 min walk after meals","2–3 sessions of resistance training/week","Carry quick sugar if at risk of hypoglycemia"]',
       N'[]', N'', N''),
 
     (N'NP-ENDO-DM-FOOT', N'Diabetic Foot Care (Nonpharm)', N'Daily inspection, moisturize, proper footwear', N'Foot care nonpharm',
@@ -26942,7 +29806,7 @@ BEGIN TRY
 
     (N'NP-ENDO-PCOS', N'PCOS Lifestyle', N'Weight management, exercise, sleep, stress reduction', N'PCOS nonpharm',
       N'Lifestyle', N'["Endocrinology","Gynecology"]', N'[]',
-      N'["Exercise â‰¥150 min/wk","Protein-rich breakfasts; limit refined carbs","Sleep 7â€“9h; manage stress"]',
+      N'["Exercise ≥150 min/wk","Protein-rich breakfasts; limit refined carbs","Sleep 7–9h; manage stress"]',
       N'[]', N'', N''),
 
     (N'NP-NEPH-FLUID', N'CKD Fluid & Diet Guidance', N'Salt restriction; individualized protein & potassium', N'CKD diet nonpharm',
@@ -26965,9 +29829,9 @@ BEGIN TRY
       N'["Daily ROM exercises","Task-specific practice for affected limb","Speech/language tasks as advised by therapist"]',
       N'[]', N'', N''),
 
-    (N'NP-NEURO-INSOMNIA', N'Post-Concussion Rest & Graded Return', N'24â€“48h relative rest then gradual activity', N'Concussion graded return',
+    (N'NP-NEURO-INSOMNIA', N'Post-Concussion Rest & Graded Return', N'24–48h relative rest then gradual activity', N'Concussion graded return',
       N'Recovery', N'["Neurology","Emergency"]', N'[]',
-      N'["Limit screen time first 24â€“48h","Gradual cognitive/physical return in stages","Stop if symptoms worsen"]',
+      N'["Limit screen time first 24–48h","Gradual cognitive/physical return in stages","Stop if symptoms worsen"]',
       N'[]', N'', N''),
 
     (N'NP-PSY-CBTI', N'CBT-I Basics', N'Stimulus control and sleep restriction principles', N'CBT-I nonpharm',
@@ -26990,29 +29854,29 @@ BEGIN TRY
       N'["Short lukewarm baths/showers","Apply emollient within 3 minutes","Avoid fragrance/harsh soaps"]',
       N'[]', N'', N''),
 
-    (N'NP-DERM-SUNSAFE', N'Sun Protection', N'Shade, clothing, sunscreen SPF â‰¥30 reapplied 2â€“3h', N'Photoprotection',
+    (N'NP-DERM-SUNSAFE', N'Sun Protection', N'Shade, clothing, sunscreen SPF ≥30 reapplied 2–3h', N'Photoprotection',
       N'Prevention', N'["Dermatology"]', N'[]',
-      N'["Avoid midday sun 10â€“4","Broad-brim hat, long sleeves","Sunscreen 15â€“30 min before exposure; reapply"]',
+      N'["Avoid midday sun 10–4","Broad-brim hat, long sleeves","Sunscreen 15–30 min before exposure; reapply"]',
       N'[]', N'', N''),
 
     (N'NP-DERM-WETWRAP', N'Wet-Wrap Therapy (Eczema Flares)', N'Moisturize + damp layer + dry layer for several hours', N'Wet wraps',
       N'Skin Care', N'["Dermatology"]', N'[]',
-      N'["Moisturize affected areas","Apply damp cotton layer then dry layer","Use 2â€“6 hours or overnight"]',
+      N'["Moisturize affected areas","Apply damp cotton layer then dry layer","Use 2–6 hours or overnight"]',
       N'[]', N'', N''),
 
     (N'NP-GI-FIBER', N'Constipation: Fiber & Routine', N'Soluble fiber, fluids, regular toilet timing', N'Constipation nonpharm',
       N'Diet', N'["Gastroenterology","General Medicine"]', N'[]',
-      N'["Add psyllium/soluble fiber gradually","1.5â€“2 L fluids if not restricted","Regular morning toilet time post-breakfast"]',
+      N'["Add psyllium/soluble fiber gradually","1.5–2 L fluids if not restricted","Regular morning toilet time post-breakfast"]',
       N'[]', N'', N''),
 
     (N'NP-GI-IBS-LOWFODMAP', N'IBS Low-FODMAP Trial', N'Structured elimination then reintroduction', N'Low FODMAP',
       N'Diet', N'["Gastroenterology","Dietetics"]', N'[]',
-      N'["Eliminate high-FODMAP foods 4â€“6 weeks","Stepwise reintroduce to identify triggers","Maintain personalized plan"]',
+      N'["Eliminate high-FODMAP foods 4–6 weeks","Stepwise reintroduce to identify triggers","Maintain personalized plan"]',
       N'[]', N'', N'Dietitian guidance recommended'),
 
     (N'NP-GI-REFLUX', N'GERD Measures', N'Head-end elevation, avoid late meals, portion control', N'Reflux lifestyle',
       N'Lifestyle', N'["Gastroenterology"]', N'[]',
-      N'["Avoid meals 2â€“3h before bed","Elevate head-end 6â€“8 inches","Reduce caffeine, spicy/fatty foods if symptomatic"]',
+      N'["Avoid meals 2–3h before bed","Elevate head-end 6–8 inches","Reduce caffeine, spicy/fatty foods if symptomatic"]',
       N'[]', N'', N''),
 
     (N'NP-HEP-ALCOHOL-ABST', N'Alcohol Abstinence in Liver Disease', N'Complete abstinence; coping plan', N'Liver alcohol abstinence',
@@ -27022,7 +29886,7 @@ BEGIN TRY
 
     (N'NP-GI-ORALCARE-MUCOSITIS', N'Oral Mucositis Care', N'Salt-soda rinses, soft brush, avoid irritants', N'Mouth care nonpharm',
       N'Supportive', N'["Oncology","Gastroenterology","Dentistry"]', N'[]',
-      N'["Rinse with salt-bicarbonate solution 4â€“6Ã—/day","Use soft toothbrush","Avoid spicy/acidic foods"]',
+      N'["Rinse with salt-bicarbonate solution 4–6×/day","Use soft toothbrush","Avoid spicy/acidic foods"]',
       N'[]', N'', N''),
 
     (N'NP-ID-ISOLATION', N'Infection Control at Home', N'Masking, hand hygiene, ventilation, separate utensils', N'Home isolation nonpharm',
@@ -27045,7 +29909,7 @@ BEGIN TRY
       N'["Turn every 2 hours if bedbound","Use pressure-redistributing mattress/cushions","Keep skin clean/dry","Nutrition optimization"]',
       N'[]', N'', N''),
 
-    (N'NP-PED-BREASTFEED', N'Breastfeeding Support', N'Positioning & latch; exclusive 0â€“6 months', N'Lactation counselling',
+    (N'NP-PED-BREASTFEED', N'Breastfeeding Support', N'Positioning & latch; exclusive 0–6 months', N'Lactation counselling',
       N'Feeding', N'["Pediatrics","Obstetrics"]', N'[]',
       N'["Skin-to-skin early","Ensure deep latch (more areola below)","Feed on demand","Avoid bottles/pacifiers initially"]',
       N'[]', N'', N''),
@@ -27082,12 +29946,12 @@ BEGIN TRY
 
     (N'NP-OBG-DYSMEN', N'Dysmenorrhea Nonpharm', N'Heat, exercise, relaxation, sleep hygiene', N'Period pain nonpharm',
       N'Symptom Care', N'["Gynecology"]', N'[]',
-      N'["Heat pad 15â€“20 min","Light exercise/yoga","Relaxation/breathing"]',
+      N'["Heat pad 15–20 min","Light exercise/yoga","Relaxation/breathing"]',
       N'[]', N'', N''),
 
-    (N'NP-ORTH-RICE', N'Acute Sprain/Strain: R.I.C.E.', N'Rest, Ice, Compression, Elevation first 48â€“72h', N'RICE protocol',
+    (N'NP-ORTH-RICE', N'Acute Sprain/Strain: R.I.C.E.', N'Rest, Ice, Compression, Elevation first 48–72h', N'RICE protocol',
       N'Injury Care', N'["Orthopedics","Rehab","Sports Medicine"]', N'[]',
-      N'["Relative rest","Ice 15â€“20 min every 2â€“3h","Elastic compression bandage","Elevate above heart"]',
+      N'["Relative rest","Ice 15–20 min every 2–3h","Elastic compression bandage","Elevate above heart"]',
       N'[]', N'', N''),
 
     (N'NP-ORTH-BACK', N'Mechanical Back Pain: Stay Active', N'Avoid bed rest; posture & core exercises', N'Back pain nonpharm',
@@ -27097,7 +29961,7 @@ BEGIN TRY
 
     (N'NP-ORTH-KNEE-OA', N'Knee OA: Quad Strengthening & Weight Loss', N'Home exercise set + weight management', N'OA knee nonpharm',
       N'Exercise', N'["Rehab","Orthopedics"]', N'[]',
-      N'["Straight leg raises, mini squats","3â€“4 sessions/week","Weight reduction 5â€“10% if overweight"]',
+      N'["Straight leg raises, mini squats","3–4 sessions/week","Weight reduction 5–10% if overweight"]',
       N'[]', N'', N''),
 
     (N'NP-ORTH-FALLS', N'Falls Prevention (Home)', N'Remove hazards, night lights, footwear, assistive devices', N'Falls prevention nonpharm',
@@ -27107,7 +29971,7 @@ BEGIN TRY
 
     (N'NP-OPH-LID', N'Lid Hygiene & Warm Compress', N'Blepharitis regimen: warm compress + lid scrub', N'Lid hygiene',
       N'Eye Care', N'["Ophthalmology"]', N'[]',
-      N'["Warm compress 5â€“10 min","Lid massage towards lid margin","Clean with diluted baby shampoo or lid wipes"]',
+      N'["Warm compress 5–10 min","Lid massage towards lid margin","Clean with diluted baby shampoo or lid wipes"]',
       N'[]', N'', N''),
 
     (N'NP-OPH-DRY-EYE', N'Dry Eye Measures', N'Blink breaks, humidify, 20-20-20 rule', N'Dry eye nonpharm',
@@ -27117,7 +29981,7 @@ BEGIN TRY
 
     (N'NP-ENT-STEAM', N'Steam Inhalation & Saline Gargles', N'Relieve nasal congestion/sore throat', N'Home remedies URTI',
       N'Symptom Care', N'["ENT","General Medicine","Pediatrics"]', N'[]',
-      N'["Steam inhalation cautiously 5â€“10 min","Warm saline gargles 3â€“4Ã—/day"]',
+      N'["Steam inhalation cautiously 5–10 min","Warm saline gargles 3–4×/day"]',
       N'["Avoid steam in small children due to burn risk"]', N'', N''),
 
     (N'NP-ENT-NETIPOT', N'Nasal Saline Irrigation', N'Isotonic saline rinse for rhinosinusitis/allergic rhinitis', N'Nasal irrigation',
@@ -27127,15 +29991,15 @@ BEGIN TRY
 
     (N'NP-URO-PFMT', N'Pelvic Floor Muscle Training (Incontinence)', N'Kegels with bladder diary', N'PFMT nonpharm',
       N'Physio', N'["Urology","Gynecology","Rehab"]', N'[]',
-      N'["Bladder diary 3â€“7 days","3 sets of 10 contractions daily","Progress hold times","Cueing during cough/sneeze"]',
+      N'["Bladder diary 3–7 days","3 sets of 10 contractions daily","Progress hold times","Cueing during cough/sneeze"]',
       N'[]', N'', N''),
 
     (N'NP-URO-STONE', N'Kidney Stone: Fluids & Strain Urine', N'High fluid intake; strain to capture stone', N'Stone nonpharm',
       N'Lifestyle', N'["Urology"]', N'[]',
-      N'["2â€“3 L fluids/day unless restricted","Reduce sodium","Strain urine to collect stone for analysis"]',
+      N'["2–3 L fluids/day unless restricted","Reduce sodium","Strain urine to collect stone for analysis"]',
       N'[]', N'', N''),
 
-    (N'NP-EMR-HEADINJ-OBS', N'Head Injury Observation (Home)', N'24â€“48h close observation and rest', N'Concussion observation',
+    (N'NP-EMR-HEADINJ-OBS', N'Head Injury Observation (Home)', N'24–48h close observation and rest', N'Concussion observation',
       N'Safety', N'["Emergency","Neurology"]', N'[]',
       N'["Check every few hours the first day","Avoid risky activity/sports","Return immediately if red flags"]',
       N'[]', N'', N''),
@@ -27152,7 +30016,7 @@ BEGIN TRY
 
     (N'NP-GER-NUTRITION', N'Geriatric Nutrition', N'Small frequent meals, protein with each meal', N'Elderly diet nonpharm',
       N'Diet', N'["Geriatrics"]', N'[]',
-      N'["Protein 1â€“1.2 g/kg/day if appropriate","Small frequent meals","Texture modification if dysphagia (SLT review)"]',
+      N'["Protein 1–1.2 g/kg/day if appropriate","Small frequent meals","Texture modification if dysphagia (SLT review)"]',
       N'[]', N'', N''),
 
     (N'NP-DENT-ORALHYGIENE', N'Oral Hygiene Routine', N'Brush twice daily with fluoride; floss; tongue cleaning', N'Oral hygiene nonpharm',
@@ -27162,12 +30026,12 @@ BEGIN TRY
 
     (N'NP-REHAB-POSTURE', N'Ergonomics & Posture', N'Neutral spine, desk ergonomics, microbreaks', N'Ergonomics nonpharm',
       N'Work', N'["Rehab","Orthopedics","Occupational Health"]', N'[]',
-      N'["Chair with lumbar support","Monitor at eye level","90â€“90â€“90 hip/knee/ankle angles","Microbreaks every 30â€“45 min"]',
+      N'["Chair with lumbar support","Monitor at eye level","90–90–90 hip/knee/ankle angles","Microbreaks every 30–45 min"]',
       N'[]', N'', N''),
 
     (N'NP-REHAB-BALANCE', N'Balance & Home Exercise (Older Adults)', N'Tandem stance, single-leg stands near support', N'Balance training',
       N'Exercise', N'["Rehab","Geriatrics"]', N'[]',
-      N'["Practice near a stable surface","Tandem stance 30â€“60s, repeat","Progress to single-leg stands"]',
+      N'["Practice near a stable surface","Tandem stance 30–60s, repeat","Progress to single-leg stands"]',
       N'[]', N'', N''),
 
     (N'NP-OPH-SCREEN', N'Screen Time Breaks (20-20-20)', N'Eye strain prevention for digital users', N'Digital eye strain',
@@ -27385,11 +30249,11 @@ BEGIN TRY
   (N'PROC-BED-BLOOD-TRANS',     N'Blood transfusion',                           N'Packed cells/platelets/FFP',                            N'transfusion',                                         N'Diagnostic/Therapeutic',    N'Hematology/Medicine',       N'Ward/ICU',   N'noninvasive', 1),
   (N'PROC-BED-DRESS-COMPL',     N'Complex wound debridement',                   N'Sharp debridement and irrigation',                      N'debridement',                                         N'Diagnostic/Therapeutic',    N'General Surgery',           N'OT/OPD',     N'minor',       1),
 
-  (N'PROC-ENDO-UGIE',           N'Upper GI endoscopy (EGD)',                    N'Diagnostic Â± therapeutic UGIE',                         N'EGD',                                                 N'Endoscopic',                N'Gastroenterology',          N'Daycare/OT', N'minor',       1),
-  (N'PROC-ENDO-COLON',          N'Colonoscopy',                                 N'Diagnostic Â± therapeutic colonoscopy',                  N'lower GI endoscopy',                                  N'Endoscopic',                N'Gastroenterology',          N'Daycare/OT', N'minor',       1),
+  (N'PROC-ENDO-UGIE',           N'Upper GI endoscopy (EGD)',                    N'Diagnostic ± therapeutic UGIE',                         N'EGD',                                                 N'Endoscopic',                N'Gastroenterology',          N'Daycare/OT', N'minor',       1),
+  (N'PROC-ENDO-COLON',          N'Colonoscopy',                                 N'Diagnostic ± therapeutic colonoscopy',                  N'lower GI endoscopy',                                  N'Endoscopic',                N'Gastroenterology',          N'Daycare/OT', N'minor',       1),
   (N'PROC-ENDO-ERCP',           N'ERCP',                                        N'Endoscopic retrograde cholangiopancreatography',        N'ERCP',                                                N'Endoscopic',                N'Gastroenterology',          N'OT/Daycare', N'major',       1),
   (N'PROC-ENDO-EUS',            N'Endoscopic ultrasound (EUS)',                 N'GI wall and adjacent structures US',                    N'EUS',                                                 N'Endoscopic',                N'Gastroenterology',          N'Daycare/OT', N'minor',       1),
-  (N'PROC-ENDO-BRONCH',         N'Bronchoscopy',                                N'Airway inspection Â± biopsy',                           N'flexible bronchoscopy',                               N'Endoscopic',                N'Pulmonology',               N'Daycare/OT', N'minor',       1),
+  (N'PROC-ENDO-BRONCH',         N'Bronchoscopy',                                N'Airway inspection ± biopsy',                           N'flexible bronchoscopy',                               N'Endoscopic',                N'Pulmonology',               N'Daycare/OT', N'minor',       1),
   (N'PROC-ENDO-CYSTO',          N'Cystoscopy',                                  N'Bladder/prostate endoscopy',                            N'cystoscopy',                                          N'Endoscopic',                N'Urology',                   N'Daycare/OT', N'minor',       1),
   (N'PROC-ENDO-HYSTERO',        N'Hysteroscopy',                                N'Uterine cavity endoscopy',                              N'hysteroscopy',                                        N'Endoscopic',                N'OBG',                       N'Daycare/OT', N'minor',       1),
   (N'PROC-ENDO-LAP-DIAG',       N'Diagnostic laparoscopy',                      N'Minimally invasive abdominal inspection',               N'laparoscopy',                                         N'Endoscopic',                N'General Surgery/OBG',       N'OT',         N'minor',       1),
@@ -27427,7 +30291,7 @@ BEGIN TRY
   (N'PROC-NEURO-VP',            N'Ventriculoperitoneal shunt',                  N'CSF diversion',                                         N'VP shunt',                                            N'Surgical',                  N'Neurosurgery',              N'OT',         N'major',       1),
   (N'PROC-NEURO-SPINE-DEC',     N'Spinal decompression',                        N'Laminectomy/discectomy',                                N'laminectomy',                                         N'Surgical',                  N'Neurosurgery',              N'OT',         N'major',       1),
 
-  (N'PROC-CARD-PCI',            N'Percutaneous coronary intervention (PCI)',    N'Angioplasty Â± stent',                                   N'angioplasty',                                         N'Interventional Cardiology', N'Cardiology',                N'Cath lab',   N'major',       1),
+  (N'PROC-CARD-PCI',            N'Percutaneous coronary intervention (PCI)',    N'Angioplasty ± stent',                                   N'angioplasty',                                         N'Interventional Cardiology', N'Cardiology',                N'Cath lab',   N'major',       1),
   (N'PROC-CARD-CABG',           N'CABG',                                        N'Coronary artery bypass graft',                           N'bypass surgery',                                      N'Surgical',                  N'Cardiothoracic',            N'OT',         N'major',       1),
   (N'PROC-CARD-PACER',          N'Permanent pacemaker implantation',            N'Single/dual chamber pacer',                             N'PPM',                                                 N'Cardiology',                N'Cardiology',                N'Cath lab',   N'major',       1),
   (N'PROC-CARD-ICD',            N'ICD implantation',                            N'Implantable cardioverter defibrillator',                N'ICD',                                                 N'Cardiology',                N'Cardiology',                N'Cath lab',   N'major',       1),
@@ -27435,7 +30299,7 @@ BEGIN TRY
 
   (N'PROC-URO-TURP',            N'TURP',                                        N'Transurethral resection of prostate',                   N'prostate resection',                                  N'Endoscopic',                N'Urology',                   N'OT',         N'major',       1),
   (N'PROC-URO-PCNL',            N'PCNL',                                        N'Percutaneous nephrolithotomy',                          N'kidney stone surgery',                                N'Endoscopic',                N'Urology',                   N'OT',         N'major',       1),
-  (N'PROC-URO-URS',             N'URS',                                         N'Ureterorenoscopy Â± lithotripsy',                        N'URS lithotripsy',                                     N'Endoscopic',                N'Urology',                   N'OT',         N'minor',       1),
+  (N'PROC-URO-URS',             N'URS',                                         N'Ureterorenoscopy ± lithotripsy',                        N'URS lithotripsy',                                     N'Endoscopic',                N'Urology',                   N'OT',         N'minor',       1),
   (N'PROC-URO-TURBT',           N'TURBT',                                       N'Transurethral resection of bladder tumor',              N'bladder tumor resection',                             N'Endoscopic',                N'Urology',                   N'OT',         N'major',       1),
   (N'PROC-URO-ORCHIO',          N'Orchiopexy',                                  N'Fixation of undescended testis',                        N'orchidopexy',                                         N'Surgical',                  N'Urology/Pediatrics',        N'OT',         N'major',       1),
 
@@ -27456,7 +30320,7 @@ BEGIN TRY
   (N'PROC-OPH-CATARACT',        N'Cataract surgery (Phaco/IOL)',                N'Lens extraction with IOL',                              N'phacoemulsification',                                 N'Surgical',                  N'Ophthalmology',            N'OT',         N'major',       1),
   (N'PROC-OPH-TRAB',            N'Trabeculectomy',                              N'Glaucoma filtering surgery',                            N'trab',                                                N'Surgical',                  N'Ophthalmology',            N'OT',         N'major',       1),
   (N'PROC-OPH-VITRECT',         N'Vitrectomy',                                  N'Posterior segment surgery',                             N'PPV',                                                 N'Surgical',                  N'Ophthalmology',            N'OT',         N'major',       1),
-  (N'PROC-OPH-PTERYGIUM',       N'Pterygium excision',                          N'Conjunctival surgery Â± graft',                          N'pterygium',                                           N'Surgical',                  N'Ophthalmology',            N'OT',         N'minor',       1),
+  (N'PROC-OPH-PTERYGIUM',       N'Pterygium excision',                          N'Conjunctival surgery ± graft',                          N'pterygium',                                           N'Surgical',                  N'Ophthalmology',            N'OT',         N'minor',       1),
   (N'PROC-OPH-LASER-PRP',       N'Panretinal photocoagulation (PRP)',           N'Laser for proliferative DR',                            N'retinal laser',                                       N'Laser',                     N'Ophthalmology',            N'Daycare',    N'noninvasive', 1),
 
   (N'PROC-DERM-CRYO',           N'Cryotherapy',                                 N'Liquid nitrogen lesion ablation',                       N'cryo',                                                N'Office Dermatology',        N'Dermatology',              N'OPD',        N'minor',       1),
@@ -27551,8 +30415,8 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 /* =========================================================
-   easyHMS â€“ Medical Specialities Seed (NMC qualification ladder)
-   Idempotent DML â€“ safe to re-run.
+   easyHMS – Medical Specialities Seed (NMC qualification ladder)
+   Idempotent DML – safe to re-run.
    Source: NMC Post-Graduate Medical Education Regulations (PGMER), 2025 recognised-course
    list (neetpgexam.com / diginerve.com, Nov 2025). PG Diplomas and PDCC deliberately excluded
    (diplomas being phased out; PDCC too narrow to matter for patient-facing search).
@@ -27587,12 +30451,12 @@ WHEN MATCHED AND (t.[Name] <> s.[Name] OR t.Tier <> s.Tier OR t.IsSurgical <> s.
   UPDATE SET t.[Name] = s.[Name], t.Tier = s.Tier, t.IsSurgical = s.IsSurgical, t.TypicalDurationYears = s.TypicalDurationYears;
 
 ------------------------------------------------------------
--- 2) Specialities â€” MD (32), MS (6), DM (32), MCh (16) = 86 rows
+-- 2) Specialities — MD (32), MS (6), DM (32), MCh (16) = 86 rows
 --    Columns: QualCode, Name, PatientFacingName, PatientFacingCategory, SixYearDirect, SortOrder
 ------------------------------------------------------------
 ;WITH sp(QualCode, [Name], PatientFacingName, PatientFacingCategory, SixYearDirect, SortOrder) AS (
   SELECT * FROM (VALUES
-    -- â”€â”€ MD (32) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    -- ── MD (32) ──────────────────────────────────────────────────────────
     (N'MD', N'Aerospace Medicine',                          N'Aviation/Aerospace Medicine Specialist',     NULL,                                    0, 1),
     (N'MD', N'Anatomy',                                     NULL,                                          NULL,                                    0, 2),
     (N'MD', N'Anaesthesiology',                             N'Anaesthetist',                                N'Anaesthesiologist',                    0, 3),
@@ -27626,7 +30490,7 @@ WHEN MATCHED AND (t.[Name] <> s.[Name] OR t.Tier <> s.Tier OR t.IsSurgical <> s.
     (N'MD', N'Sports Medicine',                               N'Sports Medicine Specialist',                  N'Sports Medicine Specialist',           0, 31),
     (N'MD', N'Tropical Medicine',                             N'Tropical Medicine Specialist',                NULL,                                    0, 32),
 
-    -- â”€â”€ MS (6) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    -- ── MS (6) ───────────────────────────────────────────────────────────
     (N'MS', N'General Surgery',                              N'General Surgeon',                             N'General Surgeon',                      0, 1),
     (N'MS', N'Obstetrics and Gynecology',                     N'Gynaecologist / Obstetrician',                N'Gynaecologist',                        0, 2),
     (N'MS', N'Ophthalmology',                                 N'Eye Specialist / Ophthalmologist',            N'Ophthalmologist (Eye)',                0, 3),
@@ -27634,7 +30498,7 @@ WHEN MATCHED AND (t.[Name] <> s.[Name] OR t.Tier <> s.Tier OR t.IsSurgical <> s.
     (N'MS', N'Otorhinolaryngology (ENT)',                     N'ENT Specialist',                              N'ENT Specialist',                       0, 5),
     (N'MS', N'Traumatology and Surgery',                      N'Trauma Surgeon',                              NULL,                                    0, 6),
 
-    -- â”€â”€ DM (32) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    -- ── DM (32) ──────────────────────────────────────────────────────────
     (N'DM', N'Cardiac Anaesthesia',                                        N'Cardiac Anaesthetist',                         NULL,                             0, 1),
     (N'DM', N'Cardiology',                                                 N'Cardiologist / Heart Specialist',              N'Cardiologist (Heart)',          0, 2),
     (N'DM', N'Child and Adolescent Psychiatry',                            N'Child Psychiatrist',                           NULL,                             0, 3),
@@ -27668,7 +30532,7 @@ WHEN MATCHED AND (t.[Name] <> s.[Name] OR t.Tier <> s.Tier OR t.IsSurgical <> s.
     (N'DM', N'Pulmonary Medicine',                                        N'Pulmonologist',                                N'Pulmonologist (Chest/Lungs)',   0, 31),
     (N'DM', N'Virology',                                                  N'Virologist',                                   NULL,                             0, 32),
 
-    -- â”€â”€ MCh (16) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    -- ── MCh (16) ─────────────────────────────────────────────────────────
     (N'MCh', N'Endocrine Surgery',                            N'Endocrine Surgeon',                                     NULL,                             0, 1),
     (N'MCh', N'Gynecological Oncology',                       N'Gynaecologic Oncologist',                               NULL,                             0, 2),
     (N'MCh', N'Hand Surgery',                                 N'Hand Surgeon',                                          N'Orthopaedic Surgeon (Bone)',    0, 3),
@@ -27708,7 +30572,7 @@ WHEN MATCHED AND (
 
 ------------------------------------------------------------
 -- 3) Feeder relationships (DM/MCh -> valid MD/MS entry route), many-to-many.
---    Medical Genetics (DM) intentionally has no rows here â€” NMC allows "any MD/MS/DNB"
+--    Medical Genetics (DM) intentionally has no rows here — NMC allows "any MD/MS/DNB"
 --    as its feeder, i.e. unconstrained, so no specific link is asserted.
 ------------------------------------------------------------
 ;WITH f(SuperQual, SuperName, FeederQual, FeederName) AS (
@@ -27812,7 +30676,7 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 /* =========================================================
-   easyHMS â€“ Seed: Default Pathology Tests with Parameter Schemas
+   easyHMS – Seed: Default Pathology Tests with Parameter Schemas
 
    Runs automatically for every active hospital on every deploy (idempotent -- only inserts a
    TestCode that hospital doesn't already have, never updates or removes existing rows). No manual
@@ -27866,14 +30730,14 @@ BEGIN TRY
   (N'HEM-CBC', N'Complete Blood Count (CBC)', N'HEMATOLOGY', N'Whole Blood', N'EDTA',
    N'{"params":[
      {"name":"Hemoglobin (Hb)","unit":"g/dL","defaultValue":"14.5","maleMin":13.5,"maleMax":17.5,"femaleMin":12.0,"femaleMax":15.5,"childMin":11.0,"childMax":14.5,"criticalLow":6.0,"criticalHigh":20.0,"sortOrder":1},
-     {"name":"Total WBC Count (TLC)","unit":"/ÂµL","defaultValue":"7200","maleMin":4000,"maleMax":11000,"femaleMin":4000,"femaleMax":11000,"childMin":5000,"childMax":15500,"criticalLow":2000,"criticalHigh":35000,"sortOrder":2},
+     {"name":"Total WBC Count (TLC)","unit":"/µL","defaultValue":"7200","maleMin":4000,"maleMax":11000,"femaleMin":4000,"femaleMax":11000,"childMin":5000,"childMax":15500,"criticalLow":2000,"criticalHigh":35000,"sortOrder":2},
      {"name":"Neutrophils","unit":"%","defaultValue":"60","maleMin":40,"maleMax":75,"femaleMin":40,"femaleMax":75,"childMin":30,"childMax":60,"criticalLow":15,"criticalHigh":90,"sortOrder":3},
      {"name":"Lymphocytes","unit":"%","defaultValue":"30","maleMin":20,"maleMax":45,"femaleMin":20,"femaleMax":45,"childMin":40,"childMax":70,"criticalLow":10,"criticalHigh":75,"sortOrder":4},
      {"name":"Monocytes","unit":"%","defaultValue":"5","maleMin":2,"maleMax":10,"femaleMin":2,"femaleMax":10,"childMin":2,"childMax":10,"criticalHigh":18,"sortOrder":5},
      {"name":"Eosinophils","unit":"%","defaultValue":"4","maleMin":1,"maleMax":6,"femaleMin":1,"femaleMax":6,"childMin":1,"childMax":6,"criticalHigh":20,"sortOrder":6},
      {"name":"Basophils","unit":"%","defaultValue":"1","maleMin":0,"maleMax":1,"femaleMin":0,"femaleMax":1,"childMin":0,"childMax":1,"criticalHigh":3,"sortOrder":7},
-     {"name":"Platelet Count","unit":"/ÂµL","defaultValue":"250000","maleMin":150000,"maleMax":450000,"femaleMin":150000,"femaleMax":450000,"childMin":150000,"childMax":450000,"criticalLow":25000,"criticalHigh":1000000,"sortOrder":8},
-     {"name":"Total RBC Count","unit":"Mil/ÂµL","defaultValue":"4.80","maleMin":4.50,"maleMax":5.90,"femaleMin":4.00,"femaleMax":5.20,"childMin":3.80,"childMax":5.50,"criticalLow":2.00,"criticalHigh":7.00,"sortOrder":9},
+     {"name":"Platelet Count","unit":"/µL","defaultValue":"250000","maleMin":150000,"maleMax":450000,"femaleMin":150000,"femaleMax":450000,"childMin":150000,"childMax":450000,"criticalLow":25000,"criticalHigh":1000000,"sortOrder":8},
+     {"name":"Total RBC Count","unit":"Mil/µL","defaultValue":"4.80","maleMin":4.50,"maleMax":5.90,"femaleMin":4.00,"femaleMax":5.20,"childMin":3.80,"childMax":5.50,"criticalLow":2.00,"criticalHigh":7.00,"sortOrder":9},
      {"name":"PCV / Hematocrit","unit":"%","defaultValue":"42.0","maleMin":40.0,"maleMax":50.0,"femaleMin":36.0,"femaleMax":46.0,"childMin":32.0,"childMax":44.0,"criticalLow":20.0,"criticalHigh":60.0,"sortOrder":10},
      {"name":"MCV","unit":"fL","defaultValue":"88.0","maleMin":80.0,"maleMax":100.0,"femaleMin":80.0,"femaleMax":100.0,"childMin":75.0,"childMax":95.0,"criticalLow":60.0,"criticalHigh":120.0,"sortOrder":11},
      {"name":"MCH","unit":"pg","defaultValue":"29.5","maleMin":27.0,"maleMax":32.0,"femaleMin":27.0,"femaleMax":32.0,"childMin":24.0,"childMax":30.0,"sortOrder":12},
@@ -27997,7 +30861,7 @@ BEGIN TRY
    N'{"params":[{"name":"Color","unit":""},{"name":"Consistency","unit":""},{"name":"Occult Blood","unit":""},{"name":"Ova","unit":""},{"name":"Cysts","unit":""},{"name":"RBCs","unit":""},{"name":"WBCs","unit":""},{"name":"Mucus","unit":""}]}', 210),
 
   (N'CP-UPT', N'Urine Pregnancy Test', N'CLINICAL_PATHOLOGY', N'Urine', N'Container',
-   N'{"params":[{"name":"Î²-hCG (Qualitative)","unit":""}]}', 220);
+   N'{"params":[{"name":"β-hCG (Qualitative)","unit":""}]}', 220);
 
   /* ===== SEROLOGY / IMMUNOLOGY (unchanged this phase) ===== */
   INSERT INTO @Tests VALUES
@@ -28025,7 +30889,7 @@ BEGIN TRY
   /* ===== ENDOCRINOLOGY (unchanged this phase) ===== */
   INSERT INTO @Tests VALUES
   (N'ENDO-THYROID', N'Thyroid Profile (T3, T4, TSH)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"T3","unit":"ng/dL","maleMin":80,"maleMax":200,"femaleMin":80,"femaleMax":200},{"name":"T4","unit":"Âµg/dL","maleMin":5.1,"maleMax":14.1,"femaleMin":5.1,"femaleMax":14.1},{"name":"TSH","unit":"ÂµIU/mL","maleMin":0.27,"maleMax":4.20,"femaleMin":0.27,"femaleMax":4.20}]}', 400),
+   N'{"params":[{"name":"T3","unit":"ng/dL","maleMin":80,"maleMax":200,"femaleMin":80,"femaleMax":200},{"name":"T4","unit":"µg/dL","maleMin":5.1,"maleMax":14.1,"femaleMin":5.1,"femaleMax":14.1},{"name":"TSH","unit":"µIU/mL","maleMin":0.27,"maleMax":4.20,"femaleMin":0.27,"femaleMax":4.20}]}', 400),
 
   -- Female range is a real physiological split (non-pregnant female prolactin legitimately runs
   -- higher than male), not just a mechanical copy -- see the catalog audit.
@@ -28033,7 +30897,7 @@ BEGIN TRY
    N'{"params":[{"name":"Prolactin","unit":"ng/mL","maleMin":2,"maleMax":18,"femaleMin":2,"femaleMax":29}]}', 410),
 
   (N'ENDO-CORTISOL', N'Serum Cortisol (Morning)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
-   N'{"params":[{"name":"Cortisol (AM)","unit":"Âµg/dL","maleMin":6.2,"maleMax":19.4,"femaleMin":6.2,"femaleMax":19.4}]}', 420),
+   N'{"params":[{"name":"Cortisol (AM)","unit":"µg/dL","maleMin":6.2,"maleMax":19.4,"femaleMin":6.2,"femaleMax":19.4}]}', 420),
 
   (N'ENDO-VITD', N'Vitamin D (25-OH)', N'ENDOCRINOLOGY', N'Serum', N'Plain',
    N'{"params":[{"name":"25-OH Vitamin D","unit":"ng/mL","maleMin":30,"maleMax":100,"femaleMin":30,"femaleMax":100}]}', 430),
@@ -28075,8 +30939,8 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 /* =========================================================
-   easyHMS â€“ Seed: Pathology Lab Test Categories + Sample Types + Default Report Templates
-   Idempotent DML â€“ safe to re-run.
+   easyHMS – Seed: Pathology Lab Test Categories + Sample Types + Default Report Templates
+   Idempotent DML – safe to re-run.
 
    This script seeds:
    1. LookupType: LAB_TEST_CATEGORY, LAB_SAMPLE_TYPE
@@ -28114,16 +30978,16 @@ DECLARE @catTypeId INT = (SELECT LookupTypeId FROM dbo.LookupTypes WHERE LookupT
 
 ;WITH cats(Code, Name, ShortDesc) AS (
   SELECT * FROM (VALUES
-    (N'BIOCHEMISTRY',       N'Biochemistry',                N'Blood chemistry â€” glucose, lipids, enzymes, electrolytes, renal & liver function'),
-    (N'HEMATOLOGY',         N'Hematology',                  N'Blood cell analysis â€” CBC, ESR, blood film, reticulocyte count'),
-    (N'COAGULATION',        N'Coagulation',                 N'Clotting studies â€” PT/INR, APTT, fibrinogen, D-dimer'),
+    (N'BIOCHEMISTRY',       N'Biochemistry',                N'Blood chemistry — glucose, lipids, enzymes, electrolytes, renal & liver function'),
+    (N'HEMATOLOGY',         N'Hematology',                  N'Blood cell analysis — CBC, ESR, blood film, reticulocyte count'),
+    (N'COAGULATION',        N'Coagulation',                 N'Clotting studies — PT/INR, APTT, fibrinogen, D-dimer'),
     (N'CLINICAL_PATHOLOGY', N'Clinical Pathology',          N'Routine urine, stool, and body fluid analysis'),
     (N'MICROBIOLOGY',       N'Microbiology',                N'Culture & sensitivity, Gram stain, AFB, fungal culture'),
-    (N'SEROLOGY',           N'Serology / Immunology',       N'Antibody/antigen testing â€” HIV, HBsAg, HCV, Widal, Dengue, RA factor, CRP'),
-    (N'HISTOPATHOLOGY',     N'Histopathology',              N'Microscopic tissue examination â€” biopsy, IHC, frozen section'),
-    (N'CYTOPATHOLOGY',      N'Cytopathology',               N'Cell-level analysis â€” PAP smear, FNAC, body fluid cytology'),
-    (N'ENDOCRINOLOGY',      N'Endocrinology / Hormones',    N'Hormone assays â€” thyroid (T3/T4/TSH), fertility, cortisol, insulin'),
-    (N'MOLECULAR',          N'Molecular Diagnostics',       N'DNA/RNA analysis â€” PCR, NGS, gene panels, viral loads'),
+    (N'SEROLOGY',           N'Serology / Immunology',       N'Antibody/antigen testing — HIV, HBsAg, HCV, Widal, Dengue, RA factor, CRP'),
+    (N'HISTOPATHOLOGY',     N'Histopathology',              N'Microscopic tissue examination — biopsy, IHC, frozen section'),
+    (N'CYTOPATHOLOGY',      N'Cytopathology',               N'Cell-level analysis — PAP smear, FNAC, body fluid cytology'),
+    (N'ENDOCRINOLOGY',      N'Endocrinology / Hormones',    N'Hormone assays — thyroid (T3/T4/TSH), fertility, cortisol, insulin'),
+    (N'MOLECULAR',          N'Molecular Diagnostics',       N'DNA/RNA analysis — PCR, NGS, gene panels, viral loads'),
     (N'TOXICOLOGY',         N'Toxicology',                  N'Drug levels, substance screening, therapeutic drug monitoring')
   ) v(Code, Name, ShortDesc)
 )
@@ -28142,17 +31006,17 @@ DECLARE @sampleTypeId INT = (SELECT LookupTypeId FROM dbo.LookupTypes WHERE Look
 
 ;WITH samples(Code, Name, ShortDesc) AS (
   SELECT * FROM (VALUES
-    (N'WHOLE_BLOOD',  N'Whole Blood',           N'EDTA/Heparin tube â€” hematology, CBC'),
-    (N'SERUM',        N'Serum',                 N'Plain/SST tube, clotted â†’ centrifuge â€” biochemistry, serology'),
-    (N'PLASMA',       N'Plasma',                N'Anticoagulant tube â†’ centrifuge â€” coagulation, some chemistry'),
-    (N'URINE',        N'Urine',                 N'Random / mid-stream / 24-hour â€” routine, culture, biochemistry'),
-    (N'STOOL',        N'Stool',                 N'Container â€” routine, occult blood, ova & cysts'),
-    (N'CSF',          N'Cerebrospinal Fluid',   N'Lumbar puncture â€” microbiology, biochemistry, cytology'),
-    (N'TISSUE',       N'Tissue / Biopsy',       N'Formalin-fixed â€” histopathology, IHC'),
-    (N'SWAB',         N'Swab',                  N'Throat, nasal, wound, vaginal â€” microbiology culture'),
-    (N'SPUTUM',       N'Sputum',                N'Expectoration â€” AFB, culture, Gram stain'),
-    (N'BODY_FLUID',   N'Body Fluid',            N'Pleural, peritoneal, synovial â€” cytology, biochemistry'),
-    (N'BONE_MARROW',  N'Bone Marrow',           N'Aspiration / biopsy â€” hematology, special stains')
+    (N'WHOLE_BLOOD',  N'Whole Blood',           N'EDTA/Heparin tube — hematology, CBC'),
+    (N'SERUM',        N'Serum',                 N'Plain/SST tube, clotted → centrifuge — biochemistry, serology'),
+    (N'PLASMA',       N'Plasma',                N'Anticoagulant tube → centrifuge — coagulation, some chemistry'),
+    (N'URINE',        N'Urine',                 N'Random / mid-stream / 24-hour — routine, culture, biochemistry'),
+    (N'STOOL',        N'Stool',                 N'Container — routine, occult blood, ova & cysts'),
+    (N'CSF',          N'Cerebrospinal Fluid',   N'Lumbar puncture — microbiology, biochemistry, cytology'),
+    (N'TISSUE',       N'Tissue / Biopsy',       N'Formalin-fixed — histopathology, IHC'),
+    (N'SWAB',         N'Swab',                  N'Throat, nasal, wound, vaginal — microbiology culture'),
+    (N'SPUTUM',       N'Sputum',                N'Expectoration — AFB, culture, Gram stain'),
+    (N'BODY_FLUID',   N'Body Fluid',            N'Pleural, peritoneal, synovial — cytology, biochemistry'),
+    (N'BONE_MARROW',  N'Bone Marrow',           N'Aspiration / biopsy — hematology, special stains')
   ) v(Code, Name, ShortDesc)
 )
 INSERT INTO dbo.LookupMaster (LookupId, LookupTypeId, Code, [Name], ShortDesc, IsActive, IsPinned, UsageCount, CreatedAt)
@@ -28180,8 +31044,8 @@ GO
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 GO
 /* =========================================================
-   easyHMS â€“ Seed: Default Pathology Report Templates
-   Hospital-scoped â€” run ONCE per new hospital during onboarding.
+   easyHMS – Seed: Default Pathology Report Templates
+   Hospital-scoped — run ONCE per new hospital during onboarding.
    Replace @HospitalId with the target hospital GUID.
 
    Creates one report template per lab department/category.

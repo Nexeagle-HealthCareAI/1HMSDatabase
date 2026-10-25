@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-10-24 20:35  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-10-25 07:07  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -3941,6 +3941,38 @@ BEGIN
   CREATE INDEX IX_HospitalLeads_HospitalId_OccurredAt ON dbo.HospitalLeads (HospitalId, OccurredAt);
   CREATE INDEX IX_HospitalLeads_SessionId ON dbo.HospitalLeads (SessionId);
   CREATE INDEX IX_HospitalLeads_OccurredAt ON dbo.HospitalLeads (OccurredAt);
+END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_hospital_visit_guide.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Patient visit guide (Vita, vision Phase 4 "After booking"): what a hospital tells a Doctor Dekho patient on the day of the visit -
+-- how to find the OPD, where to register and check in, where to park. Shown in the reminder, on the visit page and when the patient
+-- tells Vita "I've reached". Edited by the hospital in 1HMS portal -> Settings -> Hospital Info -> Patient visit guide. One row per
+-- hospital; every field optional (the patient then gets the general steps). Idempotent.
+IF OBJECT_ID('dbo.HospitalVisitGuides','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.HospitalVisitGuides
+  (
+    HospitalId         UNIQUEIDENTIFIER NOT NULL,
+    Landmark           NVARCHAR(200)    NULL,   -- "Opposite City Centre, Salt Lake Sector 1"
+    EntranceNote       NVARCHAR(300)    NULL,   -- "Use Gate 2 on the main road"
+    OpdLocation        NVARCHAR(300)    NULL,   -- "OPD is on the 1st floor, left of the lift"
+    RegistrationDesk   NVARCHAR(300)    NULL,   -- "Registration counter 3, ground floor"
+    ParkingNote        NVARCHAR(300)    NULL,
+    PaymentNote        NVARCHAR(300)    NULL,   -- "Cash, UPI and cards at the billing counter"
+    ExtraNote          NVARCHAR(500)    NULL,
+    UpdatedAt          DATETIME2(3)     NOT NULL CONSTRAINT DF_HVG_UpdatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedByUserId    UNIQUEIDENTIFIER NULL,
+
+    CONSTRAINT PK_HospitalVisitGuides PRIMARY KEY CLUSTERED (HospitalId),
+    CONSTRAINT FK_HVG_Hospital FOREIGN KEY (HospitalId) REFERENCES dbo.Hospitals(HospitalID)
+  );
 END
 GO
 
@@ -9630,6 +9662,44 @@ BEGIN
     IF COL_LENGTH('dbo.Appointments', 'HospitalSeenByUserId') IS NULL
         ALTER TABLE dbo.Appointments ADD HospitalSeenByUserId UNIQUEIDENTIFIER NULL;
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/alter_appointments_visit_messages.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Appointments - the patient's language and the after-booking messages (Vita, vision Phase 4).
+-- Description: PatientLanguage: the language the patient booked in (en / hi / hinglish), so the WhatsApp confirmation, reminders and the
+--              after-visit message read like the conversation did. NULL = English.
+--              ConfirmationSentAt, MorningReminderSentAt, BeforeVisitReminderSentAt, AfterVisitSentAt: when each message went out, so
+--              the reminder job sends each one once (also when it restarts) and the hospital can see what the patient was told.
+--              Guarded and idempotent.
+-- =============================================================================
+IF COL_LENGTH('dbo.Appointments', 'PatientLanguage') IS NULL
+    ALTER TABLE dbo.Appointments ADD PatientLanguage NVARCHAR(10) NULL,
+                                     ConfirmationSentAt DATETIME2(3) NULL,
+                                     MorningReminderSentAt DATETIME2(3) NULL,
+                                     BeforeVisitReminderSentAt DATETIME2(3) NULL,
+                                     AfterVisitSentAt DATETIME2(3) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_Appointments_PatientLanguage')
+    ALTER TABLE dbo.Appointments ADD CONSTRAINT CK_Appointments_PatientLanguage CHECK (PatientLanguage IS NULL OR PatientLanguage IN ('en','hi','hinglish'));
+GO
+
+-- The reminder job reads public bookings by date; this keeps that read small.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Appointments_PublicByDate' AND object_id = OBJECT_ID('dbo.Appointments'))
+    CREATE INDEX IX_Appointments_PublicByDate ON dbo.Appointments (ApptDate, BookingSource) INCLUDE (StartAt, CurrentStatusCode, PatientId);
+GO
+
+-- CMS Night Jobs panel toggle for the visit messages job (1HMSAPI VisitMessagesBackgroundService). Starts OFF: switch it on once the
+-- WhatsApp templates (visit_confirmation_*, visit_reminder_*, visit_after_*) are approved in Meta.
+IF OBJECT_ID('dbo.JobSettings','U') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM dbo.JobSettings WHERE JobName = N'VisitMessages')
+    INSERT INTO dbo.JobSettings (JobName, LastExecutionDateUTC, IsActive) VALUES (N'VisitMessages', NULL, 0);
 GO
 
 GO

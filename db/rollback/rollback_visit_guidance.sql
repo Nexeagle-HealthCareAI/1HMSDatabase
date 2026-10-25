@@ -9,3 +9,5 @@ IF COL_LENGTH('dbo.Appointments', 'PatientLanguage') IS NOT NULL
 GO
 DROP TABLE IF EXISTS dbo.HospitalVisitGuides;
 GO
+IF OBJECT_ID('dbo.JobSettings','U') IS NOT NULL DELETE FROM dbo.JobSettings WHERE JobName = N'VisitMessages';
+GO

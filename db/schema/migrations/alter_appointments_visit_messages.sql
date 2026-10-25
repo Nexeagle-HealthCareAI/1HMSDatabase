@@ -22,3 +22,9 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Appointments_PublicByDate' AND object_id = OBJECT_ID('dbo.Appointments'))
     CREATE INDEX IX_Appointments_PublicByDate ON dbo.Appointments (ApptDate, BookingSource) INCLUDE (StartAt, CurrentStatusCode, PatientId);
 GO
+
+-- CMS Night Jobs panel toggle for the visit messages job (1HMSAPI VisitMessagesBackgroundService). Starts OFF: switch it on once the
+-- WhatsApp templates (visit_confirmation_*, visit_reminder_*, visit_after_*) are approved in Meta.
+IF OBJECT_ID('dbo.JobSettings','U') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM dbo.JobSettings WHERE JobName = N'VisitMessages')
+    INSERT INTO dbo.JobSettings (JobName, LastExecutionDateUTC, IsActive) VALUES (N'VisitMessages', NULL, 0);
+GO

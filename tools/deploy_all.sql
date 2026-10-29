@@ -1,6 +1,6 @@
 -- =====================================================================
 -- easyHMS - consolidated database deploy script
--- Generated: 2026-10-25 07:07  (via tools/build_deploy_all.ps1)
+-- Generated: 2026-10-29 10:45  (via tools/build_deploy_all.ps1)
 -- Run against the easyHMS database (connect to it first; the script
 -- targets your CURRENT database). All statements are idempotent and
 -- safe to re-run. Order: tables -> migrations -> indexes -> seed.
@@ -1803,6 +1803,50 @@ BEGIN
   -- index on that column fails with Msg 207 even inside this skipped IF.
   CREATE INDEX IX_AnalyticsEvents_OccurredAt ON dbo.AnalyticsEvents (OccurredAt);
 END
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/tables/create_tables_appointment_journey.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- Patient journey to the clinic (Vita, "takes you there"): how the Doctor Dekho patient is coming, when they plan to leave, and - only
+-- if they agree - whether they are on the way and when they will arrive, so reception can see "On the way, ~12 min" or "Running late".
+-- One row per appointment. No live location is kept: only the estimated arrival time and the distance left. Times: PlannedLeaveAt is
+-- the hospital's wall-clock (India) time like Appointments.StartAt; the others are UTC. Idempotent.
+IF OBJECT_ID('dbo.AppointmentJourneys','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.AppointmentJourneys
+  (
+    ApptId              UNIQUEIDENTIFIER NOT NULL,
+    TravelMode          NVARCHAR(20)     NULL,   -- drive | auto_cab | transit | walk
+    PlannedLeaveAt      DATETIME2(3)     NULL,   -- when the patient said they will leave (IST wall-clock)
+    ShareWithHospital   BIT              NOT NULL CONSTRAINT DF_AJ_Share DEFAULT 0,   -- the patient's OK to show ETA to reception
+    Status              NVARCHAR(20)     NOT NULL CONSTRAINT DF_AJ_Status DEFAULT N'planned',
+    StartedAt           DATETIME2(3)     NULL,   -- left home (UTC)
+    EtaAt               DATETIME2(3)     NULL,   -- expected arrival (UTC), from the navigation or the patient
+    DistanceKm          DECIMAL(6,1)     NULL,   -- distance left at the last update
+    LateByMinutes       INT              NULL,   -- how late the patient expects to be, when they said so
+    ArrivedAt           DATETIME2(3)     NULL,
+    LeaveReminderSentAt DATETIME2(3)     NULL,   -- the "time to leave" WhatsApp went out (once)
+    CreatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_AJ_CreatedAt DEFAULT SYSUTCDATETIME(),
+    UpdatedAt           DATETIME2(3)     NOT NULL CONSTRAINT DF_AJ_UpdatedAt DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_AppointmentJourneys PRIMARY KEY CLUSTERED (ApptId),
+    CONSTRAINT FK_AJ_Appointment FOREIGN KEY (ApptId) REFERENCES dbo.Appointments(ApptId) ON DELETE CASCADE,
+    CONSTRAINT CK_AJ_TravelMode CHECK (TravelMode IS NULL OR TravelMode IN (N'drive', N'auto_cab', N'transit', N'walk')),
+    CONSTRAINT CK_AJ_Status CHECK (Status IN (N'planned', N'on_the_way', N'late', N'arrived', N'cancelled')),
+    CONSTRAINT CK_AJ_Late CHECK (LateByMinutes IS NULL OR LateByMinutes BETWEEN 0 AND 600)
+  );
+END
+GO
+
+-- The reminder job looks for planned journeys whose leave time has come.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_AJ_LeaveReminder' AND object_id = OBJECT_ID('dbo.AppointmentJourneys'))
+    CREATE INDEX IX_AJ_LeaveReminder ON dbo.AppointmentJourneys (PlannedLeaveAt) INCLUDE (Status, LeaveReminderSentAt)
+        WHERE LeaveReminderSentAt IS NULL;
 GO
 
 GO
@@ -15562,6 +15606,91 @@ GO
 -- The contributor's foreign key column, so removing a contributor does not scan the table; also serves the daily cleanup by date.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWHandoff_Contributor' AND object_id = OBJECT_ID('dbo.ContributorHandoff'))
     CREATE INDEX IX_HWHandoff_Contributor ON dbo.ContributorHandoff (ContributorId, CreatedAt DESC);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/health_wiki_09_hold_for_review.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Health Wiki, part 9 - a verified doctor publishes their own articles; the team can pull one back to review.
+-- Description: 1. HealthArticle.HoldForReview: set when a CMS editor pulls a live article back to review. While it is set, the author cannot
+--              publish the article on their own again; it goes live only after a reviewer (MEDICAL) or a CMS editor (SECTOR_UPDATE)
+--              approves it, which clears the flag. Existing articles start at 0, so nothing changes for them.
+--              Requires part 1. Guarded and idempotent.
+-- =============================================================================
+IF OBJECT_ID('dbo.HealthArticle', 'U') IS NULL
+    THROW 51000, 'health_wiki_01 must run before health_wiki_09_hold_for_review.sql', 1;
+GO
+
+IF COL_LENGTH('dbo.HealthArticle', 'HoldForReview') IS NULL
+    ALTER TABLE dbo.HealthArticle ADD HoldForReview BIT NOT NULL CONSTRAINT DF_HealthArticle_HoldForReview DEFAULT (0);
+GO
+
+-- A doctor's topic is written by the NexEagle team (or a writer the team chooses) and reviewed by that doctor. Topics a doctor sent earlier
+-- that are still waiting for a decision follow the same rule.
+IF OBJECT_ID('dbo.HealthWikiTopicRequest', 'U') IS NOT NULL AND COL_LENGTH('dbo.HealthWikiTopicRequest', 'RequestWriter') IS NOT NULL
+    UPDATE t SET RequestWriter = 1
+    FROM dbo.HealthWikiTopicRequest t
+    JOIN dbo.HealthWikiContributor c ON c.ContributorId = t.ContributorId
+    WHERE t.RequestWriter = 0 AND t.Status IN ('SUBMITTED', 'NEEDS_DETAIL') AND c.Type IN ('HOSPITAL_DOCTOR', 'INDEPENDENT_DOCTOR');
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/health_wiki_10_self_published_medical.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Health Wiki, part 10 - a verified doctor can publish their own medical article without a reviewer.
+-- Description: CK_HealthArticle_MedicalPublishedNeedsReviewer said a live MEDICAL article must name a reviewer. A medical article that a
+--              verified doctor wrote and published themselves has no reviewer (nobody else reviewed it, so no "Medically reviewed by"
+--              badge), but it always has its author. The rule now reads: a live MEDICAL article has a reviewer or an author. Whether that
+--              author is a verified doctor is checked by the API, which a CHECK constraint cannot look up.
+--              Requires part 2. Guarded and idempotent.
+-- =============================================================================
+IF OBJECT_ID('dbo.HealthArticle', 'U') IS NULL
+    THROW 51000, 'health_wiki_02 must run before health_wiki_10_self_published_medical.sql', 1;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HealthArticle_MedicalPublishedNeedsReviewer')
+    ALTER TABLE dbo.HealthArticle DROP CONSTRAINT CK_HealthArticle_MedicalPublishedNeedsReviewer;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HealthArticle_MedicalPublishedNeedsPerson')
+    ALTER TABLE dbo.HealthArticle ADD CONSTRAINT CK_HealthArticle_MedicalPublishedNeedsPerson
+        CHECK ([Status] <> 'PUBLISHED' OR [Type] <> 'MEDICAL' OR ReviewerContributorId IS NOT NULL OR AuthorContributorId IS NOT NULL);
+GO
+
+GO
+
+-- ---------------------------------------------------------------------
+-- FILE: db/schema/migrations/health_wiki_11_cover_alt_optional.sql
+-- ---------------------------------------------------------------------
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+GO
+-- =============================================================================
+-- Migration: Health Wiki, part 11 - the alt text of a cover image is optional.
+-- Description: Parts 2 and 4 made the database refuse a cover image without alt text (CK_HealthArticle_CoverAlt on the article and
+--              CK_HWRevision_CoverAlt on an edit of a live article). Writers can now add a cover image without it; the page then uses the
+--              article title as the image description. The forms still ask for alt text and say why it helps. Nothing else changes: the
+--              cover address must still be https (the API checks that).
+--              Requires parts 2 and 4. Guarded and idempotent. Run this before the API and the web apps that stop asking for alt text.
+-- =============================================================================
+IF OBJECT_ID('dbo.HealthArticle', 'U') IS NULL
+    THROW 51000, 'health_wiki_02 must run before health_wiki_11_cover_alt_optional.sql', 1;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HealthArticle_CoverAlt' AND parent_object_id = OBJECT_ID('dbo.HealthArticle'))
+    ALTER TABLE dbo.HealthArticle DROP CONSTRAINT CK_HealthArticle_CoverAlt;
+GO
+IF OBJECT_ID('dbo.HealthArticleRevision', 'U') IS NOT NULL
+   AND EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HWRevision_CoverAlt' AND parent_object_id = OBJECT_ID('dbo.HealthArticleRevision'))
+    ALTER TABLE dbo.HealthArticleRevision DROP CONSTRAINT CK_HWRevision_CoverAlt;
 GO
 
 GO

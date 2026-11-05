@@ -16,7 +16,9 @@ BEGIN
     OccurredAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_AE_OccurredAt DEFAULT SYSUTCDATETIME(),
 
     SessionId     NVARCHAR(64)     NULL,
+    -- Masked copy only (98XXXXXX10) since 2026-10; MobileHash is the keyed hash used to group/search.
     Mobile        NVARCHAR(20)     NULL,
+    MobileHash    NVARCHAR(64)     NULL,
     DoctorId      UNIQUEIDENTIFIER NULL,
     -- Frontend-only category slug (e.g. "cardiology") from NexEagleWebsite's static specialty
     -- catalog — NOT MedicalSpecialities.SpecialityId (a different, DB-side GUID concept).
@@ -31,11 +33,18 @@ BEGIN
     -- count, AI-fallback flag).
     MetadataJson  NVARCHAR(MAX)    NULL,
 
+    -- Bot / data-centre traffic (tracking_traffic_quality_2026_10.sql); excluded from reports.
+    IsAutomated   BIT              NOT NULL CONSTRAINT DF_AE_IsAutomated DEFAULT 0,
+
     CONSTRAINT PK_AnalyticsEvents PRIMARY KEY CLUSTERED (EventId)
   );
 
   CREATE INDEX IX_AnalyticsEvents_EventType_OccurredAt ON dbo.AnalyticsEvents (EventType, OccurredAt);
   CREATE INDEX IX_AnalyticsEvents_SessionId ON dbo.AnalyticsEvents (SessionId);
   CREATE INDEX IX_AnalyticsEvents_Mobile ON dbo.AnalyticsEvents (Mobile);
+  -- IX_AnalyticsEvents_MobileHash is created by migrations/tracking_privacy_2026_10.sql, not here: this batch
+  -- re-runs every deploy and SQL Server compiles it whole, so on a pre-2026-10 table (no MobileHash yet) an
+  -- index on that column fails with Msg 207 even inside this skipped IF.
+  CREATE INDEX IX_AnalyticsEvents_OccurredAt ON dbo.AnalyticsEvents (OccurredAt);
 END
 GO

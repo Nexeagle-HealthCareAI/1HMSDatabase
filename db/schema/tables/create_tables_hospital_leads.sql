@@ -33,11 +33,14 @@ BEGIN
     City          NVARCHAR(100)    NULL,
 
     OccurredAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_HL_OccurredAt DEFAULT SYSUTCDATETIME(),
+    -- Bot / data-centre traffic (tracking_traffic_quality_2026_10.sql); hidden from hospitals' lead lists.
+    IsAutomated   BIT              NOT NULL CONSTRAINT DF_HL_IsAutomated DEFAULT 0,
 
     CONSTRAINT PK_HospitalLeads PRIMARY KEY CLUSTERED (LeadId)
   );
 
   CREATE INDEX IX_HospitalLeads_HospitalId_OccurredAt ON dbo.HospitalLeads (HospitalId, OccurredAt);
   CREATE INDEX IX_HospitalLeads_SessionId ON dbo.HospitalLeads (SessionId);
+  CREATE INDEX IX_HospitalLeads_OccurredAt ON dbo.HospitalLeads (OccurredAt);
 END
 GO

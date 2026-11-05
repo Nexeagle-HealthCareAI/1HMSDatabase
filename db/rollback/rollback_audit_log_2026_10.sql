@@ -1,0 +1,4 @@
+-- Rollback for db/schema/migrations/audit_log_2026_10.sql.
+-- Intentionally does NOT drop dbo.AuditLog: it holds the record of refunds, deletions and discounts,
+-- and the previous API version simply never writes to it. Drop by hand only if you are sure:
+--   IF OBJECT_ID('dbo.AuditLog','U') IS NOT NULL DROP TABLE dbo.AuditLog;

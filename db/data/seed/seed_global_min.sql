@@ -172,7 +172,7 @@ USING (SELECT r.RoleID, v.PermissionKey
        CROSS JOIN (VALUES (N'admin_panel'),(N'appointment_scheduler'),(N'appointment_booking'),(N'billing'),(N'doc_board'),
                      (N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),(N'inventory'),
                      (N'pathology'),(N'pharmacy'),(N'patients'),(N'doctor_calendar'),(N'abdm'),
-                     (N'leads'),(N'print_preview')) v(PermissionKey)
+                     (N'leads'),(N'print_preview'),(N'health_wiki')) v(PermissionKey)
        WHERE r.RoleName = N'AdminDoctor') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
@@ -208,7 +208,7 @@ USING (SELECT r.RoleID, v.PermissionKey
        FROM @Roles r
        CROSS JOIN (VALUES (N'doc_board'),(N'ipd'),(N'nursing_station'),(N'ot_board'),(N'icu_board'),
                      (N'inventory'),(N'pathology'),(N'pharmacy'),(N'patients'),(N'doctor_calendar'),
-                     (N'billing')) v(PermissionKey)
+                     (N'billing'),(N'health_wiki')) v(PermissionKey)
        WHERE r.RoleName = N'Doctor') AS s
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
@@ -255,6 +255,18 @@ USING (SELECT r.RoleID, v.PermissionKey
   ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
 WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
 WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET IsAllowed = 1;
+
+-- HR suite (1HR): the API gates HrController / HrBiometricController on these two keys
+-- (RequiresPermission("hr.manage_employees", "hr.view_dashboard")). They were never seeded, so no
+-- role could reach HR through the normal permission path. Admin + AdminDoctor only.
+MERGE dbo.RolePermissions AS t
+USING (SELECT r.RoleID, v.PermissionKey
+       FROM @Roles r
+       CROSS JOIN (VALUES (N'hr.manage_employees'),(N'hr.view_dashboard')) v(PermissionKey)
+       WHERE r.RoleName IN (N'Admin', N'AdminDoctor')) AS s
+  ON t.RoleID = s.RoleID AND t.PermissionKey = s.PermissionKey
+WHEN NOT MATCHED THEN INSERT(RoleID, PermissionKey, IsAllowed) VALUES (s.RoleID, s.PermissionKey, 1)
+WHEN MATCHED AND t.IsAllowed = 0 THEN UPDATE SET t.IsAllowed = 1;
 
 ------------------------------------------------------------
 -- 5) Hospital Types (global)

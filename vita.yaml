@@ -1,0 +1,14 @@
+# Vita manifest for 1HMSDatabase (T-SQL, 1HMS layout: db/schema/{tables,migrations,indexes}, db/rollback, db/data/seed).
+# Copy to 1HMSDatabase/vita.yaml. The seed (db/data/seed/seed_global_min.sql) also feeds ui-journey's role map.
+app: 1hms
+repo: 1HMSDatabase
+kind: tsql-db
+skills: [db-guard]
+contracts:
+  db:
+    repo: 1HMSDatabase
+    name: EasyHMSDatabase
+    container: sqlserver
+    history_table: __MigrationHistory
+consumers: [1HMSAPI]
+budgets: { pr_minutes: 6, pr_tokens_inr: 20, nightly_minutes: 30 }

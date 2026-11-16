@@ -15707,10 +15707,20 @@ GO
 --              for a 10-digit Indian number. Indian numbers are stored exactly as before; existing rows are not touched.
 --              Widens Mobile to NVARCHAR(16) on HealthWikiContributor, HealthArticleAccessLink and ContributorOtp, and replaces their
 --              CHECK constraints (CK_HWContributor_Mobile, CK_HWLink_Mobile, CK_HWOtp_Mobile) with ones that accept either form.
+--              The two indexes on Mobile (UX_HWContributor_Mobile, IX_HWOtp_Mobile) are dropped while the column is widened and then
+--              recreated exactly as part 1 made them, because SQL Server will not alter a column an index depends on.
 --              Requires part 1. Guarded and idempotent. Run this before the API that accepts international numbers.
 -- =============================================================================
 IF OBJECT_ID('dbo.HealthWikiContributor', 'U') IS NULL
     THROW 51000, 'health_wiki_01_contributor_tables.sql must run before health_wiki_12_international_mobile.sql', 1;
+GO
+
+-- The indexes that depend on Mobile (recreated at the end, same definition as part 1).
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_HWContributor_Mobile' AND object_id = OBJECT_ID('dbo.HealthWikiContributor'))
+    DROP INDEX UX_HWContributor_Mobile ON dbo.HealthWikiContributor;
+GO
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWOtp_Mobile' AND object_id = OBJECT_ID('dbo.ContributorOtp'))
+    DROP INDEX IX_HWOtp_Mobile ON dbo.ContributorOtp;
 GO
 
 -- HealthWikiContributor.Mobile (nullable)
@@ -15750,6 +15760,13 @@ IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HWOtp_Mobile
     ALTER TABLE dbo.ContributorOtp ADD CONSTRAINT CK_HWOtp_Mobile CHECK (
         (LEN(Mobile) = 10 AND Mobile NOT LIKE '%[^0-9]%')
         OR (LEN(Mobile) BETWEEN 9 AND 16 AND Mobile LIKE '+[1-9]%' AND SUBSTRING(Mobile, 2, 16) NOT LIKE '%[^0-9]%'));
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_HWContributor_Mobile' AND object_id = OBJECT_ID('dbo.HealthWikiContributor'))
+    CREATE UNIQUE INDEX UX_HWContributor_Mobile ON dbo.HealthWikiContributor (Mobile) WHERE Mobile IS NOT NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWOtp_Mobile' AND object_id = OBJECT_ID('dbo.ContributorOtp'))
+    CREATE INDEX IX_HWOtp_Mobile ON dbo.ContributorOtp (Mobile, CreatedAt DESC);
 GO
 
 GO

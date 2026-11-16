@@ -7,6 +7,10 @@ DELETE FROM dbo.HealthArticleAccessLink WHERE LEN(Mobile) <> 10;
 GO
 UPDATE dbo.HealthWikiContributor SET Mobile = NULL WHERE Mobile IS NOT NULL AND LEN(Mobile) <> 10;
 GO
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_HWContributor_Mobile' AND object_id = OBJECT_ID('dbo.HealthWikiContributor'))
+    DROP INDEX UX_HWContributor_Mobile ON dbo.HealthWikiContributor;
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWOtp_Mobile' AND object_id = OBJECT_ID('dbo.ContributorOtp'))
+    DROP INDEX IX_HWOtp_Mobile ON dbo.ContributorOtp;
 IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HWContributor_Mobile' AND parent_object_id = OBJECT_ID('dbo.HealthWikiContributor'))
     ALTER TABLE dbo.HealthWikiContributor DROP CONSTRAINT CK_HWContributor_Mobile;
 IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_HWLink_Mobile' AND parent_object_id = OBJECT_ID('dbo.HealthArticleAccessLink'))
@@ -23,4 +27,9 @@ GO
 ALTER TABLE dbo.HealthWikiContributor ADD CONSTRAINT CK_HWContributor_Mobile CHECK (Mobile IS NULL OR (LEN(Mobile) = 10 AND Mobile NOT LIKE '%[^0-9]%'));
 ALTER TABLE dbo.HealthArticleAccessLink ADD CONSTRAINT CK_HWLink_Mobile CHECK (LEN(Mobile) = 10 AND Mobile NOT LIKE '%[^0-9]%');
 ALTER TABLE dbo.ContributorOtp ADD CONSTRAINT CK_HWOtp_Mobile CHECK (LEN(Mobile) = 10 AND Mobile NOT LIKE '%[^0-9]%');
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_HWContributor_Mobile' AND object_id = OBJECT_ID('dbo.HealthWikiContributor'))
+    CREATE UNIQUE INDEX UX_HWContributor_Mobile ON dbo.HealthWikiContributor (Mobile) WHERE Mobile IS NOT NULL;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_HWOtp_Mobile' AND object_id = OBJECT_ID('dbo.ContributorOtp'))
+    CREATE INDEX IX_HWOtp_Mobile ON dbo.ContributorOtp (Mobile, CreatedAt DESC);
 GO

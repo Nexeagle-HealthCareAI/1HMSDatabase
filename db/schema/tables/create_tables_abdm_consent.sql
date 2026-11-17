@@ -8,7 +8,7 @@ BEGIN
     Role                  NVARCHAR(10)     NOT NULL CONSTRAINT DF_AbdmConsent_Role DEFAULT ('HIP'),  -- HIP: we send; HIU: we receive
     ConsentId             NVARCHAR(100)    NOT NULL,   -- ABDM's consent artefact id (HIU: the request id until granted)
     ConsentRequestId      NVARCHAR(100)    NULL,       -- HIU only
-    Status                NVARCHAR(20)     NOT NULL,   -- REQUESTED / GRANTED / DENIED / REVOKED / EXPIRED
+    Status                NVARCHAR(20)     NOT NULL,   -- REQUESTED / GRANTED / DENIED / REVOKED / EXPIRED / FAILED
     PatientAbhaAddress    NVARCHAR(200)    NULL,
     PatientId             NVARCHAR(50)     NULL,       -- HIU only: our patient
     CounterpartyId        NVARCHAR(100)    NULL,       -- the HIU we send to, or the HIP we fetch from
@@ -47,6 +47,7 @@ BEGIN
     ErrorMessage   NVARCHAR(500)    NULL,
     PrivateKey     NVARCHAR(200)    NULL,       -- HIU only, cleared once the records are in
     Nonce          NVARCHAR(200)    NULL,
+    PushToken      NVARCHAR(100)    NULL,       -- HIU only: last segment of this transfer's data push URL
     RequestedAt    DATETIME2(3)     NOT NULL CONSTRAINT DF_AbdmDataTransfer_RequestedAt DEFAULT SYSUTCDATETIME(),
     CompletedAt    DATETIME2(3)     NULL,
     CONSTRAINT PK_AbdmDataTransfer PRIMARY KEY CLUSTERED (TransferId)
@@ -83,5 +84,11 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AbdmReceivedRecord_Patient' AND object_id=OBJECT_ID('dbo.AbdmReceivedRecord'))
 BEGIN
   CREATE INDEX IX_AbdmReceivedRecord_Patient ON dbo.AbdmReceivedRecord(HospitalId, PatientId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AbdmDataTransfer_PushToken' AND object_id=OBJECT_ID('dbo.AbdmDataTransfer'))
+BEGIN
+  CREATE INDEX IX_AbdmDataTransfer_PushToken ON dbo.AbdmDataTransfer(PushToken) WHERE PushToken IS NOT NULL;
 END
 GO
